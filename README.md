@@ -53,8 +53,12 @@ can read this repository. Models are volume-mounted read-only — they are 2.5 G
 and change on a different schedule from the code.
 
 The container runs unprivileged with a read-only root filesystem, all
-capabilities dropped, and `no-new-privileges`. Compose publishes the port on
-**loopback only**; reaching it from another machine is a deliberate edit.
+capabilities dropped, and `no-new-privileges`.
+
+The port is published on every interface, because other machines on the LAN are
+the reason the service exists; access is gated on the shared token, which fails
+closed when unset. Narrow it with `SYRINX_LISTEN=127.0.0.1:8770` on a machine
+that only ever talks to itself.
 
 ### Exposing it beyond the LAN
 

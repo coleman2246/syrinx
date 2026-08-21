@@ -22,11 +22,18 @@ services:
       # Read-only: the service loads models and has no business writing there.
       - ${SYRINX_MODELS:-/srv/syrinx/models}:/models:ro
 
-    # Published on the loopback interface only. Reaching this from another
-    # machine is a deliberate act -- see the security note in the README, and
-    # do not put a plaintext ws:// endpoint on the internet.
+    # Published on every interface by default: this is a LAN service, and other
+    # machines on the LAN are the reason it exists. Access is gated on the
+    # shared token, which fails closed when unset.
+    #
+    # That posture stops at the LAN. The transport is plaintext ws://, so the
+    # token and the audio are readable by anything on the path -- see the
+    # security note in the README before forwarding a port to this.
+    #
+    # Narrow it with SYRINX_LISTEN=127.0.0.1:8770 for a machine that only ever
+    # talks to itself.
     ports:
-      - "127.0.0.1:8770:8770"
+      - "${SYRINX_LISTEN:-0.0.0.0:8770}:8770"
 
     deploy:
       resources:
