@@ -23,6 +23,12 @@ pub struct Config {
     /// need `ydotool`; see the Method docs.
     #[serde(default)]
     pub inject: crate::inject::Method,
+    /// Global hotkey that starts and stops dictation, e.g. `ctrl+alt+d`.
+    ///
+    /// Unset by default: claiming a key combination for the whole desktop is
+    /// not something to do to someone without being asked.
+    #[serde(default)]
+    pub hotkey: Option<String>,
     /// waybar realtime signal for the status indicator.
     #[serde(default = "default_waybar_signal")]
     pub waybar_signal: u8,
@@ -210,6 +216,17 @@ pub fn template() -> String {
     ));
 
     s.push_str(
+        "# Global hotkey to start and stop dictation, e.g. \"ctrl+alt+d\".\n\
+         # Modifiers: ctrl, alt, shift, super. Function keys work on their own.\n\
+         # Unset by default, because this claims the key for the whole desktop.\n",
+    );
+    if let Some(why) = crate::hotkey::supported_here() {
+        // Say so in the file rather than let someone set it and wonder.
+        s.push_str(&comment_wrap(why));
+    }
+    s.push_str("# hotkey = \"ctrl+alt+d\"\n\n");
+
+    s.push_str(
         "# Capture source to use, as printed by `syrinx sources`.\n\
          # Left unset, syrinx asks or uses the default input.\n\
          # source_key = \"...\"\n\n",
@@ -220,6 +237,36 @@ pub fn template() -> String {
         s.push_str(&format!("waybar_signal = {}\n", default_waybar_signal()));
     }
     s
+}
+
+/// Wrap prose into `#` comment lines that fit in a terminal.
+///
+/// Indented lines are passed through unwrapped: they are examples meant to be
+/// copied, and reflowing a config line would break it.
+fn comment_wrap(text: &str) -> String {
+    const WIDTH: usize = 74;
+    let mut out = String::new();
+    for para in text.lines() {
+        if para.starts_with(' ') || para.starts_with('\t') {
+            out.push_str(&format!("#    {}\n", para.trim()));
+            continue;
+        }
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if !line.is_empty() && line.len() + 1 + word.len() > WIDTH {
+                out.push_str(&format!("# {line}\n"));
+                line.clear();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        if !line.is_empty() {
+            out.push_str(&format!("# {line}\n"));
+        }
+    }
+    out
 }
 
 /// Pad a quoted value so the `--` descriptions line up in a column.
@@ -318,6 +365,25 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    #[test]
+    fn generated_comments_fit_in_a_terminal() {
+        // A config is read in a terminal; a 200-column comment wraps into
+        // something unreadable.
+        for line in template().lines() {
+            assert!(line.len() <= 100, "line too long ({}): {line}", line.len());
+        }
+    }
+
+    #[test]
+    fn wrapped_comments_keep_examples_copyable() {
+        // An indented example is meant to be pasted; reflowing it breaks it.
+        let out = comment_wrap("some prose here\n    bindsym $mod+n exec syrinx toggle");
+        assert!(
+            out.contains("#    bindsym $mod+n exec syrinx toggle"),
+            "the example was reflowed: {out}"
+        );
     }
 
     #[test]
@@ -454,6 +520,7 @@ mod tests {
         let c = Config {
             url: "ws://h:1/v1/stream".into(),
             token: "t".into(),
+            hotkey: Some("ctrl+alt+d".into()),
             source_key: Some("rnnoise_source".into()),
             mode: OutputMode::Both,
             inject: Default::default(),

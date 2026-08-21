@@ -17,6 +17,16 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use tracing::{error, info, warn};
 
+/// Read and check the configured hotkey.
+fn state_hotkey(config: &Config) -> Result<Option<crate::hotkey::HotKey>> {
+    let Some(spec) = config.hotkey.as_deref() else {
+        return Ok(None);
+    };
+    crate::hotkey::parse(spec)
+        .map(Some)
+        .with_context(|| format!("the `hotkey` setting in your config ({spec:?}) is not valid"))
+}
+
 /// What the daemon does when a session ends by itself.
 pub struct DaemonOptions {
     pub config: Config,
@@ -80,7 +90,17 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         });
     }
 
-    let tray = crate::tray::start();
+    // Parsed before anything is started, so a typo is reported at once rather
+    // than after the daemon looks like it came up cleanly.
+    let hotkey = match state_hotkey(&opts.config) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("{e:#}");
+            None
+        }
+    };
+
+    let tray = crate::tray::start(hotkey.clone());
     let (tray_handle, mut tray_rx) = match tray {
         Some((h, rx)) => (Some(h), Some(rx)),
         None => {
@@ -88,6 +108,23 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
             (None, None)
         }
     };
+
+    // Linux registers separately from the tray: ksni has no message loop to
+    // share. On Wayland there is nothing to register at all, and saying so is
+    // the whole point -- a hotkey that silently does nothing is worse than one
+    // that was never offered.
+    #[cfg(target_os = "linux")]
+    if let Some(h) = &hotkey {
+        match crate::hotkey::supported_here() {
+            Some(why) => info!("hotkey {} not registered. {}", h.spelled, why),
+            None => info!(
+                "hotkey {} configured, but syrinx only registers hotkeys on \
+                 Windows so far; bind it in your window manager to run \
+                 `syrinx toggle`",
+                h.spelled
+            ),
+        }
+    }
 
     let mut state = DaemonRuntime {
         opts,
