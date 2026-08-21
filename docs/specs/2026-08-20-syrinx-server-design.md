@@ -737,3 +737,51 @@ Windows OpenSSH puts a session's processes in a job object and terminates it
 when the connection closes, which kills the daemon regardless of any creation
 flag. Launching through `Win32_Process.Create` escapes that job, and the daemon
 then survived across an entirely new SSH connection.
+
+
+## Container (measured, 2026-08-21)
+
+Built and run on the development desktop with GPU passthrough before going
+anywhere near the deployment host.
+
+**Verified:** the container process holds VRAM on the host GPU
+(`/usr/local/bin/syrinx-server`, 3378 MiB), transcribes correctly through the
+published port, unloads the model when idle, refuses to load when another
+tenant leaves too little free, and answers its own healthcheck. Release build
+in the image: 20.9 ms per chunk against 35 ms for the debug build on the host.
+
+### Two numbers the plan got wrong
+
+**Size: 5.12 GB, not the "roughly 1 GB" the plan predicted.** Models are
+correctly absent -- that part of the check was sound -- but the estimate ignored
+what the runtime costs. `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` is about
+4.4 GB, and ONNX Runtime adds 622 MB of which `libonnxruntime_providers_cuda.so`
+alone is 593 MB. Our own binary is 6.5 MB. There is no meaningful trimming to do
+without hand-assembling the CUDA runtime, which trades gigabytes for a class of
+missing-library failure that is expensive to diagnose remotely.
+
+**"Zero VRAM when idle" is 144 MiB.** The model does unload -- 3378 MiB drops to
+144 MiB -- but a CUDA context stays resident for the life of the process.
+Reaching literal zero would mean exiting the process, not unloading the model.
+144 MiB against a shared 8 GB card is not worth that.
+
+### ONNX Runtime 1.28 defaults to CUDA 13
+
+The release publishes `onnxruntime-linux-x64-gpu_cuda12-1.28.0.tgz` and
+`..._cuda13-...`, and the release notes say the pipeline has moved to CUDA 13.
+Taking the default would produce an image that cannot start on driver 570. The
+Dockerfile names the cuda12 asset explicitly, and the version is an ARG so the
+pairing stays visible.
+
+### Secrets
+
+The token comes from `SYRINX_TOKEN`. A token in a layer is published to anyone
+who can pull the image; a token in a committed config is published to anyone
+who can read the repository. `bind` and `model_dir` are overridable for the same
+reason -- they differ per deployment. The behaviour settings (VRAM floor,
+session cap, idle timeout) deliberately are not: they describe how the service
+behaves under pressure and belong in a file that can be reviewed.
+
+An empty environment variable does not override. An unset variable in a compose
+file arrives as `""`, and taking that literally would replace a working token
+with one that fails closed -- a failure that looks like a client problem.

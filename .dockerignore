@@ -1,0 +1,8 @@
+# The build stage compiles from source; nothing here belongs in the context.
+target/
+models/
+.git/
+docs/
+*.onnx
+*.onnx.data
+.env

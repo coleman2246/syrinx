@@ -73,11 +73,101 @@ impl Config {
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(s)?)
     }
+
+    /// Load from TOML, then let the environment override.
+    ///
+    /// A container needs its token from outside the image. Baking one into a
+    /// layer publishes it to anyone who can pull the image, and committing one
+    /// to a config file publishes it to anyone who can read the repository, so
+    /// the deployment path has to be able to supply it at run time.
+    ///
+    /// Only the settings that vary per deployment are overridable. Everything
+    /// else describes how the service behaves, which belongs in a file that can
+    /// be reviewed rather than in an environment nobody can see.
+    pub fn from_toml_and_env(s: &str) -> anyhow::Result<Self> {
+        let mut cfg = Self::from_toml(s)?;
+        cfg.apply_env(|k| std::env::var(k).ok());
+        Ok(cfg)
+    }
+
+    /// The override step, with the environment injected so it can be tested.
+    ///
+    /// Reading the real environment in a test is not safe: `set_var` is unsound
+    /// with other threads running, and the test harness is threaded.
+    pub fn apply_env(&mut self, get: impl Fn(&str) -> Option<String>) {
+        if let Some(v) = get("SYRINX_TOKEN").filter(|v| !v.is_empty()) {
+            self.token = v;
+        }
+        if let Some(v) = get("SYRINX_BIND").filter(|v| !v.is_empty()) {
+            self.bind = v;
+        }
+        if let Some(v) = get("SYRINX_MODEL_DIR").filter(|v| !v.is_empty()) {
+            self.model_dir = v;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn base() -> Config {
+        Config::from_toml("token = \"from-file\"\nmodel_dir = \"/models\"").unwrap()
+    }
+
+    #[test]
+    fn the_environment_supplies_the_token() {
+        // The reason this exists: a token must not be baked into an image or
+        // committed to a config file.
+        let mut c = base();
+        c.apply_env(|k| (k == "SYRINX_TOKEN").then(|| "from-env".to_string()));
+        assert_eq!(c.token, "from-env");
+    }
+
+    #[test]
+    fn an_empty_override_does_not_blank_a_setting() {
+        // An unset variable in a compose file arrives as "". Taking that
+        // literally would replace a working token with one that fails closed,
+        // and the failure would look like a client problem.
+        let mut c = base();
+        c.apply_env(|k| (k == "SYRINX_TOKEN").then(String::new));
+        assert_eq!(c.token, "from-file");
+    }
+
+    #[test]
+    fn the_file_wins_when_nothing_is_set() {
+        let mut c = base();
+        c.apply_env(|_| None);
+        assert_eq!(c.token, "from-file");
+        assert_eq!(c.model_dir, "/models");
+    }
+
+    #[test]
+    fn bind_and_model_dir_are_overridable() {
+        // The two other things that differ between a desktop and a container.
+        let mut c = base();
+        c.apply_env(|k| match k {
+            "SYRINX_BIND" => Some("0.0.0.0:9000".into()),
+            "SYRINX_MODEL_DIR" => Some("/mnt/models".into()),
+            _ => None,
+        });
+        assert_eq!(c.bind, "0.0.0.0:9000");
+        assert_eq!(c.model_dir, "/mnt/models");
+    }
+
+    #[test]
+    fn behaviour_settings_are_not_overridable() {
+        // VRAM floors and session caps describe how the service behaves under
+        // pressure. They belong in a file that can be reviewed, not in an
+        // environment nobody can see.
+        let mut c = base();
+        let before = (c.max_sessions, c.vram_floor_mib, c.idle_unload_secs);
+        c.apply_env(|_| Some("999".into()));
+        assert_eq!(
+            (c.max_sessions, c.vram_floor_mib, c.idle_unload_secs),
+            before
+        );
+    }
 
     #[test]
     fn provider_defaults_to_cpu_not_gpu() {

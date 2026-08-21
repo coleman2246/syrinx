@@ -58,6 +58,50 @@ fn build_loader(
     })
 }
 
+/// Ask the running service whether it is listening.
+///
+/// Hand-rolled rather than pulling in an HTTP client: one GET against
+/// loopback, and a dependency added for a health probe is a dependency in the
+/// image forever.
+async fn health_probe(bind: &str) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A service bound to 0.0.0.0 is reached at loopback from inside its own
+    // container; connecting to 0.0.0.0 is not portable.
+    let port = bind
+        .rsplit_once(':')
+        .map(|(_, p)| p)
+        .unwrap_or("8770")
+        .to_string();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .with_context(|| format!("timed out connecting to {addr}"))?
+    .with_context(|| format!("connecting to {addr}"))?;
+
+    stream
+        .write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .await
+        .context("sending the health request")?;
+
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf))
+        .await
+        .context("timed out reading the health response")?
+        .context("reading the health response")?;
+
+    let head = String::from_utf8_lossy(&buf);
+    if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200") {
+        Ok(())
+    } else {
+        anyhow::bail!("unexpected response: {}", head.lines().next().unwrap_or(""))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -67,12 +111,29 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let path = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let healthcheck = args.iter().any(|a| a == "--healthcheck");
+    let path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
         .unwrap_or_else(|| "config.toml".into());
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading config from {path}"))?;
-    let config = Arc::new(Config::from_toml(&text)?);
+    let config = Arc::new(Config::from_toml_and_env(&text)?);
+
+    // The container carries no curl or wget, so the health probe is the binary
+    // itself. Shipping a fetch tool purely to ask a question the service can
+    // answer about itself would be a strange thing to add to an image.
+    if healthcheck {
+        return match health_probe(&config.bind).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("unhealthy: {e:#}");
+                std::process::exit(1);
+            }
+        };
+    }
 
     // Only consult the GPU when we intend to use it. On CPU there is no shared
     // VRAM to protect, and probing would just invite a spurious refusal.

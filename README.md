@@ -37,6 +37,57 @@ container that moves it to `acdc` is the last piece outstanding.
 
 See [`docs/specs/`](docs/specs/) for the design document.
 
+## Running the server in a container
+
+```bash
+docker build -f docker/Dockerfile -t syrinx-server:latest .
+
+SYRINX_TOKEN=$(openssl rand -hex 24) \
+SYRINX_MODELS=/srv/syrinx/models \
+docker compose -f docker/compose.yaml up -d
+```
+
+The token comes from the environment: baking one into a layer publishes it to
+anyone who can pull the image, and committing one publishes it to anyone who
+can read this repository. Models are volume-mounted read-only — they are 2.5 GB
+and change on a different schedule from the code.
+
+The container runs unprivileged with a read-only root filesystem, all
+capabilities dropped, and `no-new-privileges`. Compose publishes the port on
+**loopback only**; reaching it from another machine is a deliberate edit.
+
+### Exposing it beyond the LAN
+
+**Do not put this on the internet as it stands.** Not because the container is
+weak — it is unprivileged, read-only and capability-less, and a shell inside it
+would be a poor prize — but because of what crosses the wire.
+
+There is **no TLS**. The protocol is `ws://`, so:
+
+- The bearer token travels in **plaintext** on every connection. Anyone on the
+  path — a hotel network, an ISP, a compromised router — reads it once and has
+  permanent access.
+- The **audio** travels in plaintext, and so do the transcripts coming back.
+  That is every word dictated, including into a password field or a private
+  message. The container boundary does nothing about this: the data is already
+  outside it.
+
+A shared bearer token over a plaintext transport is fine on a LAN, which is
+what it was built for. It is not an internet posture.
+
+**Use a VPN — WireGuard or Tailscale.** No port opened at all, mutual
+authentication, everything encrypted in transit. The client keeps pointing at a
+private address and nothing in syrinx changes. For a personal service this is
+both the safest and the least work.
+
+A TLS-terminating reverse proxy is *not* currently an alternative. The address
+parser accepts `wss://`, but the client is built without a TLS backend, so such
+a URL fails at connect with "TLS support not compiled in". Making that route
+work means enabling a TLS feature on `tokio-tungstenite` first.
+
+Whatever the transport, generate the token with `openssl rand -hex 24` rather
+than reusing `dev-token`.
+
 ## Deployment notes
 
 The target server (`acdc`, Ubuntu, RTX 2070 Super) runs driver 570, which caps
