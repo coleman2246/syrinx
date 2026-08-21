@@ -19,10 +19,3 @@ eframe = "0.36"
 egui = "0.36"
 toml = "0.9"
 rfd = "0.16"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# StatusNotifierItem tray. Pure D-Bus, which is what waybar consumes, and no
-# GTK main loop to reconcile with eframe.
-# "blocking" because the async API panics under eframe: zbus spawns its own
-# thread and calls tokio::spawn from it, outside any runtime context.
-ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }

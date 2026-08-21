@@ -38,12 +38,25 @@ impl Status {
     }
 }
 
+/// One fragment of transcript with the time it arrived.
+///
+/// Kept alongside the flat string so a transcript can be saved with timestamps
+/// without the caller having to reconstruct timing it never saw.
+#[derive(Debug, Clone)]
+pub struct Segment {
+    /// Seconds since the session started.
+    pub at: f64,
+    pub text: String,
+}
+
 /// Everything a front-end needs to render. Cheap to clone.
 #[derive(Debug, Clone, Default)]
 pub struct SessionState {
     pub status: Status,
     /// Accumulated text. Empty in [`OutputMode::Type`], which keeps none.
     pub transcript: String,
+    /// The same text, split by arrival with timings.
+    pub segments: Vec<Segment>,
     /// Most recent fragment, so a UI can show it is alive.
     pub last_fragment: String,
     pub model: Option<String>,
@@ -204,6 +217,11 @@ async fn run(
     }
     notify();
 
+    // Timestamps are relative to the moment audio starts flowing, not to
+    // connection, so they line up with the recording rather than including
+    // model load time.
+    let started = std::time::Instant::now();
+
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(32);
     let _capture = Capture::start(&opts.source, audio_tx).context("starting audio capture")?;
     info!(
@@ -229,6 +247,10 @@ async fn run(
                     let mut s = st.lock().expect("state lock poisoned");
                     if mode.keeps_transcript() {
                         s.transcript.push_str(&text);
+                        s.segments.push(Segment {
+                            at: started.elapsed().as_secs_f64(),
+                            text: text.clone(),
+                        });
                     }
                     s.last_fragment = text;
                     drop(s);
@@ -244,6 +266,19 @@ async fn run(
                     let keep = s.transcript.chars().count().saturating_sub(retract_n);
                     s.transcript = s.transcript.chars().take(keep).collect();
                     s.transcript.push_str(&text);
+                    // Revisions rewrite the tail, so the affected segments are
+                    // replaced rather than appended to.
+                    let mut dropped = 0usize;
+                    while dropped < retract_n {
+                        match s.segments.pop() {
+                            Some(seg) => dropped += seg.text.chars().count(),
+                            None => break,
+                        }
+                    }
+                    s.segments.push(Segment {
+                        at: started.elapsed().as_secs_f64(),
+                        text: text.clone(),
+                    });
                     drop(s);
                     n();
                 }

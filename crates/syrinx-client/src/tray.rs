@@ -9,7 +9,7 @@
 //! simply runs without a tray there.
 
 use std::sync::Mutex;
-use syrinx_client::{OutputMode, Status};
+use crate::{OutputMode, Status};
 use tokio::sync::mpsc;
 
 /// A request from the tray menu to the application.
@@ -92,12 +92,20 @@ impl ksni::Tray for SyrinxTray {
     }
 
     /// Named icons rather than bundled pixmaps: they follow the user's icon
-    /// theme, so the tray matches the rest of their desktop.
+    /// theme, so the tray matches the rest of the desktop.
+    ///
+    /// These particular names are chosen for availability, not just meaning.
+    /// `audio-input-microphone-muted` reads perfectly but is absent from
+    /// breeze-dark, where it rendered as a generic "prohibited" glyph -- an icon
+    /// that says "broken" rather than "idle". `media-record`,
+    /// `audio-input-microphone` and `microphone-sensitivity-muted` are all
+    /// present in Breeze and Adwaita.
     fn icon_name(&self) -> String {
         match self.state.status {
-            Status::Listening => "audio-input-microphone".into(),
-            Status::Connecting | Status::Stopping => "audio-input-microphone-low".into(),
-            Status::Idle => "audio-input-microphone-muted".into(),
+            // A record dot is unambiguous about the microphone being live.
+            Status::Listening => "media-record".into(),
+            Status::Connecting | Status::Stopping => "audio-input-microphone".into(),
+            Status::Idle => "microphone-sensitivity-muted".into(),
         }
     }
 

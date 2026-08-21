@@ -7,15 +7,13 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod tray;
-
 use anyhow::Result;
 use eframe::egui;
 use syrinx_audio::{Source, SourceKind};
 use syrinx_client::{
     Config, OutputMode, SessionHandle, SessionOptions, SessionState, Status, save,
 };
-use tray::{TrayCommand, TrayHandle, TrayState};
+use syrinx_client::tray::{self, TrayCommand, TrayHandle, TrayState};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -30,12 +28,12 @@ fn main() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([460.0, 340.0])
             .with_min_inner_size([380.0, 260.0])
-            .with_title("Parakeet"),
+            .with_title("Syrinx"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Parakeet",
+        "Syrinx",
         options,
         Box::new(|_cc| Ok(Box::new(App::new(config)))),
     )
@@ -51,6 +49,7 @@ struct App {
     quitting: bool,
     /// Last saved path, shown so the user knows where it went.
     saved_to: Option<String>,
+    save_format: save::Format,
     sources: Vec<Source>,
     selected: Option<Source>,
     session: Option<SessionHandle>,
@@ -71,7 +70,9 @@ impl App {
             tray,
             tray_rx,
             quitting: false,
+
             saved_to: None,
+            save_format: save::Format::default(),
             sources: Vec::new(),
             selected: None,
             session: None,
@@ -150,6 +151,15 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
 
         self.pump_tray(&ctx, running);
+
+        // Closing the window exits the GUI. It cannot hide instead: winit
+        // documents set_visible as "Unsupported" on Wayland, because Wayland
+        // has no hide-window concept -- a surface either exists or it does not.
+        //
+        // Background operation therefore lives in `syrinx tray`, a headless
+        // process that owns the tray and the session with no window at all. The
+        // GUI is a viewer you open and close; the tray is the thing that keeps
+        // running.
         if self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -213,6 +223,7 @@ impl App {
                 TrayCommand::ShowWindow => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+
                 }
                 TrayCommand::Quit => self.quitting = true,
             }
@@ -234,19 +245,21 @@ impl App {
 
     /// Save the transcript, remembering where it went.
     fn save_transcript(&mut self, pick_path: bool) {
+        let segments = self.state.segments.clone();
         let text = self.state.transcript.clone();
+        let format = self.save_format;
         let result = if pick_path {
             match rfd::FileDialog::new()
                 .set_file_name(save::filename_for(&save::timestamp()))
                 .set_directory(save::default_dir())
                 .save_file()
             {
-                Some(p) => save::write(&p, &text).map(|_| p),
+                Some(p) => save::save_rendered(Some(&p), &segments, &text, format),
                 // Cancelled: not an error, and not something to report.
                 None => return,
             }
         } else {
-            save::save_default(&text)
+            save::save_rendered(None, &segments, &text, format)
         };
         match result {
             Ok(p) => {
@@ -393,6 +406,23 @@ impl App {
             {
                 self.save_transcript(true);
             }
+            egui::ComboBox::from_id_salt("save_format")
+                .selected_text(self.save_format.label())
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for f in save::Format::ALL {
+                        if ui
+                            .selectable_label(self.save_format == f, f.label())
+                            .on_hover_text(match f {
+                                save::Format::Plain => "Continuous prose",
+                                save::Format::Timestamped => "Each fragment prefixed [MM:SS]",
+                            })
+                            .clicked()
+                        {
+                            self.save_format = f;
+                        }
+                    }
+                });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let short = self
                     .config

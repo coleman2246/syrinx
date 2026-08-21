@@ -5,8 +5,73 @@
 //! subtly different output from the GUI would be a trap for anyone scripting
 //! around it.
 
+use crate::session::Segment;
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// How a saved transcript is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    /// Continuous prose. What you want if the transcript is the point.
+    #[default]
+    Plain,
+    /// Each fragment prefixed with its time, `[MM:SS]`. What you want when the
+    /// transcript is an index into a recording.
+    Timestamped,
+}
+
+impl Format {
+    pub fn label(self) -> &'static str {
+        match self {
+            Format::Plain => "Plain",
+            Format::Timestamped => "Timestamped",
+        }
+    }
+
+    pub const ALL: [Format; 2] = [Format::Plain, Format::Timestamped];
+}
+
+/// Format seconds as `[MM:SS]`, or `[HH:MM:SS]` past an hour.
+///
+/// Hours are only shown when needed: prefixing every line of a two-minute note
+/// with `00:` is noise.
+pub fn stamp(seconds: f64) -> String {
+    let total = seconds.max(0.0) as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("[{h:02}:{m:02}:{s:02}]")
+    } else {
+        format!("[{m:02}:{s:02}]")
+    }
+}
+
+/// Render segments in the requested format.
+pub fn render(segments: &[Segment], fallback: &str, format: Format) -> String {
+    match format {
+        // Falls back to the flat transcript, which is all a session that
+        // predates segment tracking would have.
+        Format::Plain => {
+            if segments.is_empty() {
+                fallback.trim().to_string()
+            } else {
+                segments
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            }
+        }
+        Format::Timestamped => segments
+            .iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .map(|s| format!("{} {}", stamp(s.at), s.text.trim()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
 
 /// Default directory for saved transcripts.
 pub fn default_dir() -> PathBuf {
@@ -81,6 +146,22 @@ pub fn save_default(transcript: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Render and save in one step. The path a front-end shows the user.
+pub fn save_rendered(
+    path: Option<&Path>,
+    segments: &[Segment],
+    fallback: &str,
+    format: Format,
+) -> Result<PathBuf> {
+    let body = render(segments, fallback, format);
+    let path = match path {
+        Some(p) => p.to_path_buf(),
+        None => default_dir().join(filename_for(&timestamp())),
+    };
+    write(&path, &body)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +212,55 @@ mod tests {
         assert!(a < b, "names must sort by time");
         assert!(!a.contains(':'));
         assert!(a.ends_with(".txt"));
+    }
+
+    fn seg(at: f64, text: &str) -> Segment {
+        Segment {
+            at,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn timestamps_omit_hours_until_they_matter() {
+        assert_eq!(stamp(0.0), "[00:00]");
+        assert_eq!(stamp(65.0), "[01:05]");
+        // Prefixing a short note with 00: every line is noise.
+        assert_eq!(stamp(3661.0), "[01:01:01]");
+    }
+
+    #[test]
+    fn a_negative_time_does_not_underflow() {
+        // as u64 on a negative float wraps to something enormous.
+        assert_eq!(stamp(-5.0), "[00:00]");
+    }
+
+    #[test]
+    fn plain_format_joins_segments_into_prose() {
+        let segs = [seg(0.5, "hello "), seg(1.5, "world")];
+        assert_eq!(render(&segs, "", Format::Plain), "hello world");
+    }
+
+    #[test]
+    fn timestamped_format_prefixes_each_fragment() {
+        let segs = [seg(0.0, "hello "), seg(65.0, "world")];
+        assert_eq!(
+            render(&segs, "", Format::Timestamped),
+            "[00:00] hello\n[01:05] world"
+        );
+    }
+
+    #[test]
+    fn plain_falls_back_to_the_flat_transcript() {
+        // A session that kept no segments must still be saveable.
+        assert_eq!(render(&[], " some text ", Format::Plain), "some text");
+    }
+
+    #[test]
+    fn empty_segments_are_skipped_in_timestamped_output() {
+        // A blank line with a timestamp on it is just noise.
+        let segs = [seg(0.0, "real "), seg(1.0, "   "), seg(2.0, "text")];
+        assert_eq!(render(&segs, "", Format::Timestamped).lines().count(), 2);
     }
 
     #[test]

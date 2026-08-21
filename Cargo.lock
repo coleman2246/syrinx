@@ -4505,6 +4505,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "ksni",
  "nix",
  "serde",
  "serde_json",
@@ -4523,7 +4524,6 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui",
- "ksni",
  "rfd",
  "serde",
  "serde_json",

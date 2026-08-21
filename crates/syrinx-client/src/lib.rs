@@ -11,6 +11,9 @@ pub mod save;
 pub mod session;
 pub mod state;
 
+/// System tray. Linux only; a no-op elsewhere.
+pub mod tray;
+
 pub use config::Config;
 pub use mode::OutputMode;
 pub use session::{SessionHandle, SessionOptions, SessionState, Status};
