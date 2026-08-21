@@ -24,9 +24,13 @@ use syrinx_client::{
     session::Status,
 };
 
-/// How often the daemon is polled. Fast enough to feel live, slow enough that
-/// an idle window is not doing constant socket work.
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// How often the daemon is polled.
+///
+/// 30 Hz, because the level meter is in this window too and 200 ms made it
+/// step visibly. A round trip over the Unix socket measures about 0.1 ms, so
+/// polling thirty times a second costs roughly 0.3% of one core -- the meter is
+/// worth that, and the alternative is a display that lies about how live it is.
+const POLL_INTERVAL: Duration = Duration::from_millis(33);
 
 /// How often the source list is re-scanned.
 ///

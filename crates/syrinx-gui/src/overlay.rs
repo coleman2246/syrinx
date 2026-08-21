@@ -110,15 +110,22 @@ impl eframe::App for Overlay {
             egui::Color32::from_rgba_unmultiplied(16, 16, 20, 170),
         );
 
-        // Middle-drag moves the window. A compositor-side move is the only way
-        // that works on Wayland, where a client cannot position itself.
+        // Middle- or left-drag moves the window. A compositor-side move is the
+        // only way that works on Wayland, where a client cannot position
+        // itself.
+        //
+        // Sent once on drag START, never while dragging. StartDrag hands the
+        // whole gesture to the compositor; repeating it every frame re-grabs
+        // the pointer continuously, and the move never ends -- the window
+        // follows the cursor with no way to release it short of killing the
+        // process.
         let drag = ui.interact(
             full,
             egui::Id::new("overlay-drag"),
             egui::Sense::click_and_drag(),
         );
-        if drag.dragged_by(egui::PointerButton::Middle)
-            || drag.dragged_by(egui::PointerButton::Primary)
+        if drag.drag_started_by(egui::PointerButton::Middle)
+            || drag.drag_started_by(egui::PointerButton::Primary)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
