@@ -42,9 +42,17 @@ See [`docs/specs/`](docs/specs/) for the design document.
 ```bash
 docker build -f docker/Dockerfile -t syrinx-server:latest .
 
-SYRINX_TOKEN=$(openssl rand -hex 24) \
-SYRINX_MODELS=/srv/syrinx/models \
+cp docker/.env.example docker/.env      # then fill in the token and model path
 docker compose -f docker/compose.yaml up -d
+```
+
+`docker/.env` is gitignored and read automatically, so `ps`, `logs` and `down`
+work without exporting anything:
+
+```bash
+docker compose -f docker/compose.yaml ps      # shows (healthy)
+docker compose -f docker/compose.yaml logs -f
+docker compose -f docker/compose.yaml down
 ```
 
 The token comes from the environment: baking one into a layer publishes it to
