@@ -439,3 +439,48 @@ Linux, so this does not matter. The **GUI and CLI need an IPC transport
 abstraction and a Windows text-injection path** before they build, and
 per-application capture will remain Linux-only. Transcribe mode, file
 transcription, the meter and system audio would all work.
+
+## Bulk throughput (measured 2026-08-21, RTX 3060 Ti)
+
+113.2 s of audio, warm server:
+
+| | Wall clock | Throughput |
+|---|---|---|
+| Cold (model loading + GPU verify) | 10.0 s | 11x |
+| Warm | 7.6 s | **15x** |
+
+**This is the ceiling, not a tuning failure.** 113.2 s is 202 chunks of 560 ms,
+and inference measures 37 ms per chunk, so the model alone needs 7.5 s. Measured
+wall clock is 7.6 s: about **99% efficiency**, with essentially no protocol or
+transport overhead left to remove. An hour of audio takes roughly four minutes.
+
+An earlier figure of "2x" was misleading and came from a 6.8 s test file, where
+~2.3 s of cold start dominated everything else.
+
+### Why there is no reject-and-retry
+
+Sending flat out and having the server discard chunks it cannot keep up with
+would be worse than what is there. Discarded audio is either lost from the
+transcript or has to be re-sent, and re-sending work the server already
+half-did wastes the very capacity being contended for.
+
+Flow control achieves the same goal without either problem. The server's audio
+queue is bounded, so a full queue stops the reader draining the socket, TCP
+stops acknowledging, and the client blocks in `send` exactly as long as needed.
+The client already sends as fast as the server can consume, and no audio is
+dropped or repeated. The 99% figure is what that looks like when it works.
+
+### Making it genuinely faster
+
+Not achievable at the protocol layer, since the protocol is not the constraint.
+The real options:
+
+- **A faster model.** int8 TDT is roughly 3.7x smaller and built for offline
+  decoding, where it sees full context rather than a streaming window.
+- **Batched inference**, feeding several chunks per forward pass. A model and
+  runtime capability, not something the server can arrange.
+- **Concurrent sessions do not help.** `NemotronHandle` holds
+  `Arc<Mutex<NemotronModel>>`, so every session serialises on one model. Two
+  short concurrent sessions complete correctly, but three long ones did not
+  finish inside ten minutes, which wants investigating before `max_sessions`
+  above 1 is trusted for bulk work.
