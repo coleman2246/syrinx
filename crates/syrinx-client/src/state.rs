@@ -12,15 +12,22 @@
 //! reports "not running" for a stale file left by a crash.
 
 use anyhow::{Context, Result};
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use std::path::{Path, PathBuf};
 
 /// Where the PID file lives. `XDG_RUNTIME_DIR` is preferred because it is
 /// cleared on logout, so a stale file cannot survive a reboot.
 pub fn default_pid_path() -> PathBuf {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(dir).join("syrinx.pid")
+    #[cfg(windows)]
+    {
+        // No XDG_RUNTIME_DIR equivalent; the per-user temp directory is the
+        // closest thing, and is likewise not shared between users.
+        std::env::temp_dir().join("syrinx.pid")
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(dir).join("syrinx.pid")
+    }
 }
 
 /// Read the PID file and confirm the process is alive.
@@ -30,10 +37,43 @@ pub fn default_pid_path() -> PathBuf {
 pub fn running_pid(path: &Path) -> Option<i32> {
     let raw = std::fs::read_to_string(path).ok()?;
     let pid: i32 = raw.trim().parse().ok()?;
+    is_alive(pid).then_some(pid)
+}
+
+/// Whether a process with this id exists.
+#[cfg(unix)]
+fn is_alive(pid: i32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
     // Signal 0 performs error checking without sending anything.
-    match kill(Pid::from_raw(pid), None) {
-        Ok(()) => Some(pid),
-        Err(_) => None,
+    kill(Pid::from_raw(pid), None).is_ok()
+}
+
+/// Whether a process with this id exists.
+///
+/// `OpenProcess` succeeding is not enough on its own: a handle stays valid for
+/// a process that has exited but not yet been reaped, so the exit code has to
+/// be checked too. Without that, a crashed session would read as running and a
+/// toggle would never start again -- the same trap the PID file exists to
+/// avoid.
+#[cfg(windows)]
+fn is_alive(pid: i32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let Ok(pid) = u32::try_from(pid) else {
+        return false;
+    };
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut code = 0u32;
+        let alive = GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE.0 as u32;
+        let _ = CloseHandle(handle);
+        alive
     }
 }
 
@@ -49,9 +89,48 @@ pub fn clear_pid(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Where a stop request is left for a running instance to find.
+///
+/// Windows only. See [`signal_stop`].
+pub fn stop_request_path(pid_path: &Path) -> PathBuf {
+    pid_path.with_extension("stop")
+}
+
 /// Ask a running instance to stop. It finishes the current utterance and exits.
-pub fn signal_stop(pid: i32) -> Result<()> {
-    kill(Pid::from_raw(pid), Signal::SIGTERM).context("sending SIGTERM to the running instance")
+///
+/// On Unix this is SIGTERM. Windows has no equivalent -- `TerminateProcess` is
+/// not one, since it gives the session no chance to flush the last utterance or
+/// remove its PID file -- so a request file is left beside the PID file and the
+/// running instance watches for it. Slower to notice, but it stops cleanly,
+/// which matters more for something whose whole job is not losing your words.
+pub fn signal_stop(pid: i32, pid_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        let _ = pid_path;
+        kill(Pid::from_raw(pid), Signal::SIGTERM)
+            .context("sending SIGTERM to the running instance")
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        let p = stop_request_path(pid_path);
+        std::fs::write(&p, "stop")
+            .with_context(|| format!("writing a stop request to {}", p.display()))
+    }
+}
+
+/// Whether someone has asked this instance to stop. Clears the request.
+///
+/// Windows only; on Unix the signal handler does this job.
+pub fn take_stop_request(pid_path: &Path) -> bool {
+    let p = stop_request_path(pid_path);
+    if p.exists() {
+        let _ = std::fs::remove_file(&p);
+        return true;
+    }
+    false
 }
 
 /// Nudge waybar to re-run its custom module immediately.
@@ -59,6 +138,9 @@ pub fn signal_stop(pid: i32) -> Result<()> {
 /// Polling would leave the indicator up to a second stale on both edges, which
 /// is very visible when the whole point is knowing whether the mic is live.
 pub fn refresh_waybar(signal: u8) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
     let _ = std::process::Command::new("pkill")
         .arg(format!("-RTMIN+{signal}"))
         // `-x` matches the process name exactly, never the invoking command
@@ -102,6 +184,7 @@ mod tests {
         // PID 0 is never a normal process; kill(0, 0) targets a process group
         // so use an implausible high PID instead.
         write_pid(&p, 4_194_303).unwrap();
+        assert!(running_pid(&p).is_none());
         assert_eq!(running_pid(&p), None);
         clear_pid(&p);
     }

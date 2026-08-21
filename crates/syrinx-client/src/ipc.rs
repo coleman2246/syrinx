@@ -1,4 +1,4 @@
-//! Unix-socket IPC between the background daemon and the GUI.
+//! Local-socket IPC between the background daemon and the GUI.
 //!
 //! The daemon owns the session and the tray; the GUI is a viewer that attaches
 //! and detaches. That split exists because the GUI cannot outlive its own
@@ -6,17 +6,24 @@
 //! cannot hide itself and keep running. Something that never had a window has
 //! to hold the session instead.
 //!
-//! Line-delimited JSON over `$XDG_RUNTIME_DIR/syrinx.sock`. The socket is in the
-//! runtime directory because it is cleared on logout, so a stale socket cannot
-//! outlive the session that made it.
+//! Line-delimited JSON. On Unix that travels over a socket in
+//! `$XDG_RUNTIME_DIR`, chosen because the directory is cleared on logout so a
+//! stale socket cannot outlive the session that made it. On Windows it is a
+//! named pipe, which has no filesystem presence to go stale.
+//!
+//! Deliberately *not* the abstract namespace on Linux, though `interprocess`
+//! offers it on both platforms: an abstract socket has no filesystem
+//! permissions, so every user on the machine could drive the daemon. A named
+//! pipe carries a security descriptor, so Windows loses nothing by it.
 
 use crate::mode::OutputMode;
 use crate::save::Format;
 use crate::session::{SessionState, Status};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use interprocess::local_socket::traits::Stream as _;
+use interprocess::local_socket::{Name, Stream};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 /// A request from a front-end to the daemon.
@@ -114,9 +121,37 @@ impl DaemonState {
 }
 
 /// Path of the daemon socket.
+///
+/// Meaningful only on Unix. Windows named pipes live in their own namespace,
+/// so the path is used purely as the source of the pipe's name.
 pub fn socket_path() -> PathBuf {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(dir).join("syrinx.sock")
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"\\.\pipe\syrinx.sock")
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(dir).join("syrinx.sock")
+    }
+}
+
+/// The address the daemon listens on and clients connect to.
+pub fn socket_name() -> Result<Name<'static>> {
+    #[cfg(windows)]
+    {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+        "syrinx.sock"
+            .to_ns_name::<GenericNamespaced>()
+            .context("building the daemon pipe name")
+    }
+    #[cfg(not(windows))]
+    {
+        use interprocess::local_socket::{GenericFilePath, ToFsName};
+        socket_path()
+            .to_fs_name::<GenericFilePath>()
+            .context("building the daemon socket name")
+    }
 }
 
 /// Send one request and read the reply.
@@ -125,19 +160,25 @@ pub fn socket_path() -> PathBuf {
 /// a viewer that dies mid-request leaves nothing behind for the daemon to clean
 /// up.
 pub fn request(req: &Request) -> Result<Response> {
-    let path = socket_path();
-    let stream = UnixStream::connect(&path)
-        .with_context(|| format!("connecting to the syrinx daemon at {}", path.display()))?;
+    let stream = Stream::connect(socket_name()?).with_context(|| {
+        format!(
+            "connecting to the syrinx daemon at {}",
+            socket_path().display()
+        )
+    })?;
     // Bounded so a wedged daemon cannot hang a GUI frame indefinitely.
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .set_recv_timeout(Some(std::time::Duration::from_secs(5)))
         .ok();
-    let mut w = stream.try_clone().context("cloning the socket")?;
+
+    // `&Stream` is both Read and Write, so one connection serves both
+    // directions without a duplicate handle.
+    let mut w = &stream;
     writeln!(w, "{}", serde_json::to_string(req)?).context("sending the request")?;
     w.flush().ok();
 
     let mut line = String::new();
-    BufReader::new(stream)
+    BufReader::new(&stream)
         .read_line(&mut line)
         .context("reading the reply")?;
     serde_json::from_str(&line).context("decoding the reply")
@@ -150,14 +191,20 @@ pub fn request(req: &Request) -> Result<Response> {
 /// front-end fail with a confusing connection error instead of just starting
 /// one.
 pub fn daemon_running() -> bool {
-    UnixStream::connect(socket_path()).is_ok()
+    socket_name().is_ok_and(|n| Stream::connect(n).is_ok())
 }
 
 /// Remove a socket left behind by a daemon that did not shut down cleanly.
+///
+/// Unix only. A named pipe exists only while its server holds it open, so
+/// Windows has nothing that can be left behind.
 pub fn clear_stale_socket() {
-    let p = socket_path();
-    if p.exists() && !daemon_running() {
-        let _ = std::fs::remove_file(&p);
+    #[cfg(not(windows))]
+    {
+        let p = socket_path();
+        if p.exists() && !daemon_running() {
+            let _ = std::fs::remove_file(&p);
+        }
     }
 }
 
@@ -225,6 +272,13 @@ mod tests {
         // XDG_RUNTIME_DIR is cleared on logout, so a stale socket cannot
         // outlive the session that created it.
         assert!(socket_path().ends_with("syrinx.sock"));
+    }
+
+    #[test]
+    fn the_socket_name_is_constructible_on_this_platform() {
+        // A name that cannot be built means no front-end can reach the daemon
+        // at all, so it is worth failing here rather than at first use.
+        socket_name().expect("the platform socket name must build");
     }
 
     #[test]

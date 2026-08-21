@@ -11,8 +11,9 @@ use crate::session::{SessionHandle, SessionOptions};
 use crate::tray::{TrayCommand, TrayState};
 use crate::{Config, choose_source, list_sources};
 use anyhow::{Context, Result};
+use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+use interprocess::local_socket::{ListenerOptions, Stream};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex, mpsc};
 use tracing::{error, info, warn};
 
@@ -35,14 +36,18 @@ pub struct DaemonOptions {
 pub fn run(opts: DaemonOptions) -> Result<()> {
     ipc::clear_stale_socket();
     let sock = ipc::socket_path();
-    if sock.exists() {
+    // Ask rather than infer: on Windows there is no file to look for, and on
+    // Unix a leftover file is not proof of a live daemon.
+    if ipc::daemon_running() {
         anyhow::bail!(
             "a syrinx daemon is already running (socket at {}). Use `syrinx stop` \
              or quit it from the tray.",
             sock.display()
         );
     }
-    let listener = UnixListener::bind(&sock)
+    let listener = ListenerOptions::new()
+        .name(ipc::socket_name()?)
+        .create_sync()
         .with_context(|| format!("binding the daemon socket at {}", sock.display()))?;
 
     // A channel per source of commands, so the main loop has one place to look.
@@ -230,18 +235,15 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
 }
 
 fn serve_client(
-    stream: UnixStream,
+    stream: Stream,
     tx: mpsc::Sender<(Request, Option<mpsc::Sender<Response>>)>,
     published: Arc<Mutex<DaemonState>>,
 ) {
-    let peer = match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("cloning a client socket: {e}");
-            return;
-        }
-    };
-    let mut reader = BufReader::new(peer);
+    // A client that connects and then goes quiet must not tie up a thread.
+    stream
+        .set_recv_timeout(Some(std::time::Duration::from_secs(30)))
+        .ok();
+    let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;

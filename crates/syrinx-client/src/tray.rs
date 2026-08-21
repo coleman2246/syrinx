@@ -225,6 +225,7 @@ impl ksni::Tray for SyrinxTray {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -238,7 +239,9 @@ fn truncate(s: &str, max: usize) -> String {
 /// platform without an implementation. A missing tray must never stop the GUI
 /// starting.
 pub fn start() -> Option<(TrayHandle, mpsc::UnboundedReceiver<TrayCommand>)> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    // Annotated: on platforms without a tray, nothing else pins the element
+    // type and inference has nowhere to look.
+    let (tx, rx) = mpsc::unbounded_channel::<TrayCommand>();
 
     #[cfg(target_os = "linux")]
     {
@@ -265,7 +268,9 @@ pub fn start() -> Option<(TrayHandle, mpsc::UnboundedReceiver<TrayCommand>)> {
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = tx;
+        // Both halves are dropped: without a tray there is nothing to send on
+        // and nothing to receive from.
+        let _ = (tx, rx);
         tracing::info!("system tray is not implemented on this platform");
         None
     }

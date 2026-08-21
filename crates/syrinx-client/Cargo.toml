@@ -17,6 +17,9 @@ tokio-tungstenite = "0.30"
 futures-util = "0.3"
 toml_edit = "0.25"
 toml = "0.9"
+interprocess = "2.4.3"
+
+[target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -25,3 +28,6 @@ nix = { version = "0.31", features = ["signal", "process"] }
 # "blocking" because the async API panics under eframe: zbus spawns its own
 # thread and calls tokio::spawn from it, outside any runtime context.
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
