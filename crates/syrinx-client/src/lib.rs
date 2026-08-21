@@ -15,6 +15,7 @@ pub mod preview;
 pub mod save;
 pub mod session;
 pub mod state;
+pub mod stream;
 
 /// System tray. Linux only; a no-op elsewhere.
 pub mod tray;

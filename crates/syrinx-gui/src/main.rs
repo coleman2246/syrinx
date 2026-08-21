@@ -786,6 +786,31 @@ impl App {
                     path: None,
                 });
             }
+            // Streaming is a property of the next session, so it can be
+            // changed while one is running without disturbing it.
+            let streaming = self.state.stream_to.is_some();
+            let label = if streaming { "Streaming ⏺" } else { "Stream…" };
+            let hover = match &self.state.stream_to {
+                Some(p) => format!("Appending to {p}\nClick to stop"),
+                None => "Append the transcript to a file as you speak, so\n\
+                         nothing is lost if this crashes"
+                    .to_string(),
+            };
+            if ui.button(label).on_hover_text(hover).clicked() {
+                if streaming {
+                    action = Some(Request::SetStreamFile { path: None });
+                    self.status_line = Some("Stopped streaming to file".into());
+                } else if let Some(p) = rfd::FileDialog::new()
+                    .set_file_name("transcript.txt")
+                    .set_directory(save::default_dir())
+                    .save_file()
+                {
+                    let path = p.display().to_string();
+                    self.status_line = Some(format!("Appending to {path}"));
+                    action = Some(Request::SetStreamFile { path: Some(path) });
+                }
+            }
+
             if ui
                 .add_enabled(has_text, egui::Button::new("Save as…"))
                 .clicked()

@@ -37,6 +37,15 @@ pub struct Config {
     /// need `ydotool`; see the Method docs.
     #[serde(default)]
     pub inject: crate::inject::Method,
+    /// Append the transcript to this file while it is being dictated.
+    ///
+    /// Unset by default. Set it and every session appends to the same file, so
+    /// stopping and starting continues where it left off.
+    #[serde(default)]
+    pub stream_to: Option<String>,
+    /// Layout for saved and streamed transcripts.
+    #[serde(default)]
+    pub format: crate::save::Format,
     /// Global hotkey that starts and stops dictation, e.g. `ctrl+alt+d`.
     ///
     /// Unset by default: claiming a key combination for the whole desktop is
@@ -122,6 +131,11 @@ impl Config {
             Some(u) => u.clone(),
             None => server_url(&self.server),
         }
+    }
+
+    /// Where to stream the transcript, with `~` expanded.
+    pub fn stream_path(&self) -> Option<PathBuf> {
+        self.stream_to.as_deref().map(expand_tilde)
     }
 
     /// Canonical location.
@@ -360,6 +374,28 @@ pub fn template() -> String {
     s.push_str(&comment_wrap(crate::hotkey::PORTABILITY_NOTE));
     s.push_str("# hotkey = \"ctrl+alt+d\"\n\n");
 
+    s.push_str(&comment_wrap(
+        "Append the transcript to this file as it is dictated, rather than \
+         only saving at the end. Every session appends to the same file, so \
+         stopping and starting continues where you left off, and a crash \
+         costs the last sentence rather than the whole session.",
+    ));
+    s.push_str("# stream_to = \"~/transcripts/notes.txt\"\n\n");
+
+    s.push_str("# Layout for saved and streamed transcripts.\n");
+    for f in crate::save::Format::ALL {
+        s.push_str(&format!(
+            "#   \"{}\"{} -- {}\n",
+            f.name(),
+            pad(f.name()),
+            f.summary()
+        ));
+    }
+    s.push_str(&format!(
+        "format = \"{}\"\n\n",
+        crate::save::Format::default().name()
+    ));
+
     s.push_str(
         "# Capture source to use, as printed by `syrinx sources`.\n\
          # Left unset, syrinx asks or uses the default input.\n\
@@ -445,6 +481,26 @@ but the file must contain all of the ones you want:
 ///
 /// `%APPDATA%` on Windows, XDG on everything else. XDG_CONFIG_HOME is honoured
 /// first on both, which is what lets the tests point at a scratch directory.
+/// Expand a leading `~` to the home directory.
+///
+/// Done here rather than left to the shell: this value comes from a config
+/// file and from a GUI text box, neither of which a shell has touched, and
+/// a literal `~` directory is never what was meant.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    let Some(rest) = path.strip_prefix('~') else {
+        return PathBuf::from(path);
+    };
+    let rest = rest.trim_start_matches(['/', '\\']);
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from);
+    match home {
+        Ok(h) if rest.is_empty() => h,
+        Ok(h) => h.join(rest),
+        Err(_) => PathBuf::from(path),
+    }
+}
+
 fn config_base() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
         return PathBuf::from(dir);
@@ -726,6 +782,24 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_tilde_becomes_the_home_directory() {
+        // The value comes from a config file and a text box; no shell has
+        // expanded it, and a literal `~` folder is never what was meant.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap();
+        assert_eq!(expand_tilde("~/notes.txt"), PathBuf::from(&home).join("notes.txt"));
+        assert_eq!(expand_tilde("~"), PathBuf::from(&home));
+    }
+
+    #[test]
+    fn a_path_without_a_tilde_is_untouched() {
+        assert_eq!(expand_tilde("/tmp/a.txt"), PathBuf::from("/tmp/a.txt"));
+        // Not a prefix, so not an expansion.
+        assert_eq!(expand_tilde("/tmp/~x"), PathBuf::from("/tmp/~x"));
+    }
+
+    #[test]
     fn a_first_run_writes_a_config_and_says_where() {
         let dir = scratch("firstrun");
         let path = dir.join("config.toml");
@@ -815,6 +889,8 @@ mod tests {
         let c = Config {
             server: "h:1".into(),
             url: None,
+            stream_to: Some("~/notes.txt".into()),
+            format: crate::save::Format::Timestamped,
             token: "t".into(),
             hotkey: Some("ctrl+alt+d".into()),
             source_key: Some("rnnoise_source".into()),

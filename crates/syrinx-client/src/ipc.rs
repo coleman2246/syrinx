@@ -44,6 +44,9 @@ pub enum Request {
     },
     /// Point the daemon at a different machine. Applies to the next session.
     SetServer { server: String },
+    /// Append the transcript to this file as it is dictated. `None` stops.
+    /// Takes effect on the next session.
+    SetStreamFile { path: Option<String> },
     /// Save the current transcript, returning the path written.
     Save { format: Format, path: Option<String> },
     /// Transcribe an audio file, replacing the current transcript.
@@ -104,6 +107,9 @@ pub struct DaemonState {
     /// What became of the configured global hotkey. Shown in the GUI's help.
     #[serde(default)]
     pub hotkey: crate::hotkey::Report,
+    /// Where the transcript is being appended, if anywhere.
+    #[serde(default)]
+    pub stream_to: Option<String>,
 }
 
 impl DaemonState {
@@ -126,6 +132,7 @@ impl DaemonState {
             progress: 0.0,
             // Stamped by the daemon, which is the only thing that knows.
             hotkey: crate::hotkey::Report::Unset,
+            stream_to: None,
         }
     }
 }

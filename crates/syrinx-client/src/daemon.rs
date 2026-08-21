@@ -234,6 +234,17 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                         Response::Ok
                     }
                 }
+                Request::SetStreamFile { path } => {
+                    state.opts.config.stream_to = path;
+                    if let Err(e) = state
+                        .opts
+                        .config
+                        .save(&crate::Config::default_path())
+                    {
+                        warn!("saving the config: {e:#}");
+                    }
+                    Response::Ok
+                }
                 Request::SetServer { server } => {
                     // Sessions read the URL at start, so this takes effect on
                     // the next one rather than disturbing a running session.
@@ -286,6 +297,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         // Settled at startup and constant thereafter, so it is stamped on
         // rather than carried through the session machinery.
         snap.hotkey = hotkey_report.clone();
+        snap.stream_to = state.opts.config.stream_to.clone();
         *published.lock().expect("published state poisoned") = snap.clone();
 
         if let Some(h) = &tray_handle {
@@ -511,6 +523,14 @@ impl DaemonRuntime {
 
         let (url, token) = (self.opts.config.url(), self.opts.config.token.clone());
         let inject = self.opts.config.inject;
+        // Shared by every session in separate mode. The file is opened for
+        // append, so each write lands at the end atomically and fragments
+        // interleave in arrival order rather than tearing.
+        let stream = self
+            .opts
+            .config
+            .stream_path()
+            .map(|p| (p, self.opts.format));
         match self.opts.source_mode {
             crate::mode::SourceMode::Combined => {
                 self.sessions.push(crate::session::start(
@@ -522,6 +542,7 @@ impl DaemonRuntime {
                         // Attribution is meaningless once mixed.
                         label: None,
                         inject,
+                        stream,
                     },
                     || {},
                 ));
@@ -545,6 +566,7 @@ impl DaemonRuntime {
                             mode,
                             label,
                             inject,
+                            stream: stream.clone(),
                         },
                         || {},
                     ));

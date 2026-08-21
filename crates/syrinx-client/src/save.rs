@@ -34,6 +34,24 @@ impl Format {
         }
     }
 
+    /// The value as written in the config file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Plain => "plain",
+            Format::Timestamped => "timestamped",
+            Format::Labelled => "labelled",
+        }
+    }
+
+    /// One line for the generated config.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Format::Plain => "continuous prose. For when the words are the point",
+            Format::Timestamped => "each line prefixed [MM:SS]. An index into a recording",
+            Format::Labelled => "time and source per line. For several sources at once",
+        }
+    }
+
     pub const ALL: [Format; 3] = [Format::Plain, Format::Timestamped, Format::Labelled];
 }
 
@@ -270,6 +288,16 @@ pub fn save_rendered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_names_match_what_serde_accepts() {
+        // Written into the generated config; a mismatch would emit a file
+        // syrinx cannot read back.
+        for f in Format::ALL {
+            let quoted = format!("\"{}\"", f.name());
+            assert_eq!(serde_json::from_str::<Format>(&quoted).unwrap(), f);
+        }
+    }
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("syrinx-save-{name}-{}", std::process::id()))

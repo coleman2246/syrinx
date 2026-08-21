@@ -75,6 +75,10 @@ enum Cmd {
         /// mixing them into one. Only the first source types at the cursor.
         #[arg(long)]
         separate: bool,
+        /// Append the transcript to this file as it is dictated, rather than
+        /// only saving at the end. Overrides `stream_to` in the config.
+        #[arg(long, value_name = "FILE")]
+        stream: Option<PathBuf>,
         /// Write the transcript to this file when the session ends.
         #[arg(long)]
         save: Option<PathBuf>,
@@ -100,6 +104,9 @@ enum Cmd {
         source: Vec<String>,
         #[arg(long)]
         separate: bool,
+        /// Append the transcript to this file as it is dictated.
+        #[arg(long, value_name = "FILE")]
+        stream: Option<PathBuf>,
         #[arg(long)]
         save: Option<PathBuf>,
         #[arg(long, conflicts_with = "save")]
@@ -245,6 +252,7 @@ fn main() -> Result<()> {
             mode,
             source,
             separate,
+            stream,
             save,
             save_default,
             format,
@@ -261,13 +269,14 @@ fn main() -> Result<()> {
                 ask_daemon(syrinx_client::ipc::Request::Toggle)?;
                 return Ok(());
             }
-            run(cli.config, mode, source, separate, save, save_default, format.into(), split, pid_path)
+            run(cli.config, mode, source, separate, stream, save, save_default, format.into(), split, pid_path)
         }
 
         Cmd::Start {
             mode,
             source,
             separate,
+            stream,
             save,
             save_default,
             format,
@@ -276,7 +285,7 @@ fn main() -> Result<()> {
             if let Some(pid) = state::running_pid(&pid_path) {
                 anyhow::bail!("already running (pid {pid})");
             }
-            run(cli.config, mode, source, separate, save, save_default, format.into(), split, pid_path)
+            run(cli.config, mode, source, separate, stream, save, save_default, format.into(), split, pid_path)
         }
     }
 }
@@ -287,6 +296,7 @@ fn run(
     mode: Option<ModeArg>,
     sources_wanted: Vec<String>,
     separate: bool,
+    stream: Option<PathBuf>,
     save_to: Option<PathBuf>,
     save_default: bool,
     format: save::Format,
@@ -318,6 +328,15 @@ fn run(
         syrinx_client::mode::SourceMode::Combined
     };
 
+    // The flag wins over the config, so a one-off run can stream somewhere
+    // else without editing anything.
+    let stream_target = stream
+        .map(|p| (p, format))
+        .or_else(|| cfg.stream_path().map(|p| (p, format)));
+    if let Some((path, _)) = &stream_target {
+        info!("appending the transcript to {}", path.display());
+    }
+
     state::write_pid(&pid_path, std::process::id() as i32)?;
     state::refresh_waybar(cfg.waybar_signal);
 
@@ -333,6 +352,7 @@ fn run(
                 mode,
                 label: None,
                 inject: cfg.inject,
+                stream: stream_target.clone(),
             },
             // The CLI has nothing to repaint, so state changes need no callback.
             || {},
@@ -350,6 +370,7 @@ fn run(
                         mode: if i == 0 { mode } else { OutputMode::Transcribe },
                         label,
                         inject: cfg.inject,
+                        stream: stream_target.clone(),
                     },
                     || {},
                 )

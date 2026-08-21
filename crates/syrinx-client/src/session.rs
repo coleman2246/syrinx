@@ -88,6 +88,8 @@ pub struct SessionOptions {
     pub label: Option<String>,
     /// How text is typed at the cursor.
     pub inject: crate::inject::Method,
+    /// Append each committed fragment to this file as it arrives.
+    pub stream: Option<(std::path::PathBuf, crate::save::Format)>,
 }
 
 /// Handle to a running session. Dropping it stops the session.
@@ -260,6 +262,16 @@ async fn run(
         opts.mode.label()
     );
 
+    // Opened before the session starts, so an unwritable path is refused now
+    // rather than discovered after an hour of talking.
+    let mut stream = match &opts.stream {
+        Some((path, format)) => Some(
+            crate::stream::StreamWriter::open(path, *format)
+                .context("opening the transcript stream")?,
+        ),
+        None => None,
+    };
+
     let st = state.clone();
     let n = notify.clone();
     let mode = opts.mode;
@@ -276,14 +288,23 @@ async fn run(
                     {
                         error!("failed to type {text:?}: {e:#}");
                     }
+                    let seg = Segment {
+                        at: started.elapsed().as_secs_f64(),
+                        text: text.clone(),
+                        source: label.clone(),
+                    };
+                    // Written whatever the mode: the point of streaming is a
+                    // copy on disk, and typing at the cursor is exactly when
+                    // no transcript is kept in memory to save later.
+                    if let Some(w) = stream.as_mut()
+                        && let Err(e) = w.append(&seg)
+                    {
+                        error!("failed to append to the transcript stream: {e:#}");
+                    }
                     let mut s = st.lock().expect("state lock poisoned");
                     if mode.keeps_transcript() {
                         s.transcript.push_str(&text);
-                        s.segments.push(Segment {
-                            at: started.elapsed().as_secs_f64(),
-                            text: text.clone(),
-                            source: label.clone(),
-                        });
+                        s.segments.push(seg);
                     }
                     s.last_fragment = text;
                     drop(s);
