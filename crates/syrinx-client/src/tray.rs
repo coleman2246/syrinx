@@ -246,7 +246,18 @@ fn truncate(s: &str, max: usize) -> String {
 /// Returns `None` where no tray is available -- no SNI host running, or a
 /// platform without an implementation. A missing tray must never stop the GUI
 /// starting.
-pub fn start(hotkey: Option<crate::hotkey::HotKey>) -> Option<(TrayHandle, mpsc::UnboundedReceiver<TrayCommand>)> {
+pub struct Tray {
+    pub handle: TrayHandle,
+    pub commands: mpsc::UnboundedReceiver<TrayCommand>,
+    /// Why the hotkey did not register, where it was tried and failed.
+    ///
+    /// Carried out of here because registration happens on the tray's thread
+    /// on Windows -- the two share a message loop -- and the daemon has to
+    /// report the outcome rather than assume it.
+    pub hotkey_error: Option<String>,
+}
+
+pub fn start(hotkey: Option<crate::hotkey::HotKey>) -> Option<Tray> {
     // Annotated: on platforms without a tray, nothing else pins the element
     // type and inference has nowhere to look.
     let (tx, rx) = mpsc::unbounded_channel::<TrayCommand>();
@@ -262,13 +273,15 @@ pub fn start(hotkey: Option<crate::hotkey::HotKey>) -> Option<(TrayHandle, mpsc:
             tx,
         };
         match tray.spawn() {
-            Ok(handle) => Some((
-                TrayHandle {
+            Ok(handle) => Some(Tray {
+                handle: TrayHandle {
                     handle,
                     last: Mutex::new(None),
                 },
-                rx,
-            )),
+                commands: rx,
+                // Registered separately on Linux, so nothing to report here.
+                hotkey_error: None,
+            }),
             Err(e) => {
                 // No SNI host running is normal, not an error worth failing on.
                 tracing::info!("running without a system tray: {e}");
@@ -282,14 +295,15 @@ pub fn start(hotkey: Option<crate::hotkey::HotKey>) -> Option<(TrayHandle, mpsc:
         // The Windows tray makes its own channel, because its thread has to
         // own both ends of the message loop.
         let _ = (tx, rx);
-        let (updates, cmds) = crate::windows_ui::start(hotkey)?;
-        Some((
-            TrayHandle {
+        let (updates, cmds, hotkey_error) = crate::windows_ui::start(hotkey)?;
+        Some(Tray {
+            handle: TrayHandle {
                 updates,
                 last: Mutex::new(None),
             },
-            cmds,
-        ))
+            commands: cmds,
+            hotkey_error,
+        })
     }
 
     #[cfg(not(any(target_os = "linux", windows)))]

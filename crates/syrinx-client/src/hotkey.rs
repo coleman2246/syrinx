@@ -15,6 +15,54 @@
 //! everywhere and so the error messages are the same everywhere.
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+
+/// What actually became of the configured hotkey.
+///
+/// Reported by the daemon, which is the only thing that knows: registration can
+/// fail because another application already owns the combination, and a help
+/// screen that claimed otherwise would send the user looking at their config
+/// instead of at the application that took the key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Report {
+    /// None configured.
+    #[default]
+    Unset,
+    /// Registered and listening.
+    Active { spelled: String },
+    /// Cannot work on this platform, with what to do instead.
+    Unavailable { spelled: String, why: String },
+    /// Could work here, but did not.
+    Failed { spelled: String, error: String },
+}
+
+impl Report {
+    /// One line for a status area.
+    pub fn summary(&self) -> String {
+        match self {
+            Report::Unset => "No global hotkey set".into(),
+            Report::Active { spelled } => format!("{spelled} starts and stops dictation"),
+            Report::Unavailable { spelled, .. } => {
+                format!("{spelled} cannot be registered on this system")
+            }
+            Report::Failed { spelled, .. } => format!("{spelled} could not be registered"),
+        }
+    }
+
+    /// The longer explanation, where there is one.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Report::Unset | Report::Active { .. } => None,
+            Report::Unavailable { why, .. } => Some(why),
+            Report::Failed { error, .. } => Some(error),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self, Report::Active { .. })
+    }
+}
 
 /// Modifier keys, as a set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -199,6 +247,42 @@ pub fn supported_here() -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_report_says_something_useful() {
+        // The help screen renders these directly; an empty one would be a
+        // blank line where an explanation should be.
+        let reports = [
+            Report::Unset,
+            Report::Active { spelled: "ctrl+alt+d".into() },
+            Report::Unavailable { spelled: "ctrl+alt+d".into(), why: "because".into() },
+            Report::Failed { spelled: "ctrl+alt+d".into(), error: "taken".into() },
+        ];
+        for r in reports {
+            assert!(!r.summary().trim().is_empty(), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_registered_hotkey_reads_as_active() {
+        assert!(Report::Active { spelled: "x".into() }.is_active());
+        assert!(!Report::Unset.is_active());
+        assert!(!Report::Failed { spelled: "x".into(), error: "e".into() }.is_active());
+    }
+
+    #[test]
+    fn a_failure_explains_itself() {
+        // "could not be registered" alone leaves nowhere to go.
+        let r = Report::Failed { spelled: "ctrl+alt+d".into(), error: "already in use".into() };
+        assert_eq!(r.detail(), Some("already in use"));
+    }
+
+    #[test]
+    fn reports_round_trip_over_ipc() {
+        let r = Report::Unavailable { spelled: "ctrl+alt+d".into(), why: "wayland".into() };
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Report>(&s).unwrap(), r);
+    }
 
     #[test]
     fn a_plain_combination_parses() {

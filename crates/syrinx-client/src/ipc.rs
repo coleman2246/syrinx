@@ -57,6 +57,11 @@ pub enum Request {
 }
 
 /// The daemon's reply. Every request gets exactly one.
+///
+/// `State` dwarfs the other variants, but boxing it would trade a stack copy
+/// for a heap allocation on the one variant that is sent most often, and these
+/// are serialised and dropped immediately rather than held in bulk.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
@@ -96,6 +101,9 @@ pub struct DaemonState {
     /// a file.
     #[serde(default)]
     pub progress: f32,
+    /// What became of the configured global hotkey. Shown in the GUI's help.
+    #[serde(default)]
+    pub hotkey: crate::hotkey::Report,
 }
 
 impl DaemonState {
@@ -116,6 +124,8 @@ impl DaemonState {
             levels: s.levels.clone(),
             rms: s.rms,
             progress: 0.0,
+            // Stamped by the daemon, which is the only thing that knows.
+            hotkey: crate::hotkey::Report::Unset,
         }
     }
 }

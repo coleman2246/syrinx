@@ -17,6 +17,44 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use tracing::{error, info, warn};
 
+/// Work out what to tell the user about their hotkey.
+///
+/// Three different things can be true and they are not interchangeable: none
+/// was asked for, one was asked for and cannot work here, or one was asked for
+/// and failed. Only the daemon knows the third, since registration happens
+/// alongside the tray.
+fn report_hotkey(
+    hotkey: Option<&crate::hotkey::HotKey>,
+    error: Option<String>,
+) -> crate::hotkey::Report {
+    let Some(h) = hotkey else {
+        return crate::hotkey::Report::Unset;
+    };
+    let spelled = h.spelled.clone();
+
+    if let Some(why) = crate::hotkey::supported_here() {
+        return crate::hotkey::Report::Unavailable {
+            spelled,
+            why: why.to_string(),
+        };
+    }
+    if let Some(error) = error {
+        return crate::hotkey::Report::Failed { spelled, error };
+    }
+    // Linux under X11: the parser accepts it and the platform allows it, but
+    // registration is only wired up on Windows so far. Saying "active" here
+    // would be a lie the user could only catch by pressing the key.
+    if !cfg!(windows) {
+        return crate::hotkey::Report::Unavailable {
+            spelled,
+            why: "syrinx only registers hotkeys on Windows so far. Bind it in \
+                  your window manager to run `syrinx toggle`."
+                .into(),
+        };
+    }
+    crate::hotkey::Report::Active { spelled }
+}
+
 /// Read and check the configured hotkey.
 fn state_hotkey(config: &Config) -> Result<Option<crate::hotkey::HotKey>> {
     let Some(spec) = config.hotkey.as_deref() else {
@@ -101,31 +139,23 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     };
 
     let tray = crate::tray::start(hotkey.clone());
-    let (tray_handle, mut tray_rx) = match tray {
-        Some((h, rx)) => (Some(h), Some(rx)),
+    let (tray_handle, mut tray_rx, hotkey_error) = match tray {
+        Some(t) => (Some(t.handle), Some(t.commands), t.hotkey_error),
         None => {
             info!("no system tray available; running headless");
-            (None, None)
+            (None, None, None)
         }
     };
+
+    // What actually became of the hotkey, so the GUI's help can report the
+    // truth rather than repeat the config back at the user.
+    let hotkey_report = report_hotkey(hotkey.as_ref(), hotkey_error);
+    info!("{}", hotkey_report.summary());
 
     // Linux registers separately from the tray: ksni has no message loop to
     // share. On Wayland there is nothing to register at all, and saying so is
     // the whole point -- a hotkey that silently does nothing is worse than one
     // that was never offered.
-    #[cfg(target_os = "linux")]
-    if let Some(h) = &hotkey {
-        match crate::hotkey::supported_here() {
-            Some(why) => info!("hotkey {} not registered. {}", h.spelled, why),
-            None => info!(
-                "hotkey {} configured, but syrinx only registers hotkeys on \
-                 Windows so far; bind it in your window manager to run \
-                 `syrinx toggle`",
-                h.spelled
-            ),
-        }
-    }
-
     let mut state = DaemonRuntime {
         opts,
         sessions: Vec::new(),
@@ -248,7 +278,10 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         state.reap_file_job();
         state.update_preview();
 
-        let snap = state.snapshot();
+        let mut snap = state.snapshot();
+        // Settled at startup and constant thereafter, so it is stamped on
+        // rather than carried through the session machinery.
+        snap.hotkey = hotkey_report.clone();
         *published.lock().expect("published state poisoned") = snap.clone();
 
         if let Some(h) = &tray_handle {

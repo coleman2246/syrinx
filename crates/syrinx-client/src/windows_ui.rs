@@ -30,19 +30,33 @@ const ICON: u32 = 32;
 /// Returns the update channel for the tray and the command stream from it.
 pub fn start(
     hotkey: Option<crate::hotkey::HotKey>,
-) -> Option<(StdSender<TrayState>, mpsc::UnboundedReceiver<TrayCommand>)> {
+) -> Option<(
+    StdSender<TrayState>,
+    mpsc::UnboundedReceiver<TrayCommand>,
+    Option<String>,
+)> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TrayCommand>();
     let (state_tx, state_rx) = std::sync::mpsc::channel::<TrayState>();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Ready>();
 
     std::thread::spawn(move || run(hotkey, cmd_tx, state_rx, ready_tx));
 
-    // Wait for the thread to say whether it got a tray at all, so the daemon can
-    // log "running headless" truthfully rather than optimistically.
+    // Wait for the thread to say what it managed to start, so the daemon can
+    // report the truth rather than what it hoped for.
     match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(true) => Some((state_tx, cmd_rx)),
+        Ok(Ready {
+            tray: true,
+            hotkey_error,
+        }) => Some((state_tx, cmd_rx, hotkey_error)),
         _ => None,
     }
+}
+
+/// What the UI thread managed to start.
+struct Ready {
+    tray: bool,
+    /// `None` when the hotkey registered, or when none was asked for.
+    hotkey_error: Option<String>,
 }
 
 /// Menu item ids, so a click can be matched back to a command.
@@ -59,7 +73,7 @@ fn run(
     hotkey: Option<crate::hotkey::HotKey>,
     cmd_tx: mpsc::UnboundedSender<TrayCommand>,
     state_rx: StdReceiver<TrayState>,
-    ready_tx: StdSender<bool>,
+    ready_tx: StdSender<Ready>,
 ) {
     let toggle = MenuItem::new("Start / stop dictation", true, None);
     let transcribe = MenuItem::new("Mode: transcribe", true, None);
@@ -89,7 +103,10 @@ fn run(
     ]);
     if let Err(e) = built {
         warn!("building the tray menu: {e}");
-        let _ = ready_tx.send(false);
+        let _ = ready_tx.send(Ready {
+            tray: false,
+            hotkey_error: Some(e.to_string()),
+        });
         return;
     }
 
@@ -104,13 +121,17 @@ fn run(
         Err(e) => {
             // No notification area is survivable; the CLI still works.
             info!("running without a system tray: {e}");
-            let _ = ready_tx.send(false);
+            let _ = ready_tx.send(Ready {
+                tray: false,
+                hotkey_error: None,
+            });
             return;
         }
     };
 
     // Registered on this thread, because the hotkey's window belongs to it.
     // Kept alive for the life of the thread: dropping the manager unregisters.
+    let mut hotkey_error = None;
     let _hotkeys = hotkey.and_then(|h| match register(&h) {
         Ok(m) => {
             info!("hotkey {} registered", h.spelled);
@@ -119,11 +140,15 @@ fn run(
         Err(e) => {
             // Almost always another application already owns the combination.
             warn!("could not register the hotkey {}: {e}", h.spelled);
+            hotkey_error = Some(e.to_string());
             None
         }
     });
 
-    let _ = ready_tx.send(true);
+    let _ = ready_tx.send(Ready {
+        tray: true,
+        hotkey_error,
+    });
 
     let menu_events = MenuEvent::receiver();
     let tray_events = TrayIconEvent::receiver();
