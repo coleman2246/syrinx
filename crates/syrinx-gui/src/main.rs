@@ -153,6 +153,20 @@ fn tail(path: &std::path::Path) -> String {
     lines[start..].join("\n")
 }
 
+/// Render key/description pairs as an aligned two-column grid.
+fn keys_table(ui: &mut egui::Ui, id: &str, rows: &[(&str, &str)]) {
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            for (key, what) in rows {
+                ui.label(egui::RichText::new(*key).monospace().strong());
+                ui.label(*what);
+                ui.end_row();
+            }
+        });
+}
+
 #[cfg(test)]
 mod ensure_daemon_tests {
     use super::*;
@@ -224,11 +238,14 @@ struct App {
     /// per keystroke, so a half-typed host is never dialled.
     url_edit: String,
     editing_url: bool,
+    /// Whether the help window is open.
+    show_help: bool,
 }
 
 impl App {
     fn new(config: Config) -> Self {
         let mut app = Self {
+            show_help: false,
             config,
             state: DaemonState::default(),
             sources: Vec::new(),
@@ -301,6 +318,11 @@ impl eframe::App for App {
             self.refresh_sources();
         }
         let running = self.state.status.is_active();
+
+        if let Some(req) = self.keyboard_shortcuts(ui) {
+            self.send(req);
+        }
+        self.help_window(&ctx);
 
         ui.add_space(4.0);
         self.status_row(ui);
@@ -615,6 +637,119 @@ impl App {
             });
     }
 
+    /// Keys handled by this window.
+    ///
+    /// Every one takes a modifier. A bare key would fire while typing into the
+    /// server address field, and egui reports key presses whether or not a text
+    /// field has focus.
+    fn keyboard_shortcuts(&mut self, ui: &mut egui::Ui) -> Option<Request> {
+        let (toggle, save, help) = ui.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::D),
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::S),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::F1),
+            )
+        });
+        if help {
+            self.show_help = !self.show_help;
+        }
+        if toggle {
+            return Some(Request::Toggle);
+        }
+        if save && !self.state.transcript.trim().is_empty() {
+            return Some(Request::Save {
+                format: self.save_format,
+                path: None,
+            });
+        }
+        None
+    }
+
+    /// Everything that can drive syrinx, in one place.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_help;
+        let mut close_clicked = false;
+        egui::Window::new("Keys and controls")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.heading("In this window");
+                keys_table(
+                    ui,
+                    "window-keys",
+                    &[
+                        ("Ctrl+D", "Start or stop dictation"),
+                        ("Ctrl+S", "Save the transcript"),
+                        ("F1", "Show or hide this window"),
+                    ],
+                );
+
+                ui.add_space(10.0);
+                ui.heading("Anywhere");
+                // Reported by the daemon rather than read from the config: a
+                // hotkey can be configured and still not be listening, and
+                // saying so is the whole point of showing it here.
+                let report = &self.state.hotkey;
+                ui.horizontal_wrapped(|ui| {
+                    let colour = if report.is_active() {
+                        egui::Color32::from_rgb(110, 205, 130)
+                    } else {
+                        egui::Color32::from_rgb(220, 170, 80)
+                    };
+                    ui.colored_label(colour, if report.is_active() { "●" } else { "○" });
+                    ui.label(report.summary());
+                });
+                if let Some(detail) = report.detail() {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(detail).weak().size(11.0));
+                }
+                if matches!(report, syrinx_client::hotkey::Report::Unset) {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Set one with `hotkey = \"ctrl+alt+d\"` in the config, \
+                             then restart the daemon.",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.heading("Tray icon");
+                keys_table(
+                    ui,
+                    "tray-keys",
+                    &[
+                        ("Left click", "Start or stop dictation"),
+                        ("Right click", "Mode, open this window, quit"),
+                    ],
+                );
+
+                ui.add_space(10.0);
+                ui.heading("Command line");
+                ui.label(
+                    egui::RichText::new("The same actions, for a key binding or a script.")
+                        .weak()
+                        .size(11.0),
+                );
+                keys_table(
+                    ui,
+                    "cli-keys",
+                    &[
+                        ("syrinx toggle", "Start or stop"),
+                        ("syrinx status", "What it is doing now"),
+                        ("syrinx quit", "Stop the daemon"),
+                    ],
+                );
+
+                ui.add_space(10.0);
+                close_clicked = ui.button("Close").clicked();
+            });
+        self.show_help = open && !close_clicked;
+    }
+
     fn controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, running: bool) {
         let mut action: Option<Request> = None;
         ui.horizontal(|ui| {
@@ -624,6 +759,14 @@ impl App {
                 }
             } else if ui.button("Start").clicked() {
                 action = Some(Request::Start);
+            }
+
+            if ui
+                .button("Help")
+                .on_hover_text("Keys and controls (F1)")
+                .clicked()
+            {
+                self.show_help = !self.show_help;
             }
 
             let has_text = !self.state.transcript.trim().is_empty();

@@ -99,7 +99,24 @@ bindsym $mod+n exec syrinx toggle
 ```
 
 The daemon logs which of these applies at startup rather than failing quietly,
-and the generated config says so too.
+the generated config says so too, and the GUI's help window reports what
+actually happened — a hotkey can be configured and still not be listening,
+because another application already owns the combination.
+
+## Keys
+
+Press **F1** in the GUI, or the Help button, for a window listing everything
+that can drive syrinx: the in-window keys, the global hotkey and its real
+status, what the tray icon does, and the CLI equivalents.
+
+| Key | Action |
+|---|---|
+| `Ctrl+D` | Start or stop dictation |
+| `Ctrl+S` | Save the transcript |
+| `F1` | Show or hide the help window |
+
+Every one takes a modifier: a bare key would fire while typing into the server
+address field.
 
 ## Windows notes
 
