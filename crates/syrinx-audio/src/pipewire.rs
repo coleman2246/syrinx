@@ -198,9 +198,14 @@ pub struct PwCapture {
     child: tokio::process::Child,
 }
 
-/// Bytes per read. 16 kHz mono s16 is 32 kB/s, so this is ~0.1s of audio:
-/// responsive without excessive syscalls.
-const READ_CHUNK: usize = 4096;
+/// Bytes per read. 16 kHz mono s16 is 32 kB/s, so 1024 bytes is 32 ms of audio.
+///
+/// This sets the ceiling on how often a level meter can move: at the previous
+/// 4096 bytes nothing downstream could update faster than about 8 Hz however
+/// fast it polled, which read as a laggy display. 32 ms is ~31 reads a second,
+/// which is nothing, and leaves the meter limited by the display rather than
+/// by the audio path.
+const READ_CHUNK: usize = 1024;
 
 impl PwCapture {
     /// Capture from a source or sink monitor, addressed by target.

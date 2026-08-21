@@ -13,7 +13,7 @@ use crate::{Config, choose_source, list_sources};
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use tracing::{error, info, warn};
 
 /// What the daemon does when a session ends by itself.
@@ -45,16 +45,26 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     // A channel per source of commands, so the main loop has one place to look.
     let (tx, rx) = mpsc::channel::<(Request, Option<mpsc::Sender<Response>>)>();
 
+    // Latest state, published by the loop and read directly by clients.
+    //
+    // GetState used to travel through the same channel as commands, so a poll
+    // waited for the next loop tick before it was even looked at. Reading a
+    // published snapshot decouples how fresh state is from how fast the loop
+    // spins, which is what a 30 Hz meter needs.
+    let published: Arc<Mutex<DaemonState>> = Arc::new(Mutex::new(DaemonState::default()));
+
     // Accept loop: one thread per connection, which is ample for a handful of
     // short-lived requests.
     {
         let tx = tx.clone();
+        let pub_state = published.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(s) => {
                         let tx = tx.clone();
-                        std::thread::spawn(move || serve_client(s, tx));
+                        let pub_state = pub_state.clone();
+                        std::thread::spawn(move || serve_client(s, tx, pub_state));
                     }
                     Err(e) => warn!("accepting a client: {e}"),
                 }
@@ -109,10 +119,11 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         // IPC requests.
         while let Ok((req, reply)) = rx.try_recv() {
             let resp = match req {
+                // Only reaches the loop as a keep-alive; the reply came from
+                // the published snapshot.
                 Request::GetState => {
-                    // A viewer is present, so metering is worth running.
                     state.last_viewer = Some(std::time::Instant::now());
-                    Response::State(state.snapshot())
+                    Response::Ok
                 }
                 Request::Start => {
                     state.start();
@@ -163,16 +174,20 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         state.reap_finished_session();
         state.update_preview();
 
+        let snap = state.snapshot();
+        *published.lock().expect("published state poisoned") = snap.clone();
+
         if let Some(h) = &tray_handle {
-            let snap = state.snapshot();
             h.update(TrayState {
                 status: snap.status,
                 mode: snap.mode,
-                last_fragment: snap.last_fragment,
+                last_fragment: snap.last_fragment.clone(),
             });
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // 25 ms rather than 100: the loop publishes the state a 30 Hz meter
+        // reads, and doing almost nothing forty times a second is cheap.
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
     state.stop();
@@ -182,7 +197,11 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     Ok(())
 }
 
-fn serve_client(stream: UnixStream, tx: mpsc::Sender<(Request, Option<mpsc::Sender<Response>>)>) {
+fn serve_client(
+    stream: UnixStream,
+    tx: mpsc::Sender<(Request, Option<mpsc::Sender<Response>>)>,
+    published: Arc<Mutex<DaemonState>>,
+) {
     let peer = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -196,6 +215,14 @@ fn serve_client(stream: UnixStream, tx: mpsc::Sender<(Request, Option<mpsc::Send
         return;
     }
     let resp = match serde_json::from_str::<Request>(&line) {
+        // Answered straight from the published snapshot. Polling is the common
+        // case by far, and routing it through the loop would cap the meter at
+        // the loop rate.
+        Ok(Request::GetState) => {
+            // Still tell the loop a viewer is here, so metering keeps running.
+            let _ = tx.send((Request::GetState, None));
+            Response::State(published.lock().expect("published state poisoned").clone())
+        }
         Ok(req) => {
             let (rtx, rrx) = mpsc::channel();
             if tx.send((req, Some(rtx))).is_err() {
