@@ -162,22 +162,25 @@ So CPU-only operation on the deployment host is a genuine option that would
 sidestep GPU contention with Frigate and Jellyfin entirely. It must be measured
 there before being relied upon.
 
-#### Historical note: the earlier claim about cuDNN 8
+#### The deployment host's CPU
 
 `acdc` runs a **Ryzen 1700** (Zen 1, 8c/16t, 2017). Zen 1 splits 256-bit AVX2
 operations into two 128-bit halves, so it is roughly half-rate on exactly the
-vector math inference depends on. This was originally read as ruling CPU out;
-the measurements above show that was too pessimistic.
+vector math inference depends on. An earlier draft read that as ruling CPU out
+entirely; the measurements above show it was too pessimistic.
 
-So "fall back to CPU" must not be written into the design as though it were a
-graceful degradation path for the streaming model. Realistic options when the GPU
-is unavailable are, in order of preference:
+Extrapolating 149 ms on Zen 3 by 2-3x puts Zen 1 somewhere around 300-450 ms per
+560 ms chunk. That still fits the real-time budget for **one** stream, with
+little room for a second. So when the GPU is unavailable, the options are, in
+order of preference:
 
-1. **Refuse the session** with a clear `capacity` error. Honest and predictable.
-2. **Degrade to the EOU 120M model**, which is 5x smaller and may keep up on
+1. **Run on CPU with a reduced session limit.** Viable if measurement on `acdc`
+   confirms the extrapolation, and it sidesteps GPU contention entirely.
+2. **Refuse the session** with a clear `capacity` error. Honest and predictable.
+3. **Degrade to the EOU 120M model**, 5x smaller and comfortably real-time on
    CPU — at the cost of punctuation.
 
-Actual CPU inference time must be measured before option 2 is relied upon.
+The extrapolation must be measured on `acdc` before option 1 is relied upon.
 
 That Frigate already runs ONNX on this GPU is useful evidence: ORT + CUDA +
 Docker GPU passthrough is proven on this exact hardware.
