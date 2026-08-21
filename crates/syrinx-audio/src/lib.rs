@@ -18,11 +18,14 @@
 //! | System audio | yes (sink monitors) | yes (WASAPI loopback) |
 //! | One application | yes | no |
 //!
-//! Windows lacking per-application capture is a real gap, not an oversight:
-//! process loopback exists in the Windows API (10 2004+) but cpal does not
-//! expose it, and adding it means hand-written WASAPI.
+//! Per-application capture on Linux works by linking the application's output
+//! ports directly into a capture stream's inputs; see [`link`]. Windows lacking
+//! it is a real gap, not an oversight: process loopback exists in the Windows
+//! API (10 2004+) but cpal does not expose it, and adding it means hand-written
+//! WASAPI.
 
 pub mod capture;
+pub mod link;
 pub mod source;
 
 #[cfg(target_os = "linux")]

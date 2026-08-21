@@ -68,18 +68,9 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
                     .unwrap_or_else(|| node_name.as_deref().unwrap_or("unknown"));
                 (SourceKind::Monitor, format!("Monitor of {desc}"))
             }
-            // An application playing audio.
-            //
-            // NOT CURRENTLY CAPTURABLE. `pw-record --target <stream node>`
-            // establishes a link but no audio flows: measured against a
-            // controlled 440 Hz tone, the app stream yields rms 26 while the
-            // sink monitor carrying the same audio yields rms 341. A null sink
-            // plus `pactl move-sink-input` was also tried and gave rms 19.
-            //
-            // Still enumerated because identifying what is playing is useful
-            // and the right mechanism is likely a variation on the above, but
-            // `list_sources` filters them out so a picker never offers an
-            // option that returns silence.
+            // An application playing audio. Captured by linking its output
+            // ports into a capture stream; see the `link` module for why
+            // `--target` does not work here.
             "Stream/Output/Audio" => {
                 let app = props
                     .get("application.name")
@@ -120,19 +111,11 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
 }
 
 /// Enumerate capturable sources from the running PipeWire daemon.
-///
-/// Application streams are omitted: capturing them does not currently work
-/// (see the note in [`parse_sources`]), and offering a source that returns
-/// silence is worse than not offering it at all.
 pub fn list_sources() -> Result<Vec<Source>> {
-    Ok(list_all_sources()?
-        .into_iter()
-        .filter(|s| s.kind != SourceKind::Application)
-        .collect())
+    list_all_sources()
 }
 
-/// Everything, including application streams that cannot yet be captured.
-/// For diagnostics.
+/// Alias kept for the diagnostics example.
 pub fn list_all_sources() -> Result<Vec<Source>> {
     let out = std::process::Command::new("pw-dump")
         .output()
@@ -166,10 +149,38 @@ pub struct PwCapture {
 const READ_CHUNK: usize = 4096;
 
 impl PwCapture {
+    /// Capture from a source or sink monitor, addressed by target.
     pub fn start(node_id: u32, tx: tokio::sync::mpsc::Sender<Vec<f32>>) -> Result<Self> {
+        Self::start_inner(Some(node_id), tx, None)
+    }
+
+    /// Capture one application by linking its output ports into this stream.
+    ///
+    /// `--target` cannot do this: for a capture stream it means "read from this
+    /// source", and an application's playback stream is not a source. See the
+    /// `link` module for the measurements.
+    pub fn start_linked(app_node: u32, tx: tokio::sync::mpsc::Sender<Vec<f32>>) -> Result<Self> {
+        Self::start_inner(None, tx, Some(app_node))
+    }
+
+    fn start_inner(
+        target: Option<u32>,
+        tx: tokio::sync::mpsc::Sender<Vec<f32>>,
+        link_from: Option<u32>,
+    ) -> Result<Self> {
         use tokio::io::AsyncReadExt;
 
-        let mut child = tokio::process::Command::new("pw-record")
+        // Target 0 when linking manually: pw-record wants a target argument,
+        // and 0 leaves the stream unconnected for the link to fill.
+        let node_id = target.unwrap_or(0);
+        let capture_name = crate::link::unique_capture_name();
+        let mut cmd = tokio::process::Command::new("pw-record");
+        if link_from.is_some() {
+            // pw-record publishes no process id, so give the node a name we can
+            // find it by. Without this the link target cannot be identified.
+            cmd.env("PIPEWIRE_PROPS", format!("{{ node.name = {capture_name} }}"));
+        }
+        let mut child = cmd
             .args([
                 "--target",
                 &node_id.to_string(),
@@ -186,6 +197,30 @@ impl PwCapture {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .context("spawning pw-record (is PipeWire installed?)")?;
+
+        // Wire the application in once pw-record has registered its node.
+        if let Some(app_node) = link_from {
+            let mut linked = false;
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if let Ok(Some(capture_node)) = crate::link::capture_node_by_name(&capture_name) {
+                    match crate::link::link_all(app_node, capture_node) {
+                        Ok(n) => {
+                            tracing::info!("linked {n} port(s) from node {app_node}");
+                            linked = true;
+                        }
+                        Err(e) => tracing::warn!("linking application audio: {e:#}"),
+                    }
+                    break;
+                }
+            }
+            if !linked {
+                // Without the link the stream yields silence, which would look
+                // like a broken microphone rather than a failed link.
+                let _ = child.start_kill();
+                anyhow::bail!("could not link application node {app_node} into the capture stream");
+            }
+        }
 
         let mut stdout = child.stdout.take().context("pw-record stdout missing")?;
         if let Some(stderr) = child.stderr.take() {

@@ -19,7 +19,14 @@ impl Capture {
         match &source.target {
             #[cfg(target_os = "linux")]
             SourceTarget::PipeWireNode(id) => {
-                Ok(Capture::PipeWire(crate::pipewire::PwCapture::start(*id, tx)?))
+                // Applications need their ports linked in; sources and sink
+                // monitors are addressable by target.
+                let cap = if source.kind == crate::SourceKind::Application {
+                    crate::pipewire::PwCapture::start_linked(*id, tx)?
+                } else {
+                    crate::pipewire::PwCapture::start(*id, tx)?
+                };
+                Ok(Capture::PipeWire(cap))
             }
             #[cfg(not(target_os = "linux"))]
             SourceTarget::PipeWireNode(_) => {

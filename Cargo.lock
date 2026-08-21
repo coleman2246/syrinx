@@ -4485,6 +4485,7 @@ dependencies = [
  "syrinx-proto",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
