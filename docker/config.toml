@@ -1,0 +1,18 @@
+# Baked-in defaults for the container.
+#
+# The token is deliberately not a usable value: it is supplied at run time
+# through SYRINX_TOKEN. A real token here would be published to anyone who can
+# pull the image.
+bind = "0.0.0.0:8770"
+token = "set-SYRINX_TOKEN"
+model_dir = "/models"
+provider = "cuda"
+
+# Zero VRAM when idle. The GPU is shared with Frigate and Jellyfin, both of
+# which fail visibly when starved, so the model is unloaded five minutes after
+# the last session ends.
+idle_unload_secs = 300
+
+# Refuse to load rather than win an allocation race against the cameras.
+vram_floor_mib = 1024
+max_sessions = 4

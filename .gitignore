@@ -27,4 +27,8 @@ config.local.toml
 .idea/
 *.swp
 .DS_Store
-config.toml
+# Only the one at the root: that is the local server config, with a token in
+# it. A bare `config.toml` also matched docker/config.toml, which the image
+# needs -- so a clone had no config to COPY and the build failed there while
+# working here.
+/config.toml
