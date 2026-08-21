@@ -13,9 +13,17 @@ use std::process::Command;
 use tracing::debug;
 
 /// How text is delivered to the focused window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Method {
+    /// Whatever is right for the platform this is running on.
+    ///
+    /// The default, and the reason a single config file works on every
+    /// machine: the *setting* is identical everywhere, and only its
+    /// resolution differs. Naming a concrete method as the default would
+    /// have meant a config written on one platform being wrong on another.
+    #[default]
+    Auto,
     /// `wtype`, the Wayland virtual-keyboard protocol.
     ///
     /// The default, and correct for most native Wayland applications. It fails
@@ -48,27 +56,46 @@ pub enum Method {
     SendInput,
 }
 
-/// Platform default.
+/// What [`Method::Auto`] means here, worked out once per process.
 ///
-/// Every variant parses on every platform so a config file stays portable,
-/// but only one is right for the machine it runs on.
-impl Default for Method {
-    fn default() -> Self {
+/// Probed rather than assumed, and cached because this is asked once per
+/// transcript fragment -- several times a second -- and the answer cannot
+/// change without restarting the daemon that owns the session.
+fn auto() -> Method {
+    static CHOICE: std::sync::OnceLock<Method> = std::sync::OnceLock::new();
+    *CHOICE.get_or_init(|| {
         if cfg!(windows) {
-            Method::SendInput
-        } else {
-            Method::Wtype
+            return Method::SendInput;
         }
-    }
+        // Running ydotoold is a deliberate act -- it is a daemon someone had
+        // to install, enable and give access to /dev/uinput. Taking that as
+        // consent means `auto` is right in Electron apps too, where wtype
+        // silently loses focus. Without it, wtype needs no setup at all.
+        if ydotoold_running() {
+            return Method::Ydotool;
+        }
+        Method::Wtype
+    })
 }
 
 impl Method {
+    /// The concrete method to use on this machine.
+    ///
+    /// Only [`Method::Auto`] changes; anything chosen explicitly is honoured
+    /// as written, and fails loudly in preflight if it cannot work here.
+    pub fn resolve(self) -> Method {
+        match self {
+            Method::Auto => auto(),
+            other => other,
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
             Method::Wtype => "wtype (Wayland)",
             Method::Ydotool => "ydotool (uinput)",
             Method::Paste => "clipboard paste",
             Method::SendInput => "SendInput (Win32)",
+            Method::Auto => "automatic",
         }
     }
 
@@ -83,22 +110,26 @@ impl Method {
             Method::Ydotool => "ydotool",
             Method::Paste => "paste",
             Method::SendInput => "sendinput",
+            Method::Auto => "auto",
         }
     }
 
     /// One line for the generated config, explaining when to pick this.
     pub fn summary(self) -> &'static str {
         match self {
-            Method::Wtype => "Wayland virtual keyboard. Fails in Electron apps (Teams, Discord, VS Code)",
-            Method::Ydotool => "kernel uinput device. Works everywhere, needs ydotoold running",
-            Method::Paste => "clipboard then Ctrl+V. Broad, but wrong for terminals (they want Ctrl+Shift+V)",
-            Method::SendInput => "Win32 SendInput. Layout-independent Unicode key events",
+            Method::Wtype => "[Linux] Wayland virtual keyboard. Fails in Electron apps",
+            Method::Ydotool => "[Linux] kernel uinput. Works in Electron, needs ydotoold",
+            Method::Paste => "[Linux] clipboard then Ctrl+V. Wrong for terminals",
+            Method::SendInput => "[Windows] layout-independent Unicode key events",
+            Method::Auto => "the right one for this machine. Start here",
         }
     }
 
     /// Whether this method can work on the platform now running.
     pub fn supported_here(self) -> bool {
         match self {
+            // Auto resolves to something that works, by construction.
+            Method::Auto => true,
             Method::Wtype | Method::Ydotool | Method::Paste => cfg!(target_os = "linux"),
             Method::SendInput => cfg!(windows),
         }
@@ -112,11 +143,12 @@ impl Method {
             Method::Wtype => Some("wtype"),
             Method::Ydotool => Some("ydotool"),
             Method::Paste => Some("wl-copy"),
-            Method::SendInput => None,
+            Method::SendInput | Method::Auto => None,
         }
     }
 
-    pub const ALL: [Method; 4] = [
+    pub const ALL: [Method; 5] = [
+        Method::Auto,
         Method::Wtype,
         Method::Ydotool,
         Method::Paste,
@@ -129,6 +161,7 @@ pub fn type_text(text: &str, method: Method) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    let method = method.resolve();
     debug!("typing {text:?} via {}", method.label());
     match method {
         Method::Wtype => run(Command::new("wtype").arg("--").arg(text), "wtype"),
@@ -144,6 +177,8 @@ pub fn type_text(text: &str, method: Method) -> Result<()> {
         ),
         Method::Paste => paste(text),
         Method::SendInput => send_input(text),
+        // resolve() never returns Auto.
+        Method::Auto => unreachable!("Auto resolves before dispatch"),
     }
 }
 
@@ -222,6 +257,7 @@ fn run(cmd: &mut Command, what: &str) -> Result<()> {
 /// Surfaces a missing tool up front rather than after the user has spoken a
 /// sentence into a session that was never going to type anything.
 pub fn preflight(method: Method) -> Result<()> {
+    let method = method.resolve();
     if !method.supported_here() {
         let usable: Vec<&str> = Method::ALL
             .iter()
@@ -277,17 +313,53 @@ mod tests {
     }
 
     #[test]
+    fn the_default_is_the_same_setting_on_every_platform() {
+        // The point of Auto: one config file that is correct everywhere.
+        // A concrete default would be wrong on the other machine.
+        assert_eq!(Method::default(), Method::Auto);
+    }
+
+    #[test]
+    fn auto_resolves_to_something_that_works_here() {
+        let r = Method::Auto.resolve();
+        assert_ne!(r, Method::Auto, "resolve must produce a concrete method");
+        assert!(r.supported_here(), "{r:?} cannot work on this platform");
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
-    fn wtype_is_the_default_on_linux() {
-        // Changing the default would alter behaviour for everyone whose setup
-        // already works.
-        assert_eq!(Method::default(), Method::Wtype);
+    fn auto_picks_a_linux_method() {
+        // Which one depends on whether ydotoold is running, so assert the
+        // property rather than the answer: a test that demands wtype fails on
+        // a machine set up for Electron apps, and vice versa.
+        let r = Method::Auto.resolve();
+        assert!(
+            matches!(r, Method::Wtype | Method::Ydotool),
+            "auto chose {r:?} on Linux"
+        );
+        assert!(r.supported_here());
+    }
+
+    #[test]
+    fn auto_is_stable_within_a_process() {
+        // It is asked several times a second while dictating; an answer that
+        // changed mid-session would type half a sentence by one route and
+        // half by another.
+        assert_eq!(Method::Auto.resolve(), Method::Auto.resolve());
     }
 
     #[test]
     #[cfg(windows)]
-    fn sendinput_is_the_default_on_windows() {
-        assert_eq!(Method::default(), Method::SendInput);
+    fn auto_is_sendinput_on_windows() {
+        assert_eq!(Method::Auto.resolve(), Method::SendInput);
+    }
+
+    #[test]
+    fn an_explicit_choice_is_never_second_guessed() {
+        // Someone who wrote `ydotool` gets ydotool, not what we would pick.
+        for m in Method::ALL.iter().filter(|m| **m != Method::Auto) {
+            assert_eq!(m.resolve(), *m);
+        }
     }
 
     #[test]
@@ -314,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_one_method_is_the_platform_default() {
+    fn the_default_can_always_be_used() {
         assert!(Method::default().supported_here());
     }
 
