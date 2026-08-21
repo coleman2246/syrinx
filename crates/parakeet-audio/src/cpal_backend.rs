@@ -65,21 +65,20 @@ pub fn list_sources() -> Result<Vec<Source>> {
         }
     }
 
-    out.sort_by(|a, b| (a.kind, a.name.to_lowercase()).cmp(&(b.kind, b.name.to_lowercase())));
+    out.sort_by_key(|s| (s.kind, s.name.to_lowercase()));
     Ok(out)
 }
 
 /// Find a cpal device by name, on the correct side of the input/output split.
 pub fn find_device(name: &str, loopback: bool) -> Result<cpal::Device> {
     let host = cpal::default_host();
-    let devices: Box<dyn Iterator<Item = cpal::Device>> = if loopback {
+    let mut devices: Box<dyn Iterator<Item = cpal::Device>> = if loopback {
         Box::new(host.output_devices().context("enumerating output devices")?)
     } else {
         Box::new(host.input_devices().context("enumerating input devices")?)
     };
     devices
-        .filter(|d| device_name(d).as_deref() == Some(name))
-        .next()
+        .find(|d| device_name(d).as_deref() == Some(name))
         .with_context(|| format!("no such audio device: {name}"))
 }
 

@@ -105,7 +105,7 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
 
     // Group by kind for a stable, readable picker, then by name so the order
     // does not jump around as PipeWire renumbers nodes.
-    out.sort_by(|a, b| (a.kind, a.name.to_lowercase()).cmp(&(b.kind, b.name.to_lowercase())));
+    out.sort_by_key(|s| (s.kind, s.name.to_lowercase()));
     Ok(out)
 }
 
@@ -120,6 +120,99 @@ pub fn list_sources() -> Result<Vec<Source>> {
     parse_sources(&String::from_utf8_lossy(&out.stdout))
 }
 
+
+// ---------------------------------------------------------------------------
+// Capture
+// ---------------------------------------------------------------------------
+
+/// A running `pw-record`. Dropping it stops the capture.
+///
+/// `pw-record` is used as a subprocess rather than binding libpipewire because
+/// it already handles graph negotiation, format conversion and resampling, and
+/// can target any node -- microphone, sink monitor, or one application's
+/// stream. It writes raw PCM to stdout, which is the shape needed here.
+///
+/// Capturing an application is a **tap**: it keeps playing to its normal output.
+/// Nothing is rerouted, so transcribing a video does not silence it.
+pub struct PwCapture {
+    child: tokio::process::Child,
+}
+
+/// Bytes per read. 16 kHz mono s16 is 32 kB/s, so this is ~0.1s of audio:
+/// responsive without excessive syscalls.
+const READ_CHUNK: usize = 4096;
+
+impl PwCapture {
+    pub fn start(node_id: u32, tx: tokio::sync::mpsc::Sender<Vec<f32>>) -> Result<Self> {
+        use tokio::io::AsyncReadExt;
+
+        let mut child = tokio::process::Command::new("pw-record")
+            .args([
+                "--target",
+                &node_id.to_string(),
+                "--rate",
+                &parakeet_proto::SAMPLE_RATE.to_string(),
+                "--channels",
+                "1",
+                "--format",
+                "s16",
+                // "-" writes raw PCM to stdout, with no WAV header to skip.
+                "-",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("spawning pw-record (is PipeWire installed?)")?;
+
+        let mut stdout = child.stdout.take().context("pw-record stdout missing")?;
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut s = String::new();
+                let mut r = tokio::io::BufReader::new(stderr);
+                if r.read_to_string(&mut s).await.is_ok() && !s.trim().is_empty() {
+                    tracing::warn!("pw-record: {}", s.trim());
+                }
+            });
+        }
+
+        tokio::spawn(async move {
+            // s16 samples can straddle reads, so carry the odd byte rather than
+            // decoding half a sample.
+            let mut carry: Vec<u8> = Vec::new();
+            let mut buf = vec![0u8; READ_CHUNK];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        carry.extend_from_slice(&buf[..n]);
+                        let usable = carry.len() - (carry.len() % 2);
+                        let samples = parakeet_proto::pcm_s16le_to_f32(&carry[..usable]);
+                        carry.drain(..usable);
+                        // try_send: if the consumer is behind, dropping audio
+                        // beats growing a backlog and drifting off real time.
+                        if tx.try_send(samples).is_err() && tx.is_closed() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("reading from pw-record: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self { child })
+    }
+}
+
+impl Drop for PwCapture {
+    fn drop(&mut self) {
+        // start_kill rather than an await: Drop cannot be async, and leaking
+        // pw-record would hold the capture open indefinitely.
+        let _ = self.child.start_kill();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -249,95 +342,3 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Capture
-// ---------------------------------------------------------------------------
-
-/// A running `pw-record`. Dropping it stops the capture.
-///
-/// `pw-record` is used as a subprocess rather than binding libpipewire because
-/// it already handles graph negotiation, format conversion and resampling, and
-/// can target any node -- microphone, sink monitor, or one application's
-/// stream. It writes raw PCM to stdout, which is the shape needed here.
-///
-/// Capturing an application is a **tap**: it keeps playing to its normal output.
-/// Nothing is rerouted, so transcribing a video does not silence it.
-pub struct PwCapture {
-    child: tokio::process::Child,
-}
-
-/// Bytes per read. 16 kHz mono s16 is 32 kB/s, so this is ~0.1s of audio:
-/// responsive without excessive syscalls.
-const READ_CHUNK: usize = 4096;
-
-impl PwCapture {
-    pub fn start(node_id: u32, tx: tokio::sync::mpsc::Sender<Vec<f32>>) -> Result<Self> {
-        use tokio::io::AsyncReadExt;
-
-        let mut child = tokio::process::Command::new("pw-record")
-            .args([
-                "--target",
-                &node_id.to_string(),
-                "--rate",
-                &parakeet_proto::SAMPLE_RATE.to_string(),
-                "--channels",
-                "1",
-                "--format",
-                "s16",
-                // "-" writes raw PCM to stdout, with no WAV header to skip.
-                "-",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("spawning pw-record (is PipeWire installed?)")?;
-
-        let mut stdout = child.stdout.take().context("pw-record stdout missing")?;
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let mut s = String::new();
-                let mut r = tokio::io::BufReader::new(stderr);
-                if r.read_to_string(&mut s).await.is_ok() && !s.trim().is_empty() {
-                    tracing::warn!("pw-record: {}", s.trim());
-                }
-            });
-        }
-
-        tokio::spawn(async move {
-            // s16 samples can straddle reads, so carry the odd byte rather than
-            // decoding half a sample.
-            let mut carry: Vec<u8> = Vec::new();
-            let mut buf = vec![0u8; READ_CHUNK];
-            loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        carry.extend_from_slice(&buf[..n]);
-                        let usable = carry.len() - (carry.len() % 2);
-                        let samples = parakeet_proto::pcm_s16le_to_f32(&carry[..usable]);
-                        carry.drain(..usable);
-                        // try_send: if the consumer is behind, dropping audio
-                        // beats growing a backlog and drifting off real time.
-                        if tx.try_send(samples).is_err() && tx.is_closed() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("reading from pw-record: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Self { child })
-    }
-}
-
-impl Drop for PwCapture {
-    fn drop(&mut self) {
-        // start_kill rather than an await: Drop cannot be async, and leaking
-        // pw-record would hold the capture open indefinitely.
-        let _ = self.child.start_kill();
-    }
-}
