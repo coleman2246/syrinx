@@ -639,3 +639,44 @@ the development desktop. That fallback was silent, so an old file quietly took
 over -- and with the default now typing at the cursor rather than accumulating
 a transcript, an unnoticed config is no longer a harmless surprise. Loading a
 non-canonical path is now logged as a warning naming both paths.
+
+
+## Streaming to a file, and a theme (2026-08-21)
+
+### Streaming
+
+Saving at the end is fine until something goes wrong at minute forty. Each
+committed fragment is now appended as it arrives, and the file is opened for
+append so a second session continues the first.
+
+Three decisions worth recording:
+
+**Commits only.** The server sends nothing else today -- the ASR is append-only
+-- but a post-processing layer would emit provisional text that a revision
+retracts, and a flushed file cannot take anything back. Writing commits only
+means the file lags the screen slightly and is never wrong.
+
+**No buffering.** `File` is unbuffered, so a write reaches the operating system
+before the call returns and a process that dies afterwards loses nothing.
+Surviving a power cut too would need an fsync per fragment, which is a real
+cost for a rarer failure. Verified with `kill -9` mid-session: everything
+spoken was on disk.
+
+**Lines follow speech, not chunks.** The first implementation put every
+fragment on its own stamped line, which broke words in half -- "brown fox j"
+then "umps over the" -- because the model splits on 560 ms boundaries. A line
+now continues while speech continues and breaks after 1.5 s of silence. Nothing
+is buffered to achieve it; the newline is simply withheld.
+
+In separate mode every session shares one file. `O_APPEND` takes the offset
+atomically, so fragments interleave in arrival order rather than tearing, which
+is what the labelled layout wants anyway.
+
+### Theme
+
+Colours were literals at every call site, which is how an interface drifts:
+two reds that are nearly the same, a green that belongs to nothing else. They
+are now one palette, taken from Fluent 2 -- the violet brand colour, near-neutral
+greys, and Teams' own red and green for status. The transcript sits on a
+surface of its own rather than on bare canvas, which was reading as an empty
+window with text in the corner.

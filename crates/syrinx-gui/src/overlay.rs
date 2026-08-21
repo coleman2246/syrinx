@@ -8,6 +8,7 @@
 //! Deliberately not shown for transcribe-only. An always-on-top window over
 //! whatever you are reading is an intrusion that has to earn its place.
 
+use crate::theme::palette;
 use eframe::egui;
 use syrinx_client::{ipc, ipc::Request, session::Status};
 
@@ -114,7 +115,9 @@ impl eframe::App for Overlay {
         painter.rect_filled(
             full,
             8.0,
-            egui::Color32::from_rgba_unmultiplied(16, 16, 20, 170),
+            // The canvas colour at partial opacity, so the overlay reads as
+            // part of the same application rather than a stray box.
+            egui::Color32::from_rgba_unmultiplied(0x1F, 0x1F, 0x1F, 205),
         );
 
         // Middle- or left-drag moves the window. A compositor-side move is the
@@ -157,11 +160,11 @@ impl eframe::App for Overlay {
                 egui::vec2(bar_w, h),
             );
             let colour = if v > 0.9 {
-                egui::Color32::from_rgb(235, 90, 70)
+                palette::RECORDING
             } else if v > 0.7 {
-                egui::Color32::from_rgb(235, 190, 70)
+                palette::WARNING
             } else {
-                egui::Color32::from_rgb(110, 205, 130)
+                palette::SUCCESS
             };
             painter.rect_filled(bar, 1.5, colour);
         }
@@ -175,9 +178,9 @@ impl eframe::App for Overlay {
             if line.is_empty() { "listening…" } else { &line },
             egui::FontId::proportional(12.0),
             if line.is_empty() {
-                egui::Color32::from_rgb(130, 130, 140)
+                palette::TEXT_MUTED
             } else {
-                egui::Color32::from_rgb(225, 225, 235)
+                palette::TEXT
             },
         );
 

@@ -107,6 +107,27 @@ the generated config says so too, and the GUI's help window reports what
 actually happened — a hotkey can be configured and still not be listening,
 because another application already owns the combination.
 
+## Streaming to a file
+
+`stream_to` appends the transcript as it is dictated, rather than saving only
+at the end:
+
+```toml
+stream_to = "~/transcripts/notes.txt"
+format = "timestamped"
+```
+
+Or per run: `syrinx start --stream notes.txt`. In the GUI, the **Stream…**
+button picks a file.
+
+Every session appends to the same file, so stopping and starting continues
+where you left off, and a crash costs the last sentence rather than the whole
+session — verified against `kill -9` mid-session.
+
+Only committed text is written. A stamped line continues while speech does and
+breaks on a pause, because the model splits on chunk boundaries rather than
+words: a line per fragment produced "brown fox j" then "umps over the".
+
 ## Keys
 
 Press **F1** in the GUI, or the Help button, for a window listing everything

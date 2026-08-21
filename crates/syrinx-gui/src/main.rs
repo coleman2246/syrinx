@@ -12,6 +12,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod overlay;
+mod theme;
 
 use anyhow::{Context, Result};
 use eframe::egui;
@@ -68,7 +69,10 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Syrinx",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new(config)))),
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(App::new(config)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -324,36 +328,36 @@ impl eframe::App for App {
         }
         self.help_window(&ctx);
 
-        ui.add_space(4.0);
+        ui.add_space(2.0);
         self.status_row(ui);
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         self.source_row(ui, running);
-        ui.add_space(4.0);
         self.mode_row(ui, running);
-        ui.add_space(4.0);
         self.meter_row(ui, running);
-        ui.separator();
+        ui.add_space(8.0);
 
-        let reserved = 96.0;
+        // The card carries the visual weight now, so the rules above and below
+        // it are redundant lines across the window.
+        let reserved = 104.0;
         let height = ui.available_height() - reserved;
         self.transcript_box(ui, height);
-        ui.separator();
+        ui.add_space(8.0);
         self.controls(ui, &ctx, running);
 
         if self.disconnected {
             ui.colored_label(
-                egui::Color32::from_rgb(220, 80, 80),
+                theme::palette::DANGER,
                 "Lost the daemon. Close and reopen this window to restart it.",
             );
         }
         if let Some(e) = &self.state.error {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), e);
+            ui.colored_label(theme::palette::DANGER, e);
         }
         if let Some(e) = &self.list_error {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), e);
+            ui.colored_label(theme::palette::DANGER, e);
         }
         if let Some(s) = &self.status_line {
-            ui.colored_label(egui::Color32::from_rgb(120, 190, 120), s);
+            ui.colored_label(theme::palette::SUCCESS, s);
         }
 
         ctx.request_repaint_after(POLL_INTERVAL);
@@ -421,9 +425,9 @@ impl App {
     fn status_row(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (colour, dot) = match self.state.status {
-                Status::Listening => (egui::Color32::from_rgb(220, 60, 60), "●"),
+                Status::Listening => (theme::palette::RECORDING, "●"),
                 Status::Connecting | Status::Stopping | Status::Transcribing => {
-                    (egui::Color32::from_rgb(220, 170, 60), "●")
+                    (theme::palette::WARNING, "●")
                 }
                 Status::Idle => (egui::Color32::GRAY, "○"),
             };
@@ -592,11 +596,11 @@ impl App {
                 // Green through amber to red: loud enough to clip is worth
                 // seeing at a glance.
                 let colour = if v > 0.85 {
-                    egui::Color32::from_rgb(220, 80, 60)
+                    theme::palette::RECORDING
                 } else if v > 0.6 {
-                    egui::Color32::from_rgb(220, 180, 60)
+                    theme::palette::WARNING
                 } else {
-                    egui::Color32::from_rgb(90, 190, 110)
+                    theme::palette::SUCCESS
                 };
                 painter.rect_filled(bar, 1.0, colour);
             }
@@ -614,6 +618,20 @@ impl App {
     }
 
     fn transcript_box(&self, ui: &mut egui::Ui, height: f32) {
+        // A surface of its own rather than bare canvas. The transcript is the
+        // content of this window, and content that sits directly on the
+        // background reads as an empty window with some text in the corner.
+        egui::Frame::new()
+            .fill(theme::palette::SURFACE)
+            .stroke(egui::Stroke::new(1.0, theme::palette::BORDER))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                self.transcript_scroll(ui, height);
+            });
+    }
+
+    fn transcript_scroll(&self, ui: &mut egui::Ui, height: f32) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
@@ -696,9 +714,9 @@ impl App {
                 let report = &self.state.hotkey;
                 ui.horizontal_wrapped(|ui| {
                     let colour = if report.is_active() {
-                        egui::Color32::from_rgb(110, 205, 130)
+                        theme::palette::SUCCESS
                     } else {
-                        egui::Color32::from_rgb(220, 170, 80)
+                        theme::palette::WARNING
                     };
                     ui.colored_label(colour, if report.is_active() { "●" } else { "○" });
                     ui.label(report.summary());
