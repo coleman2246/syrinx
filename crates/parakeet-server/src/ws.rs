@@ -94,14 +94,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let backend = match tokio::task::spawn_blocking(move || handle.get_or_load()).await {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => {
-            // Most likely the VRAM guard refusing because a neighbour is busy.
-            // Transient, so the client may retry.
-            warn!("model unavailable: {e:#}");
+            // Capacity (a busy GPU) is transient and worth retrying; a failed
+            // load is a misconfiguration that will fail identically forever.
+            let retryable = e.is_retryable();
+            warn!(retryable, "model unavailable: {e}");
             let _ = tx
                 .send(json_msg(&ServerMessage::Error {
-                    code: ErrorCode::Capacity,
-                    message: e.to_string(),
-                    retryable: true,
+                    code: if retryable {
+                        ErrorCode::Capacity
+                    } else {
+                        ErrorCode::Internal
+                    },
+                    message: e.message(),
+                    retryable,
                 }))
                 .await;
             return;

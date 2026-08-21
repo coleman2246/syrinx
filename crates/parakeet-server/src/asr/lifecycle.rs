@@ -7,7 +7,7 @@
 //! correct behaviour here, not a failure.
 
 use super::AsrBackend;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -75,6 +75,40 @@ impl VramProbe for FixedVramProbe {
 
 type Loader = Arc<dyn Fn() -> Result<Arc<dyn AsrBackend>> + Send + Sync>;
 
+/// Why a model could not be provided.
+///
+/// The distinction matters to clients: `Capacity` depends on what the GPU's
+/// other tenants are doing right now and is worth retrying, whereas `Failed`
+/// means a missing model directory or a binary built without GPU support, which
+/// will fail identically forever. Reporting the second as retryable would have
+/// clients retry a permanent misconfiguration in a loop.
+#[derive(Debug)]
+pub enum LoadError {
+    /// Loading now would starve another GPU tenant. Transient.
+    Capacity(String),
+    /// The model could not be loaded at all. Permanent until fixed.
+    Failed(anyhow::Error),
+}
+
+impl LoadError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, LoadError::Capacity(_))
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            LoadError::Capacity(m) => m.clone(),
+            LoadError::Failed(e) => format!("{e:#}"),
+        }
+    }
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
 /// Loads a model on demand and drops it once idle.
 ///
 /// The server should hold zero VRAM for most of the day. A dictation session is
@@ -118,7 +152,7 @@ impl ModelHandle {
     /// VRAM for other tenants. Callers surface that as
     /// `error{code:"capacity", retryable:true}` -- it is transient, since it
     /// depends on what the neighbours are doing right now.
-    pub fn get_or_load(&self) -> Result<Arc<dyn AsrBackend>> {
+    pub fn get_or_load(&self) -> std::result::Result<Arc<dyn AsrBackend>, LoadError> {
         let mut slot = self.loaded.lock().expect("model lock poisoned");
         *self.last_used.lock().expect("last_used lock poisoned") = Instant::now();
 
@@ -131,17 +165,17 @@ impl ModelHandle {
         if let Some(free) = self.probe.free_mib()
             && !self.guard.can_load(self.model_mib, free)
         {
-            bail!(
+            return Err(LoadError::Capacity(format!(
                 "refusing to load: {} MiB free, need {} MiB for the model plus a \
                  {} MiB floor reserved for other GPU tenants",
                 free,
                 self.model_mib,
                 self.guard.floor_mib()
-            );
+            )));
         }
 
         info!("loading model");
-        let backend = (self.loader)()?;
+        let backend = (self.loader)().map_err(LoadError::Failed)?;
         *slot = Some(backend.clone());
         Ok(backend)
     }
@@ -267,10 +301,33 @@ mod tests {
         // object is not.
         let err = match h.get_or_load() {
             Ok(_) => panic!("expected a refusal when VRAM is short"),
-            Err(e) => e.to_string(),
+            Err(e) => e,
         };
-        assert!(err.contains("refusing to load"), "got: {err}");
+        assert!(err.message().contains("refusing to load"), "got: {err}");
+        assert!(err.is_retryable(), "VRAM pressure is transient, so retryable");
         assert_eq!(n.load(Ordering::SeqCst), 0, "must not have attempted a load");
+    }
+
+    #[test]
+    fn a_broken_loader_is_reported_as_permanent_not_retryable() {
+        // A missing model directory, or a binary built without GPU support,
+        // fails identically forever. Telling a client to retry that would have
+        // it loop on a permanent misconfiguration.
+        let loader: Loader = Arc::new(|| anyhow::bail!("model directory not found"));
+        let h = ModelHandle::new(
+            loader,
+            VramGuard::new(1536),
+            Arc::new(FixedVramProbe(Some(8000))),
+            3400,
+            Duration::from_secs(600),
+        );
+        match h.get_or_load() {
+            Ok(_) => panic!("expected the load to fail"),
+            Err(e) => {
+                assert!(!e.is_retryable(), "a broken loader is permanent");
+                assert!(e.message().contains("model directory not found"));
+            }
+        }
     }
 
     #[test]
