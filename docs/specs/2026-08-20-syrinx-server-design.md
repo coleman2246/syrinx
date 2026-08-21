@@ -27,7 +27,7 @@ in the same league as the whisper model, while still streaming.
 2. **Live mode**: near-real-time transcription typed at the cursor.
 3. **Transcript mode**: a GUI showing a running transcript the user can save.
 4. **Bulk mode**: offline transcription of existing audio files.
-5. Run locally now; move to a headless Ubuntu server (`acdc`) later with no
+5. Run locally now; move to a headless Ubuntu GPU server later with no
    protocol changes.
 
 ### Non-goals (v1)
@@ -44,7 +44,7 @@ below.
 
 ### The deployment target caps CUDA at 12.8
 
-`acdc` runs driver **570.211.01**, which supports **CUDA 12.8 maximum**. CUDA 13
+the GPU host runs driver **570.211.01**, which supports **CUDA 12.8 maximum**. CUDA 13
 requires driver >= 580, and CUDA forward-compatibility packages are a datacenter
 feature that does not apply to GeForce cards. **A CUDA 13 image cannot run on
 that host.**
@@ -62,7 +62,7 @@ current toolkits.
 
 ### VRAM is contended by two services that fail visibly
 
-`acdc`'s 2070 Super has **8192 MiB** total and is shared with **Frigate** (live
+the GPU host's 2070 Super has **8192 MiB** total and is shared with **Frigate** (live
 camera recording) and **Jellyfin** (NVENC transcoding). The nvidia-smi snapshot
 taken during design showed ~580 MiB in use by `frigate.detector:onnx` plus two
 ffmpeg processes — but that is a quiet-moment reading, not a ceiling.
@@ -159,7 +159,7 @@ reasoning from Zen 1's halved AVX2 throughput without measuring. At 149 ms per
 560 ms chunk on Zen 3, that was too pessimistic: CPU keeps up in real time with
 substantial margin, supporting ~4 concurrent streams.
 
-Zen 1 on `acdc` will be slower -- perhaps 2-3x -- which still plausibly lands
+Zen 1 on the GPU host will be slower -- perhaps 2-3x -- which still plausibly lands
 under the 560 ms real-time budget for a single stream, though not for several.
 So CPU-only operation on the deployment host is a genuine option that would
 sidestep GPU contention with Frigate and Jellyfin entirely. It must be measured
@@ -167,7 +167,7 @@ there before being relied upon.
 
 #### The deployment host's CPU
 
-`acdc` runs a **Ryzen 1700** (Zen 1, 8c/16t, 2017). Zen 1 splits 256-bit AVX2
+the GPU host runs a **Ryzen 1700** (Zen 1, 8c/16t, 2017). Zen 1 splits 256-bit AVX2
 operations into two 128-bit halves, so it is roughly half-rate on exactly the
 vector math inference depends on. An earlier draft read that as ruling CPU out
 entirely; the measurements above show it was too pessimistic.
@@ -177,13 +177,13 @@ Extrapolating 149 ms on Zen 3 by 2-3x puts Zen 1 somewhere around 300-450 ms per
 little room for a second. So when the GPU is unavailable, the options are, in
 order of preference:
 
-1. **Run on CPU with a reduced session limit.** Viable if measurement on `acdc`
+1. **Run on CPU with a reduced session limit.** Viable if measurement on the GPU host
    confirms the extrapolation, and it sidesteps GPU contention entirely.
 2. **Refuse the session** with a clear `capacity` error. Honest and predictable.
 3. **Degrade to the EOU 120M model**, 5x smaller and comfortably real-time on
    CPU — at the cost of punctuation.
 
-The extrapolation must be measured on `acdc` before option 1 is relied upon.
+The extrapolation must be measured on the GPU host before option 1 is relied upon.
 
 That Frigate already runs ONNX on this GPU is useful evidence: ORT + CUDA +
 Docker GPU passthrough is proven on this exact hardware.
@@ -257,7 +257,7 @@ nvidia/cuda:12.8-cudnn-runtime  (base)
 
 Model as a volume keeps the image ~1 GB instead of ~4 GB and allows swapping
 models without a rebuild. Multi-stage build so the Rust toolchain does not ship.
-Requires NVIDIA Container Toolkit on the host, already present on `acdc`.
+Requires NVIDIA Container Toolkit on the host, already present there.
 
 ## Protocol
 
@@ -614,9 +614,9 @@ consulted once per transcript fragment, several times a second.
 
 ## A host instead of a URL (2026-08-21)
 
-The client config asked for `url = "ws://192.168.0.235:8770/v1/stream"`: four
+The client config asked for `url = "ws://192.168.1.10:8770/v1/stream"`: four
 things to get right when only one of them ever changes. It is now
-`server = "192.168.0.235"`, with the scheme, port and endpoint supplied.
+`server = "192.168.1.10"`, with the scheme, port and endpoint supplied.
 
 Deliberately dull rules, because one that guesses is worse than one that is
 boring: a bare host gets the default port and the endpoint appended; anything

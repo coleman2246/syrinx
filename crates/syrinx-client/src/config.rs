@@ -15,7 +15,7 @@ pub struct Config {
     /// Just the host. The scheme, the port and the endpoint path are syrinx's
     /// business, not something to memorise and retype -- and a full URL in a
     /// config is four things to get right when only one of them ever changes.
-    /// A port may be appended (`dock.internal:9000`) when the server is not on
+    /// A port may be appended (`laptop.lan:9000`) when the server is not on
     /// the default.
     #[serde(default = "default_server")]
     pub server: String,
@@ -354,7 +354,7 @@ pub fn template() -> String {
     s.push_str(
         "# Which machine the server is on: a hostname or an IP address.\n\
          # Just the host -- syrinx supplies the port and the endpoint. Append\n\
-         # a port (\"dock.internal:9000\") only if the server is not on the\n\
+         # a port (\"laptop.lan:9000\") only if the server is not on the\n\
          # default.\n",
     );
     s.push_str(&format!("server = \"{}\"\n\n", default_server()));
@@ -546,13 +546,13 @@ mod tests {
 
     #[test]
     fn a_bare_host_is_all_that_is_needed() {
-        let c: Config = toml::from_str("token = \"t\"\nserver = \"dock.internal\"").unwrap();
-        assert_eq!(c.url(), "ws://dock.internal:8770/v1/stream");
+        let c: Config = toml::from_str("token = \"t\"\nserver = \"laptop.lan\"").unwrap();
+        assert_eq!(c.url(), "ws://laptop.lan:8770/v1/stream");
     }
 
     #[test]
     fn a_port_can_be_appended_to_the_host() {
-        assert_eq!(server_url("dock.internal:9000"), "ws://dock.internal:9000/v1/stream");
+        assert_eq!(server_url("laptop.lan:9000"), "ws://laptop.lan:9000/v1/stream");
     }
 
     #[test]
@@ -615,11 +615,11 @@ mod tests {
         // Written before `server` existed. The host is lifted out so the file
         // quietly modernises rather than needing a hand edit.
         let c: Config =
-            toml::from_str("token = \"t\"\nurl = \"ws://192.168.0.235:8770/v1/stream\"").unwrap();
+            toml::from_str("token = \"t\"\nurl = \"ws://192.168.1.10:8770/v1/stream\"").unwrap();
         let c = migrate(c);
-        assert_eq!(c.server, "192.168.0.235");
+        assert_eq!(c.server, "192.168.1.10");
         assert_eq!(c.url, None);
-        assert_eq!(c.url(), "ws://192.168.0.235:8770/v1/stream");
+        assert_eq!(c.url(), "ws://192.168.1.10:8770/v1/stream");
     }
 
     #[test]
@@ -645,7 +645,7 @@ mod tests {
     fn migrating_never_changes_where_a_client_connects() {
         // The whole risk of a migration: it must be invisible.
         for url in [
-            "ws://192.168.0.235:8770/v1/stream",
+            "ws://192.168.1.10:8770/v1/stream",
             "ws://host:9000/v1/stream",
             "wss://edge/asr",
             "ws://host:8770/other",
@@ -854,7 +854,7 @@ mod tests {
         std::fs::write(&path, template()).unwrap();
 
         let original = Config {
-            server: "dock.internal:9001".into(),
+            server: "laptop.lan:9001".into(),
             url: None,
             token: "a-token".into(),
             source_key: Some("some-source".into()),

@@ -33,7 +33,7 @@ way. Set `mode = "transcribe"` for a transcript instead, or `"both"`.
 ## Status
 
 Working on Linux and Windows. The server runs on the development desktop; the
-container that moves it to `acdc` is the last piece outstanding.
+container that moves it to the GPU host is the last piece outstanding.
 
 See [`docs/specs/`](docs/specs/) for the design document.
 
@@ -129,7 +129,7 @@ Two things worth doing at the same time:
 
 ## Deployment notes
 
-The target server (`acdc`, Ubuntu, RTX 2070 Super) runs driver 570, which caps
+The target server (Ubuntu, RTX 2070 Super) runs driver 570, which caps
 CUDA at **12.8** — a CUDA 13 image will not run there. The container pins CUDA
 12.8, which also works on the CUDA 13.3 development desktop by backward
 compatibility. One image, both machines.
@@ -252,12 +252,12 @@ The client is thin: no model, no GPU work, just audio out and text back. Name
 the machine the server is on:
 
 ```toml
-server = "192.168.0.235"     # or a hostname: dock.internal
+server = "192.168.1.10"     # or a hostname: laptop.lan
 ```
 
 Just the host. Syrinx supplies the port and the endpoint, so there is nothing
 to memorise and one thing to change when the server moves. Append a port
-(`dock.internal:9000`) if it is not on the default. A complete `url = "..."`
+(`laptop.lan:9000`) if it is not on the default. A complete `url = "..."`
 still works as an override, for a reverse proxy on a path syrinx would not
 choose.
 

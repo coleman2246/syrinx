@@ -451,7 +451,7 @@ impl App {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.url_edit)
                     .desired_width(280.0)
-                    .hint_text("192.168.0.235  or  dock.internal"),
+                    .hint_text("192.168.1.10  or  laptop.lan"),
             );
             let submitted =
                 resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -1027,15 +1027,15 @@ mod tests {
     #[test]
     fn a_bare_host_is_kept_as_typed() {
         // The field asks for a machine, and that is all it should store.
-        assert_eq!(normalise_server("192.168.0.11").unwrap(), "192.168.0.11");
-        assert_eq!(normalise_server("dock.internal").unwrap(), "dock.internal");
+        assert_eq!(normalise_server("192.168.1.20").unwrap(), "192.168.1.20");
+        assert_eq!(normalise_server("laptop.lan").unwrap(), "laptop.lan");
     }
 
     #[test]
     fn a_host_and_port_keeps_the_port() {
         assert_eq!(
-            normalise_server("acdc.home.arpa:9000").unwrap(),
-            "acdc.home.arpa:9000"
+            normalise_server("gpu-host.home.arpa:9000").unwrap(),
+            "gpu-host.home.arpa:9000"
         );
     }
 
@@ -1043,13 +1043,13 @@ mod tests {
     fn a_pasted_url_is_reduced_to_its_host() {
         // People paste what they have; stripping it beats rejecting it.
         for input in [
-            "ws://192.168.0.11:8770/v1/stream",
-            "http://192.168.0.11:8770",
-            "https://192.168.0.11:8770/anything",
+            "ws://192.168.1.20:8770/v1/stream",
+            "http://192.168.1.20:8770",
+            "https://192.168.1.20:8770/anything",
         ] {
             let out = normalise_server(input).unwrap();
             assert!(
-                out.starts_with("192.168.0.11"),
+                out.starts_with("192.168.1.20"),
                 "{input} became {out}"
             );
             assert!(!out.contains("://"), "{input} kept its scheme: {out}");
@@ -1079,10 +1079,10 @@ mod tests {
     fn what_the_field_accepts_is_what_the_config_can_use() {
         // The two halves must agree, or the GUI would save something that
         // does not resolve to the server the user just typed.
-        let host = normalise_server("  ws://dock.internal:9000/v1/stream ").unwrap();
+        let host = normalise_server("  ws://laptop.lan:9000/v1/stream ").unwrap();
         assert_eq!(
             syrinx_client::config::server_url(&host),
-            "ws://dock.internal:9000/v1/stream"
+            "ws://laptop.lan:9000/v1/stream"
         );
     }
 }
