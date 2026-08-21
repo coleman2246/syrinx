@@ -7,7 +7,10 @@
 //! never had a window has to hold the session instead.
 //!
 //! Starting the GUI starts a daemon if none is running, so opening the window is
-//! enough to get a tray, and closing it leaves both alive.
+//! enough to get a tray, and closing it leaves both alive. The daemon is
+//! detached from whatever started it -- a console on Windows, a session on Unix
+//! -- so closing the terminal the GUI was launched from does not take dictation
+//! with it.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -41,7 +44,31 @@ const POLL_INTERVAL: Duration = Duration::from_millis(33);
 /// than the state poll because scanning shells out to `pw-dump`.
 const SOURCE_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        report_fatal(&e);
+        std::process::exit(1);
+    }
+}
+
+/// Show a failure that happened before there was a window to show it in.
+///
+/// A double-clicked application has no console to print to, so printing alone
+/// means it simply fails to appear -- no window, no message, nothing to act on.
+/// A bad token or an unreachable server would look identical to a broken
+/// download.
+fn report_fatal(e: &anyhow::Error) {
+    let text = format!("{e:#}");
+    tracing::error!("{text}");
+    eprintln!("Error: {text}");
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Syrinx could not start")
+        .set_description(text)
+        .show();
+}
+
+fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -101,7 +128,8 @@ fn ensure_daemon() -> Result<()> {
     let log_path = daemon_log_path();
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("creating the daemon log at {}", log_path.display()))?;
-    let mut child = std::process::Command::new(&cmd)
+    let mut command = std::process::Command::new(&cmd);
+    command
         .arg("daemon")
         // Detached from this window's stdin: the daemon must outlive it.
         .stdin(std::process::Stdio::null())
@@ -109,7 +137,9 @@ fn ensure_daemon() -> Result<()> {
             log.try_clone()
                 .context("duplicating the daemon log handle")?,
         )
-        .stderr(log)
+        .stderr(log);
+    detach(&mut command);
+    let mut child = command
         .spawn()
         .with_context(|| format!("starting the daemon via {}", cmd.display()))?;
 
@@ -138,6 +168,43 @@ fn ensure_daemon() -> Result<()> {
         tail(&log_path)
     )
 }
+
+/// Cut the daemon loose from whatever started this window.
+///
+/// Without it the daemon dies with the terminal. On Windows a child inherits
+/// its parent's console and receives `CTRL_CLOSE_EVENT` when that console is
+/// closed; on Unix a shell sends `SIGHUP` to its jobs when it exits. Either way
+/// closing the window you launched from would stop dictation, which is the
+/// opposite of the point of having a daemon.
+#[cfg(windows)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    /// The child gets no console of its own and does not inherit ours, so no
+    /// window flashes up and console close events cannot reach it.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    /// Also out of our Ctrl-C group.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(unix)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // A new session, not merely a new process group: a background job in the
+    // same session is still sent SIGHUP when the shell exits.
+    unsafe {
+        command.pre_exec(|| {
+            // Failure here is not fatal -- the daemon still runs, it is just
+            // still attached -- so the error is swallowed rather than aborting
+            // a process that is mid-exec.
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn detach(_command: &mut std::process::Command) {}
 
 /// Where the daemon's output is kept, beside its PID file so it is per-user.
 fn daemon_log_path() -> PathBuf {

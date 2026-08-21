@@ -704,3 +704,36 @@ matches at the repository root. The fixture lives under
 `crates/syrinx-server/tests/`, so it was never tracked -- the golden test could
 not run from a fresh clone, and the file never reached the Windows laptop,
 whose tree arrives by `git archive`.
+
+
+## Launching on Windows (2026-08-21)
+
+Double-clicking the GUI has to start a daemon, open a window, and leave the
+daemon running when the window closes -- including when the terminal that
+launched it closes.
+
+`windows_subsystem = "windows"` on release builds means no console appears.
+Debug builds keep their console deliberately, so day-to-day use wants the
+release binary.
+
+The daemon is spawned with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`. A
+child otherwise inherits its parent's console and receives `CTRL_CLOSE_EVENT`
+when it is closed, which would stop dictation whenever the launching terminal
+went away. Verified with `AttachConsole` against the running daemon: error 6,
+`ERROR_INVALID_HANDLE` -- it has no console at all, so no console event can
+reach it.
+
+The Unix side uses `setsid` in `pre_exec` for the same reason. A new process
+group is not enough: a background job in the same session is still sent SIGHUP
+when the shell exits. Confirmed the daemon is its own session leader.
+
+Startup failures now open a message box. A double-clicked application has no
+console to print to, so a bad token used to look exactly like a broken
+download: no window, no message.
+
+### Not verifiable over SSH
+
+Windows OpenSSH puts a session's processes in a job object and terminates it
+when the connection closes, which kills the daemon regardless of any creation
+flag. Launching through `Win32_Process.Create` escapes that job, and the daemon
+then survived across an entirely new SSH connection.

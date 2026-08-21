@@ -180,8 +180,24 @@ this belongs on a trusted network only.
 
 ```powershell
 winget install Rustlang.Rustup      # MSVC toolchain, plus VS Build Tools
-cargo build -p syrinx-cli -p syrinx-gui
+cargo build --release -p syrinx-cli -p syrinx-gui
 ```
+
+Build **release** for day-to-day use: only the release binary is linked as a
+Windows-subsystem application, so only that one opens without a console window
+behind it. Double-clicking `target\release\syrinx-gui.exe` starts the daemon
+if none is running, opens the window, and leaves the daemon running when the
+window is closed.
+
+The daemon is spawned with `DETACHED_PROCESS`, so it has no console of its own
+and closing the terminal you launched from cannot reach it. Running
+`syrinx daemon` directly in a terminal is the ordinary foreground case and does
+stop with that terminal; launch the GUI, or use the tray, to get one that
+persists.
+
+Anything that goes wrong before the window appears is shown in a message box.
+A double-clicked application has no console to print to, so without that a bad
+token would look identical to a broken download.
 
 ## Sway
 
