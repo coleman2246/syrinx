@@ -1,0 +1,36 @@
+# TLS termination, for reaching syrinx from outside the LAN.
+#
+#   docker compose -f docker/compose.yaml -f docker/compose.tls.yaml up -d
+#
+# A separate file rather than a compose profile: compose interpolates every
+# variable in a file whether or not its profile is active, so a required
+# SYRINX_DOMAIN here would break the plain LAN deployment that has no domain.
+#
+# Set SYRINX_DOMAIN in docker/.env first, and point it at this host -- a
+# dynamic-DNS name is fine.
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      SYRINX_DOMAIN: ${SYRINX_DOMAIN:?set SYRINX_DOMAIN to the name this is reachable at}
+      SYRINX_ACME_EMAIL: ${SYRINX_ACME_EMAIL:-}
+    ports:
+      # 80 is not optional: it is how the certificate is issued and renewed.
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates. Losing this volume means re-requesting on every restart,
+      # which runs into Let's Encrypt rate limits quickly.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - syrinx
+    networks:
+      - syrinx
+
+volumes:
+  caddy_data:
+  caddy_config:

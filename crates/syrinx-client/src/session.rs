@@ -184,6 +184,7 @@ async fn run(
         inject::preflight(opts.inject)?;
     }
 
+    crate::install_crypto_provider();
     let mut req = opts
         .url
         .as_str()

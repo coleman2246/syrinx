@@ -785,3 +785,49 @@ behaves under pressure and belong in a file that can be reviewed.
 An empty environment variable does not override. An unset variable in a compose
 file arrives as `""`, and taking that literally would replace a working token
 with one that fails closed -- a failure that looks like a client problem.
+
+
+## TLS (2026-08-21)
+
+The design assumed a LAN and said so: a shared bearer token over plaintext
+`ws://`, with the reasoning that TLS would add cert-distribution friction on a
+Windows laptop for no gain on a trusted network. That reasoning held until the
+laptop needed to reach the service from elsewhere, and a VPN turned out not to
+be available -- the machine already runs Tailscale for something else, and a
+device can only be on one tailnet at a time.
+
+Two pieces were missing, and only one of them was code.
+
+**The client had no TLS backend.** The address parser accepted `wss://` and had
+done since the host-not-URL change, but `tokio-tungstenite`'s default features
+are `connect` and `handshake` only, so such a URL parsed and then failed at
+connect with "TLS support not compiled in". The parser accepting a scheme the
+client could not speak was the worst of both: it looked supported.
+
+Enabled `rustls-tls-native-roots` -- the platform trust store rather than
+bundled roots, so a private CA installed on the machine is trusted like a
+public one.
+
+**rustls then panicked.** Version 0.23 refuses to guess its cryptography
+backend when crate features do not settle it, and the refusal is a panic at the
+first connection, not an error. Dictating over `wss://` would have taken the
+process down mid-sentence. `install_crypto_provider` installs ring once, from
+every path that opens a connection.
+
+**Termination is Caddy's job, not ours.** Obtaining and renewing certificates
+is the hard part of TLS, and it is solved. `docker/compose.tls.yaml` adds a
+Caddy service that does it; syrinx keeps speaking plaintext on a compose
+network that never leaves the host.
+
+That overlay is a separate file rather than a compose profile because compose
+interpolates every variable in a file whether or not its profile is active: a
+required `SYRINX_DOMAIN` in the main file broke the LAN deployment that has no
+domain.
+
+### Verified
+
+Against a private CA and a real Caddy in front of the running container:
+dictation over `wss://` works (15x real time), an untrusted issuer is refused
+with `UnknownIssuer`, and a hostname the certificate does not cover is refused.
+A TLS client that accepted anything would be worse than no TLS, because it
+would look safe.

@@ -89,6 +89,7 @@ pub async fn transcribe(
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::protocol::Message as Ws;
 
+    crate::install_crypto_provider();
     let mut req = url
         .into_client_request()
         .with_context(|| format!("building a request for {url}"))?;

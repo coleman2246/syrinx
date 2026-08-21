@@ -13,12 +13,18 @@ serde_json.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-tokio-tungstenite = "0.30"
+# rustls, with the platform trust store. Without a TLS feature a `wss://`
+# URL parses and then fails at connect with "TLS support not compiled in",
+# so this is what makes the address parser's wss support real. Native roots
+# rather than bundled ones, so a private CA installed on the machine is
+# trusted the same as a public one.
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 toml_edit = "0.25"
 toml = "0.9"
 interprocess = "2.4.3"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process"] }

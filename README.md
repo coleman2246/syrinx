@@ -68,37 +68,46 @@ the reason the service exists; access is gated on the shared token, which fails
 closed when unset. Narrow it with `SYRINX_LISTEN=127.0.0.1:8770` on a machine
 that only ever talks to itself.
 
-### Exposing it beyond the LAN
+### Reaching it from outside the LAN
 
-**Do not put this on the internet as it stands.** Not because the container is
-weak — it is unprivileged, read-only and capability-less, and a shell inside it
-would be a poor prize — but because of what crosses the wire.
+The LAN default is plaintext `ws://`, which is fine on a network you control
+and **not** something to forward a port to. There is no encryption there: the
+bearer token travels in the clear on every connection, and so does the audio
+and every transcript coming back. Anyone on the path reads the token once and
+has permanent access to a microphone service.
 
-There is **no TLS**. The protocol is `ws://`, so:
+For anything beyond the LAN, terminate TLS:
 
-- The bearer token travels in **plaintext** on every connection. Anyone on the
-  path — a hotel network, an ISP, a compromised router — reads it once and has
-  permanent access.
-- The **audio** travels in plaintext, and so do the transcripts coming back.
-  That is every word dictated, including into a password field or a private
-  message. The container boundary does nothing about this: the data is already
-  outside it.
+```bash
+# in docker/.env
+SYRINX_DOMAIN=dictate.example.com     # a dynamic-DNS name is fine
+SYRINX_ACME_EMAIL=you@example.com     # optional; renewal warnings go here
 
-A shared bearer token over a plaintext transport is fine on a LAN, which is
-what it was built for. It is not an internet posture.
+docker compose -f docker/compose.yaml -f docker/compose.tls.yaml up -d
+```
 
-**Use a VPN — WireGuard or Tailscale.** No port opened at all, mutual
-authentication, everything encrypted in transit. The client keeps pointing at a
-private address and nothing in syrinx changes. For a personal service this is
-both the safest and the least work.
+Caddy obtains and renews a Let's Encrypt certificate by itself — that is the
+part of "just use TLS" that is actually hard. Forward ports **80 and 443** to
+the host: 80 is not optional, it is how the certificate is issued and renewed.
 
-A TLS-terminating reverse proxy is *not* currently an alternative. The address
-parser accepts `wss://`, but the client is built without a TLS backend, so such
-a URL fails at connect with "TLS support not compiled in". Making that route
-work means enabling a TLS feature on `tokio-tungstenite` first.
+Then point the client at it:
 
-Whatever the transport, generate the token with `openssl rand -hex 24` rather
-than reusing `dev-token`.
+```toml
+server = "wss://dictate.example.com"
+```
+
+No port needed; `wss://` means 443. The client validates the certificate chain
+against the platform trust store and refuses on a bad one — verified against a
+private CA: an untrusted issuer fails with `UnknownIssuer` rather than
+connecting anyway.
+
+Two things worth doing at the same time:
+
+- **Generate a real token.** `openssl rand -hex 24`. On the internet the token
+  is the only thing between a stranger and a transcription service running on
+  your GPU. `dev-token` is not that.
+- **Keep the LAN port closed at the router.** Publishing 8770 on the host is
+  for machines already on the LAN; the internet should only ever reach 443.
 
 ## Deployment notes
 

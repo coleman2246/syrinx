@@ -5,6 +5,22 @@
 //! selection, status -- had to be built twice and could drift between them.
 
 pub mod bulk;
+
+/// Choose rustls' cryptography backend, once per process.
+///
+/// rustls 0.23 refuses to guess when it cannot tell which backend the crate
+/// features selected, and the refusal is a **panic** at the point of the first
+/// connection -- so without this, dictating over `wss://` would take the whole
+/// process down mid-sentence rather than return an error.
+///
+/// Called from every path that opens a connection. Installing twice is not an
+/// error worth reporting; the second call simply loses.
+pub fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 pub mod config;
 pub mod daemon;
 pub mod ipc;

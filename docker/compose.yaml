@@ -51,6 +51,10 @@ services:
     cap_drop:
       - ALL
 
+    # Reachable by name from the TLS terminator over the compose network.
+    networks:
+      - syrinx
+
     healthcheck:
       # The binary probes itself: the image carries no curl or wget, and
       # /health needs no token, so nothing secret appears here.
@@ -59,3 +63,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+networks:
+  syrinx:

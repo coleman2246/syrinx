@@ -1,0 +1,27 @@
+# TLS termination for syrinx.
+#
+# Caddy obtains and renews a certificate for SYRINX_DOMAIN by itself, which is
+# the part of "just use TLS" that is actually hard. Certificates live in the
+# caddy_data volume: without that they are re-requested on every restart, and
+# Let's Encrypt rate-limits that quickly.
+#
+# reverse_proxy passes WebSocket upgrades through unchanged, so the client
+# talks wss:// to Caddy and Caddy talks ws:// to syrinx over the compose
+# network, which never leaves the host.
+
+{
+	# Where expiry warnings go. Optional, but Let's Encrypt is the only party
+	# that will tell you a renewal has been failing for a month.
+	email {$SYRINX_ACME_EMAIL}
+}
+
+{$SYRINX_DOMAIN} {
+	reverse_proxy syrinx:8770
+
+	# Streaming audio in, transcript out, for as long as someone is dictating.
+	# The defaults would cut a long session off mid-sentence.
+	timeouts {
+		read_body 0
+		idle 30m
+	}
+}
