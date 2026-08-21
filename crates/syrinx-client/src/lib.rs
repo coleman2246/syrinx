@@ -18,6 +18,10 @@ pub mod state;
 /// System tray. Linux only; a no-op elsewhere.
 pub mod tray;
 
+/// Typing at the cursor on Windows. See `inject::Method::SendInput`.
+#[cfg(windows)]
+pub mod windows_input;
+
 pub use config::Config;
 pub use mode::OutputMode;
 pub use session::{SessionHandle, SessionOptions, SessionState, Status};

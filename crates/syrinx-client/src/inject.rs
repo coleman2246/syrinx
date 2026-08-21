@@ -150,7 +150,7 @@ pub fn type_text(text: &str, method: Method) -> Result<()> {
 /// Type via the Win32 `SendInput` API.
 #[cfg(windows)]
 fn send_input(text: &str) -> Result<()> {
-    windows_input::type_text(text)
+    crate::windows_input::type_text(text)
 }
 
 #[cfg(not(windows))]
