@@ -549,3 +549,43 @@ the likely cause, which is the other common reason for the same symptom.
 
 The laptop microphone also reads silent, but privacy consent is `Allow` and the
 endpoints report OK, so this is most likely a quiet room rather than a fault.
+
+
+## Tray and hotkey (2026-08-21)
+
+The Windows tray uses `tray-icon`; Linux keeps `ksni`. Both feed the same
+`TrayCommand` channel, so the daemon does not know which is running. The icon on
+Windows is generated in code -- a coloured disc, red while listening -- rather
+than shipped as an asset: there is nothing to lose, nothing to keep in step with
+the Linux icon names, and no build step.
+
+`tray-icon` and `global-hotkey` are both thread-affine on Windows: each creates
+a hidden window and receives its messages on the creating thread. They therefore
+share one thread and one message pump. The daemon's own loop is a poll over
+channels, not a message loop, so this could not live there.
+
+### The hotkey is not portable, and cannot be
+
+Windows and X11 let any process claim a key combination. **Wayland deliberately
+does not** -- the compositor owns input, and a client that could grab keys
+globally could keylog every other client. There is a desktop portal for this
+(`org.freedesktop.portal.GlobalShortcuts`) but wlroots does not implement it, so
+Sway has nothing to offer either.
+
+The config setting is uniform anyway, and the daemon reports which case applies
+at startup with the exact compositor line to add. A hotkey that silently does
+nothing would be worse than one never offered.
+
+Not verified: registration fails over SSH with "requires an interactive window
+station" (error 1459), the same limitation that blocks `SendInput`. It needs a
+run from a real login.
+
+### A GUI bug found on the way
+
+`ensure_daemon` spawned the daemon with stdout and stderr on `/dev/null` and
+never waited on the child. Two consequences, both seen on the development
+desktop: a daemon that failed to start reported only "did not start listening
+within 5s" with the reason discarded, and the dead child stayed a zombie for as
+long as the GUI was open. Output now goes to a log beside the PID file, the exit
+is detected while polling and reported with the log's tail, and the child is
+reaped in the background once the socket is up.

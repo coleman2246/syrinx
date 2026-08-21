@@ -63,7 +63,29 @@ What differs from Linux:
 | Typing | `wtype` / `ydotool` / `paste` | `sendinput` |
 | Stopping a session | SIGTERM | a stop-request file, polled |
 | Audio | PipeWire, including per-application capture | WASAPI via cpal |
-| System tray | yes | not yet — use `syrinx quit` |
+| System tray | ksni (StatusNotifierItem) | tray-icon |
+| Global hotkey | compositor binding | built in |
+
+## Hotkey
+
+`hotkey = "ctrl+alt+d"` in the config starts and stops dictation from anywhere.
+Modifiers are `ctrl`, `alt`, `shift` and `super`; function keys work on their
+own. Unset by default, because claiming a combination for the whole desktop is
+not something to do to someone unasked.
+
+**It only registers on Windows and X11.** Wayland has no way for a client to
+grab a key globally — the compositor owns input, and a client that could do this
+could keylog every other client. On Sway, GNOME or KDE the binding belongs in
+the compositor and runs the CLI:
+
+```
+bindsym $mod+n exec syrinx toggle
+```
+
+The daemon logs which of these applies at startup rather than failing quietly,
+and the generated config says so too.
+
+## Windows notes
 
 Per-application capture is Linux-only. Windows has had process loopback since
 10 2004, but cpal does not expose it, so it would mean hand-written WASAPI.
