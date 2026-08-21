@@ -1,8 +1,13 @@
 //! Portable backend for platforms without PipeWire, principally Windows.
 //!
 //! Enumerates capture devices, plus **output** devices offered as system audio:
-//! WASAPI transparently enables loopback when an output device is opened for
-//! input, which is how "transcribe whatever is playing" works on Windows.
+//! WASAPI enables loopback when an output device is opened for input, which is
+//! how "transcribe whatever is playing" works on Windows.
+//!
+//! Only half transparent, and the half that is not cost a debugging session:
+//! cpal sets the loopback flag when *building* an input stream on a render
+//! endpoint, but `default_input_config` still refuses to describe one. The
+//! config has to come from the output side. See `CpalCapture::start`.
 //!
 //! Cannot isolate a single application. Windows has had process loopback since
 //! 10 2004, but cpal does not expose it, so that would mean hand-written

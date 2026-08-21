@@ -60,9 +60,22 @@ impl CpalCapture {
         use syrinx_proto::{downmix_to_mono, resample_to_16k};
 
         let device = crate::cpal_backend::find_device(name, loopback)?;
-        let supported = device
-            .default_input_config()
-            .context("querying input config")?;
+        // A loopback source is a *render* endpoint being read. cpal builds that
+        // stream correctly -- it sets AUDCLNT_STREAMFLAGS_LOOPBACK for an input
+        // stream on a render device -- but it refuses to describe one:
+        // `default_input_config` answers "Device does not support input" for
+        // anything that is not a capture endpoint. The format to ask for is the
+        // one the device renders in, so query the output side and open it for
+        // input.
+        let supported = if loopback {
+            device
+                .default_output_config()
+                .context("querying the output config of a loopback device")?
+        } else {
+            device
+                .default_input_config()
+                .context("querying input config")?
+        };
         let channels = supported.channels();
         let rate = supported.sample_rate();
         let format = supported.sample_format();
