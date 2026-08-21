@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use syrinx_client::{Config, OutputMode, SessionOptions, save, state};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 #[derive(Parser)]
@@ -111,6 +111,11 @@ enum Cmd {
     },
     /// Report whether a session is active.
     Status,
+    /// Stop the background daemon.
+    ///
+    /// `stop` ends dictation but leaves the daemon running, the same as the
+    /// tray's Stop. This is the tray's Quit.
+    Quit,
     /// Run the background daemon: tray icon, no window. The GUI attaches to
     /// this, so closing the GUI leaves dictation running.
     Daemon {
@@ -190,18 +195,46 @@ fn main() -> Result<()> {
         }
 
         Cmd::Status => {
+            // A daemon owns its session and writes no PID file, so looking only
+            // at the PID file reports "idle" while the GUI is actively
+            // dictating. The CLI is meant to be equivalent to the GUI, and that
+            // starts with the two agreeing about what is happening.
             match state::running_pid(&pid_path) {
                 Some(pid) => println!("running (pid {pid})"),
-                None => println!("idle"),
+                None => match daemon_state() {
+                    Some(s) => println!(
+                        "{} (daemon, mode {})",
+                        s.status.label().to_lowercase(),
+                        s.mode.name()
+                    ),
+                    None => println!("idle"),
+                },
             }
+            Ok(())
+        }
+
+        Cmd::Quit => {
+            if !syrinx_client::ipc::daemon_running() {
+                info!("no daemon running");
+                return Ok(());
+            }
+            ask_daemon(syrinx_client::ipc::Request::Quit)?;
+            info!("daemon asked to quit");
             Ok(())
         }
 
         Cmd::Stop => {
             match state::running_pid(&pid_path) {
                 Some(pid) => {
-                    state::signal_stop(pid)?;
+                    state::signal_stop(pid, &pid_path)?;
                     info!("asked pid {pid} to stop");
+                }
+                // Fall through to the daemon, which holds its session without a
+                // PID file. Without this, `stop` is a no-op whenever dictation
+                // was started from the GUI or the tray.
+                None if syrinx_client::ipc::daemon_running() => {
+                    ask_daemon(syrinx_client::ipc::Request::Stop)?;
+                    info!("asked the daemon to stop dictating");
                 }
                 None => info!("not running"),
             }
@@ -218,8 +251,14 @@ fn main() -> Result<()> {
             split,
         } => {
             if let Some(pid) = state::running_pid(&pid_path) {
-                state::signal_stop(pid)?;
+                state::signal_stop(pid, &pid_path)?;
                 info!("stopping pid {pid}");
+                return Ok(());
+            }
+            // A running daemon owns the session, so toggling has to go through
+            // it rather than start a second one competing for the microphone.
+            if syrinx_client::ipc::daemon_running() {
+                ask_daemon(syrinx_client::ipc::Request::Toggle)?;
                 return Ok(());
             }
             run(cli.config, mode, source, separate, save, save_default, format.into(), split, pid_path)
@@ -322,8 +361,9 @@ fn run(
     // interactive equivalent. Handling them rather than dying lets the session
     // flush its final words instead of truncating mid-utterance.
     let (sig_tx, sig_rx) = std::sync::mpsc::channel();
+    let stop_path = pid_path.clone();
     std::thread::spawn(move || {
-        wait_for_stop_signal();
+        wait_for_stop_signal(&stop_path);
         let _ = sig_tx.send(());
     });
 
@@ -377,19 +417,62 @@ fn run(
     Ok(())
 }
 
-/// Block until SIGTERM or Ctrl-C.
-fn wait_for_stop_signal() {
+/// The daemon's current state, or `None` if no daemon is listening.
+fn daemon_state() -> Option<syrinx_client::ipc::DaemonState> {
+    match syrinx_client::ipc::request(&syrinx_client::ipc::Request::GetState) {
+        Ok(syrinx_client::ipc::Response::State(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Send one request to the daemon, turning its error reply into ours.
+fn ask_daemon(req: syrinx_client::ipc::Request) -> Result<()> {
+    match syrinx_client::ipc::request(&req)? {
+        syrinx_client::ipc::Response::Error { message } => {
+            anyhow::bail!("the daemon refused: {message}")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Block until asked to stop: SIGTERM or Ctrl-C on Unix, a stop request or
+/// Ctrl-C on Windows.
+fn wait_for_stop_signal(pid_path: &Path) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("building a runtime for signal handling");
     rt.block_on(async {
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("installing a SIGTERM handler");
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = tokio::signal::ctrl_c() => {}
+        #[cfg(unix)]
+        {
+            let _ = pid_path;
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("installing a SIGTERM handler");
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Windows has no SIGTERM, so `stop` leaves a file instead. Polled
+            // rather than watched: this is a human pressing a key, so a fifth
+            // of a second is imperceptible and a directory watcher would be a
+            // lot of machinery for it.
+            let path = pid_path.to_path_buf();
+            let watch = async {
+                loop {
+                    if state::take_stop_request(&path) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            };
+            tokio::select! {
+                _ = watch => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
         }
     });
 }
@@ -411,8 +494,9 @@ fn run_daemon(
     let source_key = source.or_else(|| cfg.source_key.clone());
 
     // Signals stop the daemon, so ^C and `systemctl stop` behave.
-    std::thread::spawn(|| {
-        wait_for_stop_signal();
+    let stop_path = state::default_pid_path();
+    std::thread::spawn(move || {
+        wait_for_stop_signal(&stop_path);
         // Ask politely over IPC so the socket is cleaned up on the way out.
         let _ = syrinx_client::ipc::request(&syrinx_client::ipc::Request::Quit);
     });
@@ -455,8 +539,9 @@ fn run_meter(
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let stop = stop.clone();
+        let stop_path = state::default_pid_path();
         std::thread::spawn(move || {
-            wait_for_stop_signal();
+            wait_for_stop_signal(&stop_path);
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         });
     }
