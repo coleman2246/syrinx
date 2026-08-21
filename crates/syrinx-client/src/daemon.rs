@@ -74,6 +74,8 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     let mut state = DaemonRuntime {
         opts,
         session: None,
+        preview: None,
+        last_viewer: None,
         last: Default::default(),
     };
 
@@ -106,7 +108,11 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         // IPC requests.
         while let Ok((req, reply)) = rx.try_recv() {
             let resp = match req {
-                Request::GetState => Response::State(state.snapshot()),
+                Request::GetState => {
+                    // A viewer is present, so metering is worth running.
+                    state.last_viewer = Some(std::time::Instant::now());
+                    Response::State(state.snapshot())
+                }
                 Request::Start => {
                     state.start();
                     Response::Ok
@@ -154,6 +160,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         }
 
         state.reap_finished_session();
+        state.update_preview();
 
         if let Some(h) = &tray_handle {
             let snap = state.snapshot();
@@ -214,6 +221,13 @@ fn serve_client(stream: UnixStream, tx: mpsc::Sender<(Request, Option<mpsc::Send
 struct DaemonRuntime {
     opts: DaemonOptions,
     session: Option<SessionHandle>,
+    /// Live level meter, running only while idle and only while a viewer is
+    /// watching. Holding a capture open otherwise would keep a microphone
+    /// active for no reason.
+    preview: Option<crate::preview::Preview>,
+    /// When a viewer last asked for state. Metering stops shortly after the
+    /// last one closes.
+    last_viewer: Option<std::time::Instant>,
     /// The last finished session's state.
     ///
     /// Without this, stopping wipes the transcript from every viewer at exactly
@@ -228,6 +242,49 @@ impl DaemonRuntime {
         self.session.as_ref().is_some_and(|s| s.is_running())
     }
 
+    /// Start, stop or re-point the level meter.
+    ///
+    /// Metering runs only while idle and only while a viewer is watching: a
+    /// session already has the source open, and holding a capture for nobody
+    /// would keep a microphone live with no indication.
+    fn update_preview(&mut self) {
+        const VIEWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+        let watched = self
+            .last_viewer
+            .is_some_and(|t| t.elapsed() < VIEWER_TIMEOUT);
+        let want = watched && !self.running();
+
+        if !want {
+            self.preview = None;
+            return;
+        }
+
+        let key = self.opts.source_key.clone();
+        // Re-point when the selection changes, so the meter always shows what
+        // pressing Start would actually record.
+        let stale = match (&self.preview, &key) {
+            (Some(p), Some(k)) => &p.source_key != k,
+            (Some(_), None) => true,
+            (None, _) => true,
+        };
+        if !stale {
+            return;
+        }
+
+        self.preview = None;
+        let Ok(sources) = list_sources() else { return };
+        let Ok(source) = choose_source(&sources, key.as_deref()) else {
+            return;
+        };
+        match crate::preview::Preview::start(&source) {
+            Ok(p) => self.preview = Some(p),
+            // A source that cannot be metered is not fatal; Start will report
+            // the real error.
+            Err(e) => warn!("could not meter {}: {e:#}", source.display()),
+        }
+    }
+
     fn snapshot(&self) -> DaemonState {
         // Falls back to the last finished session rather than to an empty
         // default, so a stopped transcript stays on screen.
@@ -236,7 +293,12 @@ impl DaemonRuntime {
             .as_ref()
             .map(|s| s.state())
             .unwrap_or_else(|| self.last.clone());
-        DaemonState::from_session(&s, self.opts.mode, self.opts.source_key.clone())
+        let mut out = DaemonState::from_session(&s, self.opts.mode, self.opts.source_key.clone());
+        if let Some(p) = &self.preview {
+            out.levels = p.levels().to_vec();
+            out.rms = p.rms();
+        }
+        out
     }
 
     fn start(&mut self) {

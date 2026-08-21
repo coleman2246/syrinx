@@ -202,6 +202,8 @@ impl eframe::App for App {
         self.source_row(ui, running);
         ui.add_space(4.0);
         self.mode_row(ui, running);
+        ui.add_space(4.0);
+        self.meter_row(ui, running);
         ui.separator();
 
         let reserved = 96.0;
@@ -378,6 +380,58 @@ impl App {
         if let Some(mode) = chosen {
             self.send(Request::SetMode { mode });
         }
+    }
+
+    /// Ten-band spectrum of the selected source.
+    ///
+    /// Answers "is this device actually carrying audio" before a session is
+    /// started, which otherwise can only be discovered by recording and getting
+    /// an empty transcript.
+    fn meter_row(&mut self, ui: &mut egui::Ui, running: bool) {
+        let bands = &self.state.levels;
+        ui.horizontal(|ui| {
+            ui.label("Level:");
+
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(220.0, 26.0),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+
+            let n = syrinx_audio::meter::BANDS;
+            let gap = 2.0;
+            let bar_w = (rect.width() - gap * (n as f32 + 1.0)) / n as f32;
+            for i in 0..n {
+                let v = bands.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                // A visible floor, so an idle meter reads as "running, quiet"
+                // rather than "not running at all".
+                let h = (rect.height() - 4.0) * v.max(0.02);
+                let x = rect.left() + gap + i as f32 * (bar_w + gap);
+                let bar = egui::Rect::from_min_size(
+                    egui::pos2(x, rect.bottom() - 2.0 - h),
+                    egui::vec2(bar_w, h),
+                );
+                // Green through amber to red: loud enough to clip is worth
+                // seeing at a glance.
+                let colour = if v > 0.85 {
+                    egui::Color32::from_rgb(220, 80, 60)
+                } else if v > 0.6 {
+                    egui::Color32::from_rgb(220, 180, 60)
+                } else {
+                    egui::Color32::from_rgb(90, 190, 110)
+                };
+                painter.rect_filled(bar, 1.0, colour);
+            }
+
+            if running {
+                ui.weak("(session running)");
+            } else if self.state.rms > 0.001 {
+                ui.weak(format!("{:.0}%", self.state.rms * 100.0));
+            } else {
+                ui.weak("silent");
+            }
+        });
     }
 
     fn transcript_box(&self, ui: &mut egui::Ui, height: f32) {

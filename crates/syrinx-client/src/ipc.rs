@@ -64,6 +64,13 @@ pub struct DaemonState {
     pub error: Option<String>,
     /// Stable key of the source in use, so a viewer can show and change it.
     pub source_key: Option<String>,
+    /// Ten-band spectrum of the selected source, for confirming there is signal
+    /// before starting. Zeroed when nothing is being metered.
+    #[serde(default)]
+    pub levels: Vec<f32>,
+    /// Overall level of the same, 0.0 to 1.0.
+    #[serde(default)]
+    pub rms: f32,
 }
 
 impl DaemonState {
@@ -77,6 +84,8 @@ impl DaemonState {
             chunk_ms: s.chunk_ms,
             error: s.error.clone(),
             source_key,
+            levels: Vec::new(),
+            rms: 0.0,
         }
     }
 }

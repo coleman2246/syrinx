@@ -110,6 +110,17 @@ enum Cmd {
         format: FormatArg,
     },
 
+    /// Show a live level meter for a source, to confirm it is carrying audio.
+    /// Runs until interrupted.
+    Meter {
+        /// Source to meter. Defaults to the configured one.
+        #[arg(long)]
+        source: Option<String>,
+        /// Stop after this many seconds instead of running until interrupted.
+        #[arg(long)]
+        seconds: Option<u64>,
+    },
+
     /// List capturable audio sources.
     Sources,
 }
@@ -132,6 +143,8 @@ fn main() -> Result<()> {
             save_default,
             format,
         } => run_daemon(cli.config, mode, source, save_default, format.into()),
+
+        Cmd::Meter { source, seconds } => run_meter(cli.config, source, seconds),
 
         Cmd::Sources => {
             let mut last = None;
@@ -327,4 +340,62 @@ fn run_daemon(
             .map(|p| p.display().to_string())
             .or_else(|| Some("syrinx-gui".into())),
     })
+}
+
+/// Print a live meter until interrupted.
+///
+/// Uses the same analysis the GUI draws, so the two agree about whether a
+/// source is carrying audio.
+fn run_meter(
+    config: Option<PathBuf>,
+    source: Option<String>,
+    seconds: Option<u64>,
+) -> Result<()> {
+    use syrinx_audio::meter;
+
+    let cfg = Config::load(config).ok();
+    let want = source.or_else(|| cfg.and_then(|c| c.source_key));
+    let sources = syrinx_client::list_sources()?;
+    let src = syrinx_client::choose_source(&sources, want.as_deref())?;
+    eprintln!("metering: {}  (ctrl-c to stop)", src.display());
+
+    let preview = syrinx_client::preview::Preview::start(&src)?;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            wait_for_stop_signal();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    // On a terminal, redraw one line in place. Redirected to a file or a pipe,
+    // emit a line per sample instead -- carriage returns would produce one
+    // enormous unreadable line.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let deadline = seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let bands = preview.levels();
+        let rms = preview.rms();
+        let line = format!("  [{}]  {:>4.0}%", meter::bars(&bands), rms * 100.0);
+        use std::io::Write;
+        if interactive {
+            eprint!("\r{line}   ");
+        } else {
+            eprintln!("{line}");
+        }
+        let _ = std::io::stderr().flush();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if interactive {
+        eprintln!();
+    }
+    Ok(())
 }
