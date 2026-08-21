@@ -181,58 +181,6 @@ enum Cmd {
     Sources,
 }
 
-#[cfg(test)]
-mod format_tests {
-    use super::*;
-
-    fn cfg_with(format: save::Format) -> Config {
-        let mut c: Config = toml::from_str("token = \"t\"").unwrap();
-        c.format = format;
-        c
-    }
-
-    #[test]
-    fn the_config_decides_when_no_flag_is_given() {
-        // The flag carried default_value = "plain", so clap could not tell
-        // "not given" from "asked for plain" and `format` in the config was
-        // never consulted -- streaming was always plain prose.
-        let cfg = cfg_with(save::Format::Timestamped);
-        assert_eq!(resolve_format(None, &cfg), save::Format::Timestamped);
-    }
-
-    #[test]
-    fn the_flag_wins_over_the_config() {
-        let cfg = cfg_with(save::Format::Timestamped);
-        assert_eq!(
-            resolve_format(Some(FormatArg::Labelled), &cfg),
-            save::Format::Labelled
-        );
-    }
-
-    #[test]
-    fn asking_for_plain_is_not_the_same_as_saying_nothing() {
-        // The distinction the old default_value destroyed.
-        let cfg = cfg_with(save::Format::Labelled);
-        assert_eq!(
-            resolve_format(Some(FormatArg::Plain), &cfg),
-            save::Format::Plain
-        );
-        assert_eq!(resolve_format(None, &cfg), save::Format::Labelled);
-    }
-
-    #[test]
-    fn every_flag_value_maps_to_its_format() {
-        // A mismatch here would silently save in the wrong layout.
-        for (arg, want) in [
-            (FormatArg::Plain, save::Format::Plain),
-            (FormatArg::Timestamped, save::Format::Timestamped),
-            (FormatArg::Labelled, save::Format::Labelled),
-        ] {
-            assert_eq!(save::Format::from(arg), want);
-        }
-    }
-}
-
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -747,4 +695,56 @@ fn merge_cli_states(
     out.transcript = save::render(&segments, "", save::Format::Labelled);
     out.segments = segments;
     out
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    fn cfg_with(format: save::Format) -> Config {
+        let mut c: Config = toml::from_str("token = \"t\"").unwrap();
+        c.format = format;
+        c
+    }
+
+    #[test]
+    fn the_config_decides_when_no_flag_is_given() {
+        // The flag carried default_value = "plain", so clap could not tell
+        // "not given" from "asked for plain" and `format` in the config was
+        // never consulted -- streaming was always plain prose.
+        let cfg = cfg_with(save::Format::Timestamped);
+        assert_eq!(resolve_format(None, &cfg), save::Format::Timestamped);
+    }
+
+    #[test]
+    fn the_flag_wins_over_the_config() {
+        let cfg = cfg_with(save::Format::Timestamped);
+        assert_eq!(
+            resolve_format(Some(FormatArg::Labelled), &cfg),
+            save::Format::Labelled
+        );
+    }
+
+    #[test]
+    fn asking_for_plain_is_not_the_same_as_saying_nothing() {
+        // The distinction the old default_value destroyed.
+        let cfg = cfg_with(save::Format::Labelled);
+        assert_eq!(
+            resolve_format(Some(FormatArg::Plain), &cfg),
+            save::Format::Plain
+        );
+        assert_eq!(resolve_format(None, &cfg), save::Format::Labelled);
+    }
+
+    #[test]
+    fn every_flag_value_maps_to_its_format() {
+        // A mismatch here would silently save in the wrong layout.
+        for (arg, want) in [
+            (FormatArg::Plain, save::Format::Plain),
+            (FormatArg::Timestamped, save::Format::Timestamped),
+            (FormatArg::Labelled, save::Format::Labelled),
+        ] {
+            assert_eq!(save::Format::from(arg), want);
+        }
+    }
 }
