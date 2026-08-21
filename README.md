@@ -37,6 +37,11 @@ container that moves it to the GPU host is the last piece outstanding.
 
 See [`docs/specs/`](docs/specs/) for the design document.
 
+## Deploying
+
+See [docs/deploying.md](docs/deploying.md) for a GPU server behind an existing
+nginx. The short version is below.
+
 ## Running the server in a container
 
 ```bash
