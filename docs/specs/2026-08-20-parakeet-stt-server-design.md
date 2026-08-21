@@ -104,12 +104,70 @@ race against the cameras or a film.
   rather than degrading everyone already connected.
 - **Bulk uses int8 TDT** and yields to streaming sessions, which take priority.
 
-#### CPU fallback is not a real fallback on this host
+#### Measured performance (2026-08-20, RTX 3060 Ti + Ryzen 5700X)
+
+Steady-state medians over 20 chunks, warmup discarded:
+
+| Provider | Per 560 ms chunk | RTF | Concurrent streams | VRAM |
+|---|---|---|---|---|
+| CUDA (3060 Ti) | **37 ms** | 0.07x | ~15 | **3400 MiB** |
+| CPU (Ryzen 5700X) | **149 ms** | 0.27x | ~4 | 0 |
+
+Two corrections to earlier estimates in this document:
+
+- **VRAM is 3400 MiB, not ~2515 MiB.** The model file is 2515 MB, but ORT's CUDA
+  arena and workspace add ~900 MB on top. The tenancy budget must use the larger
+  figure.
+- The first chunk costs **~280 ms** on GPU against a 37 ms steady state, because
+  it pays for CUDA context creation and cuDNN autotuning. Quoting first-chunk
+  timing understates GPU performance by nearly an order of magnitude, and
+  flatters CPU, which has no equivalent warmup.
+
+The ~15 concurrent streams figure confirms the earlier ~14 estimate.
+
+#### ONNX Runtime's CUDA provider does not link cuDNN
+
+`libonnxruntime_providers_cuda.so` references 8 cuDNN symbols
+(`cudnnGetConvolutionBackwardDataAlgorithm_v7` and friends) but carries **no
+`DT_NEEDED` entry for cuDNN** -- confirmed with `objdump -p`. It links cublas,
+cudart and nccl; the cuDNN link was dropped, most likely by `--as-needed` at
+package build time. When ORT `dlopen`s the provider those symbols are
+unresolved, registration fails, and **ORT falls back to CPU silently**.
+
+This was diagnosed only because the plan required verifying with `nvidia-smi`
+rather than trusting a passing test. The golden tests were green the whole time,
+transcribing correctly at a quarter of the intended speed.
+
+The fix is `dlopen`ing cuDNN with `RTLD_GLOBAL` at startup, in
+`asr::parakeet::preload_cudnn`. It is equivalent to
+`LD_PRELOAD=/usr/lib/libcudnn.so.9` but done in-process, so deployment does not
+depend on an environment variable that is easy to omit.
+
+`ParakeetBackend::verify_gpu` then fails startup if inference runs slower than
+90 ms per chunk, turning an invisible 4x performance cliff into an explicit
+error. It is timing-based rather than provider-querying deliberately: it
+measures the property actually cared about, and catches every cause rather than
+only this one known failure.
+
+#### CPU is a viable fallback after all
+
+An earlier draft of this document asserted that CPU "is not a real fallback",
+reasoning from Zen 1's halved AVX2 throughput without measuring. At 149 ms per
+560 ms chunk on Zen 3, that was too pessimistic: CPU keeps up in real time with
+substantial margin, supporting ~4 concurrent streams.
+
+Zen 1 on `acdc` will be slower -- perhaps 2-3x -- which still plausibly lands
+under the 560 ms real-time budget for a single stream, though not for several.
+So CPU-only operation on the deployment host is a genuine option that would
+sidestep GPU contention with Frigate and Jellyfin entirely. It must be measured
+there before being relied upon.
+
+#### Historical note: the earlier claim about cuDNN 8
 
 `acdc` runs a **Ryzen 1700** (Zen 1, 8c/16t, 2017). Zen 1 splits 256-bit AVX2
 operations into two 128-bit halves, so it is roughly half-rate on exactly the
-vector math inference depends on. A 0.6B encoder is very unlikely to sustain
-real-time streaming there.
+vector math inference depends on. This was originally read as ruling CPU out;
+the measurements above show that was too pessimistic.
 
 So "fall back to CPU" must not be written into the design as though it were a
 graceful degradation path for the streaming model. Realistic options when the GPU

@@ -21,10 +21,12 @@ toml = "0.9"
 # The real GPU backend is optional so `cargo test` stays fast and CUDA-free.
 # CI runs the default feature set; the GPU path is built with --features cuda.
 parakeet-rs = { version = "0.3", features = ["cuda", "load-dynamic"], optional = true }
+# Used to dlopen cuDNN with RTLD_GLOBAL; see asr::parakeet::preload_cudnn.
+libc = { version = "0.2", optional = true }
 
 [features]
 default = []
-cuda = ["dep:parakeet-rs"]
+cuda = ["dep:parakeet-rs", "dep:libc"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.30"
