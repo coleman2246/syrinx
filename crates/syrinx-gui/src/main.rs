@@ -100,6 +100,10 @@ struct App {
     disconnected: bool,
     status_line: Option<String>,
     list_error: Option<String>,
+    /// Server address being edited. Applied on Enter or the Apply button, not
+    /// per keystroke, so a half-typed host is never dialled.
+    url_edit: String,
+    editing_url: bool,
 }
 
 impl App {
@@ -113,6 +117,8 @@ impl App {
             disconnected: false,
             status_line: None,
             list_error: None,
+            url_edit: String::new(),
+            editing_url: false,
         };
         app.refresh_sources();
         app.poll();
@@ -208,6 +214,60 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Server address editor. Hidden until the address is clicked, so the
+    /// common case stays uncluttered.
+    fn server_row(&mut self, ui: &mut egui::Ui, running: bool) {
+        if !self.editing_url {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Server:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.url_edit)
+                    .desired_width(280.0)
+                    .hint_text("ws://host:8770/v1/stream"),
+            );
+            let submitted =
+                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Changing servers mid-session would leave the daemon connected to
+            // the old one, so it waits for idle.
+            let apply = ui
+                .add_enabled(!running, egui::Button::new("Apply"))
+                .on_hover_text(if running {
+                    "Stop the session first"
+                } else {
+                    "Save and use this server"
+                })
+                .clicked();
+            if ui.button("Cancel").clicked() {
+                self.editing_url = false;
+            }
+            if (submitted || apply) && !running {
+                match self.apply_url() {
+                    Ok(()) => {
+                        self.status_line = Some(format!("Server set to {}", self.config.url));
+                        self.editing_url = false;
+                    }
+                    Err(e) => self.status_line = Some(format!("{e:#}")),
+                }
+            }
+        });
+        ui.weak("The daemon reconnects on the next session.");
+    }
+
+    /// Normalise, persist, and hand the new address to the daemon.
+    fn apply_url(&mut self) -> Result<()> {
+        let url = normalise_url(&self.url_edit)?;
+        self.config.url = url.clone();
+        self.config.save(&Config::default_path())?;
+        // The daemon holds its own copy, so telling it is what actually takes
+        // effect; writing the file only makes it survive a restart.
+        match ipc::request(&Request::SetUrl { url })? {
+            Response::Error { message } => anyhow::bail!(message),
+            _ => Ok(()),
+        }
+    }
+
     fn status_row(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (colour, dot) = match self.state.status {
@@ -375,18 +435,96 @@ impl App {
                         }
                     }
                 });
+            let has_text2 = !self.state.transcript.trim().is_empty();
+            if ui
+                .add_enabled(has_text2 && !running, egui::Button::new("Clear"))
+                .on_hover_text("Discard the transcript")
+                .clicked()
+            {
+                action = Some(Request::Clear);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let short = self
                     .config
                     .url
                     .trim_start_matches("ws://")
                     .trim_end_matches("/v1/stream");
-                ui.weak(short).on_hover_text(&self.config.url);
+                if ui
+                    .link(short)
+                    .on_hover_text(format!("{}\nclick to change", self.config.url))
+                    .clicked()
+                {
+                    self.url_edit = self.config.url.clone();
+                    self.editing_url = true;
+                }
             });
         });
+        self.server_row(ui, running);
         ui.weak("Closing this window leaves dictation running in the tray.");
         if let Some(a) = action {
             self.send(a);
         }
+    }
+}
+
+/// Accept a bare host, `host:port`, or a full URL, and produce a full one.
+///
+/// Typing just an IP is the common case, and failing on it would be needless
+/// friction when the rest of the address is always the same.
+fn normalise_url(input: &str) -> Result<String> {
+    let s = input.trim();
+    if s.is_empty() {
+        anyhow::bail!("enter a server address");
+    }
+    if s.starts_with("ws://") || s.starts_with("wss://") {
+        return Ok(s.to_string());
+    }
+    let with_port = if s.contains(':') {
+        s.to_string()
+    } else {
+        format!("{s}:8770")
+    };
+    Ok(format!("ws://{with_port}/v1/stream"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_host_becomes_a_full_url() {
+        assert_eq!(
+            normalise_url("192.168.0.11").unwrap(),
+            "ws://192.168.0.11:8770/v1/stream"
+        );
+    }
+
+    #[test]
+    fn a_host_and_port_keeps_the_port() {
+        assert_eq!(
+            normalise_url("acdc.home.arpa:9000").unwrap(),
+            "ws://acdc.home.arpa:9000/v1/stream"
+        );
+    }
+
+    #[test]
+    fn a_full_url_is_left_alone() {
+        let u = "ws://host:1234/v1/stream";
+        assert_eq!(normalise_url(u).unwrap(), u);
+        assert_eq!(normalise_url("wss://host/v1/stream").unwrap(), "wss://host/v1/stream");
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        assert_eq!(
+            normalise_url("  10.0.0.5  ").unwrap(),
+            "ws://10.0.0.5:8770/v1/stream"
+        );
+    }
+
+    #[test]
+    fn an_empty_address_is_an_error() {
+        assert!(normalise_url("").is_err());
+        assert!(normalise_url("   ").is_err());
     }
 }

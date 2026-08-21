@@ -74,6 +74,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     let mut state = DaemonRuntime {
         opts,
         session: None,
+        last: Default::default(),
     };
     let mut quit = false;
 
@@ -116,12 +117,22 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                     state.opts.source_key = Some(key);
                     Response::Ok
                 }
+                Request::SetUrl { url } => {
+                    // Sessions read the URL at start, so this takes effect on
+                    // the next one rather than disturbing a running session.
+                    state.opts.config.url = url;
+                    Response::Ok
+                }
                 Request::Save { format, path } => match state.save(format, path.as_deref()) {
                     Ok(p) => Response::Saved { path: p },
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),
                     },
                 },
+                Request::Clear => {
+                    state.clear();
+                    Response::Ok
+                }
                 Request::Quit => {
                     quit = true;
                     Response::Ok
@@ -193,6 +204,13 @@ fn serve_client(stream: UnixStream, tx: mpsc::Sender<(Request, Option<mpsc::Send
 struct DaemonRuntime {
     opts: DaemonOptions,
     session: Option<SessionHandle>,
+    /// The last finished session's state.
+    ///
+    /// Without this, stopping wipes the transcript from every viewer at exactly
+    /// the moment the user wants to read or save it: the session is dropped and
+    /// a snapshot falls back to an empty default. The text survives until the
+    /// next session starts or it is explicitly cleared.
+    last: crate::session::SessionState,
 }
 
 impl DaemonRuntime {
@@ -201,11 +219,13 @@ impl DaemonRuntime {
     }
 
     fn snapshot(&self) -> DaemonState {
+        // Falls back to the last finished session rather than to an empty
+        // default, so a stopped transcript stays on screen.
         let s = self
             .session
             .as_ref()
             .map(|s| s.state())
-            .unwrap_or_default();
+            .unwrap_or_else(|| self.last.clone());
         DaemonState::from_session(&s, self.opts.mode, self.opts.source_key.clone())
     }
 
@@ -230,6 +250,9 @@ impl DaemonRuntime {
         // Remember what was actually used, so a viewer shows the real source
         // rather than the preference that may not have resolved.
         self.opts.source_key = Some(source.stable_key());
+        // A new session starts from a blank transcript; the previous one has
+        // had its chance to be read and saved.
+        self.last = Default::default();
         self.session = Some(crate::session::start(
             SessionOptions {
                 url: self.opts.config.url.clone(),
@@ -244,6 +267,14 @@ impl DaemonRuntime {
     fn stop(&mut self) {
         if let Some(s) = &mut self.session {
             s.stop();
+        }
+    }
+
+    /// Discard the retained transcript. Ignored while a session is running,
+    /// where clearing would fight with text still arriving.
+    fn clear(&mut self) {
+        if !self.running() {
+            self.last = Default::default();
         }
     }
 
@@ -269,7 +300,7 @@ impl DaemonRuntime {
             .session
             .as_ref()
             .map(|s| s.state())
-            .unwrap_or_default();
+            .unwrap_or_else(|| self.last.clone());
         let p = save::save_rendered(
             path.map(std::path::Path::new),
             &st.segments,
@@ -305,9 +336,11 @@ impl DaemonRuntime {
                 Err(e) => info!("not saved: {e}"),
             }
         }
-        if let Some(e) = st.error {
+        if let Some(e) = &st.error {
             error!("session ended with an error: {e}");
         }
+        // Keep the finished transcript visible and saveable.
+        self.last = st;
         self.session = None;
     }
 }

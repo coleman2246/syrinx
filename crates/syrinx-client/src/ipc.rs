@@ -30,8 +30,12 @@ pub enum Request {
     Toggle,
     SetMode { mode: OutputMode },
     SetSource { key: String },
+    /// Point the daemon at a different server. Applies to the next session.
+    SetUrl { url: String },
     /// Save the current transcript, returning the path written.
     Save { format: Format, path: Option<String> },
+    /// Discard the retained transcript.
+    Clear,
     /// Stop the daemon entirely.
     Quit,
 }
