@@ -234,6 +234,18 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                         Response::Ok
                     }
                 }
+                Request::SetFormat { format } => {
+                    // Held on the daemon because it owns the session that is
+                    // streaming; a format that only travelled with Save
+                    // requests left the stream writing whatever the daemon
+                    // happened to start with.
+                    state.opts.format = format;
+                    state.opts.config.format = format;
+                    if let Err(e) = state.opts.config.save(&crate::Config::default_path()) {
+                        warn!("saving the config: {e:#}");
+                    }
+                    Response::Ok
+                }
                 Request::SetStreamFile { path } => {
                     state.opts.config.stream_to = path;
                     if let Err(e) = state
@@ -298,6 +310,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         // rather than carried through the session machinery.
         snap.hotkey = hotkey_report.clone();
         snap.stream_to = state.opts.config.stream_to.clone();
+        snap.format = state.opts.format;
         *published.lock().expect("published state poisoned") = snap.clone();
 
         if let Some(h) = &tray_handle {

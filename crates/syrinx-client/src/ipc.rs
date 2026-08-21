@@ -44,6 +44,8 @@ pub enum Request {
     },
     /// Point the daemon at a different machine. Applies to the next session.
     SetServer { server: String },
+    /// Layout for saved and streamed transcripts.
+    SetFormat { format: Format },
     /// Append the transcript to this file as it is dictated. `None` stops.
     /// Takes effect on the next session.
     SetStreamFile { path: Option<String> },
@@ -110,6 +112,9 @@ pub struct DaemonState {
     /// Where the transcript is being appended, if anywhere.
     #[serde(default)]
     pub stream_to: Option<String>,
+    /// Layout in use for saving and streaming.
+    #[serde(default)]
+    pub format: Format,
 }
 
 impl DaemonState {
@@ -133,6 +138,7 @@ impl DaemonState {
             // Stamped by the daemon, which is the only thing that knows.
             hotkey: crate::hotkey::Report::Unset,
             stream_to: None,
+            format: Format::default(),
         }
     }
 }

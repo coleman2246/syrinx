@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Config {
     /// Which machine the server is on: a hostname or an IP.
     ///
@@ -248,13 +248,15 @@ impl Config {
         doc["token"] = toml_edit::value(&self.token);
         doc["mode"] = toml_edit::value(self.mode.name());
         doc["inject"] = toml_edit::value(self.inject.name());
+        doc["format"] = toml_edit::value(self.format.name());
         doc["waybar_signal"] = toml_edit::value(i64::from(self.waybar_signal));
-        match &self.source_key {
-            Some(k) => doc["source_key"] = toml_edit::value(k),
-            None => {
-                doc.remove("source_key");
-            }
-        }
+
+        // Every optional field has to be handled, or a setting changed from a
+        // front-end is applied and then lost on restart. Three of these were
+        // missing, which is why `format` chosen in the GUI never survived.
+        set_or_remove(&mut doc, "source_key", self.source_key.as_deref());
+        set_or_remove(&mut doc, "stream_to", self.stream_to.as_deref());
+        set_or_remove(&mut doc, "hotkey", self.hotkey.as_deref());
 
         std::fs::write(path, doc.to_string())
             .with_context(|| format!("writing {}", path.display()))
@@ -293,6 +295,16 @@ fn plain_host(url: &str) -> Option<String> {
         _ => authority.to_string(),
     };
     (!host.is_empty()).then_some(host)
+}
+
+/// Write a key, or remove it entirely when there is no value.
+fn set_or_remove(doc: &mut toml_edit::DocumentMut, key: &str, value: Option<&str>) {
+    match value {
+        Some(v) => doc[key] = toml_edit::value(v),
+        None => {
+            doc.remove(key);
+        }
+    }
 }
 
 /// Write the starter config, without clobbering anything already there.
@@ -827,6 +839,61 @@ mod tests {
         write_template(&path).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "token = \"mine\"\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_setting_survives_a_save_and_reload() {
+        // Guards against the bug this test was written for: a field added to
+        // Config but not to `save`, so a setting changed in the GUI applied
+        // once and was gone after a restart. Every field is given a
+        // non-default value, so a missing one cannot pass by coincidence.
+        let dir = scratch("roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, template()).unwrap();
+
+        let original = Config {
+            server: "dock.internal:9001".into(),
+            url: None,
+            token: "a-token".into(),
+            source_key: Some("some-source".into()),
+            stream_to: Some("~/notes.txt".into()),
+            format: crate::save::Format::Labelled,
+            mode: OutputMode::Both,
+            inject: crate::inject::Method::Paste,
+            hotkey: Some("ctrl+alt+k".into()),
+            waybar_signal: 3,
+        };
+        original.save(&path).unwrap();
+
+        let reloaded = Config::load(Some(path.clone())).unwrap();
+        assert_eq!(reloaded, original, "a setting was lost by save/load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_an_optional_setting_removes_it() {
+        // Setting it back to None has to delete the line, or the old value
+        // comes back on the next load.
+        let dir = scratch("clearopt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "token = \"t\"\nstream_to = \"/tmp/x.txt\"\nhotkey = \"ctrl+alt+d\"\n",
+        )
+        .unwrap();
+
+        let mut c = Config::load(Some(path.clone())).unwrap();
+        assert!(c.stream_to.is_some() && c.hotkey.is_some());
+        c.stream_to = None;
+        c.hotkey = None;
+        c.save(&path).unwrap();
+
+        let reloaded = Config::load(Some(path.clone())).unwrap();
+        assert_eq!(reloaded.stream_to, None);
+        assert_eq!(reloaded.hotkey, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -30,6 +30,15 @@ enum FormatArg {
     Labelled,
 }
 
+/// The layout to use: the flag if given, otherwise the config.
+///
+/// The flag used to carry `default_value = "plain"`, which made it impossible
+/// for clap to tell "not given" from "asked for plain" -- so `format` in the
+/// config was never consulted and streaming was always plain prose.
+fn resolve_format(flag: Option<FormatArg>, cfg: &Config) -> save::Format {
+    flag.map(save::Format::from).unwrap_or(cfg.format)
+}
+
 impl From<FormatArg> for save::Format {
     fn from(f: FormatArg) -> Self {
         match f {
@@ -87,8 +96,10 @@ enum Cmd {
         save_default: bool,
         /// Layout of the saved file. Timestamped prefixes each fragment with
         /// its time, which makes the transcript an index into the recording.
-        #[arg(long, value_enum, default_value = "plain")]
-        format: FormatArg,
+        /// Layout for saved and streamed transcripts. Defaults to `format`
+        /// in the config.
+        #[arg(long, value_enum)]
+        format: Option<FormatArg>,
         /// With --separate, write one file per source instead of one combined
         /// file.
         #[arg(long)]
@@ -111,8 +122,10 @@ enum Cmd {
         save: Option<PathBuf>,
         #[arg(long, conflicts_with = "save")]
         save_default: bool,
-        #[arg(long, value_enum, default_value = "plain")]
-        format: FormatArg,
+        /// Layout for saved and streamed transcripts. Defaults to `format`
+        /// in the config.
+        #[arg(long, value_enum)]
+        format: Option<FormatArg>,
         #[arg(long)]
         split: bool,
     },
@@ -133,8 +146,10 @@ enum Cmd {
         /// Save each session to the default transcripts folder as it ends.
         #[arg(long)]
         save_default: bool,
-        #[arg(long, value_enum, default_value = "plain")]
-        format: FormatArg,
+        /// Layout for saved and streamed transcripts. Defaults to `format`
+        /// in the config.
+        #[arg(long, value_enum)]
+        format: Option<FormatArg>,
     },
 
     /// Transcribe an audio file. Anything ffmpeg can decode: wav, mp3, m4a,
@@ -145,8 +160,10 @@ enum Cmd {
         /// Write the transcript here instead of printing it.
         #[arg(long)]
         save: Option<PathBuf>,
-        #[arg(long, value_enum, default_value = "plain")]
-        format: FormatArg,
+        /// Layout for saved and streamed transcripts. Defaults to `format`
+        /// in the config.
+        #[arg(long, value_enum)]
+        format: Option<FormatArg>,
     },
 
     /// Show a live level meter for a source, to confirm it is carrying audio.
@@ -162,6 +179,58 @@ enum Cmd {
 
     /// List capturable audio sources.
     Sources,
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    fn cfg_with(format: save::Format) -> Config {
+        let mut c: Config = toml::from_str("token = \"t\"").unwrap();
+        c.format = format;
+        c
+    }
+
+    #[test]
+    fn the_config_decides_when_no_flag_is_given() {
+        // The flag carried default_value = "plain", so clap could not tell
+        // "not given" from "asked for plain" and `format` in the config was
+        // never consulted -- streaming was always plain prose.
+        let cfg = cfg_with(save::Format::Timestamped);
+        assert_eq!(resolve_format(None, &cfg), save::Format::Timestamped);
+    }
+
+    #[test]
+    fn the_flag_wins_over_the_config() {
+        let cfg = cfg_with(save::Format::Timestamped);
+        assert_eq!(
+            resolve_format(Some(FormatArg::Labelled), &cfg),
+            save::Format::Labelled
+        );
+    }
+
+    #[test]
+    fn asking_for_plain_is_not_the_same_as_saying_nothing() {
+        // The distinction the old default_value destroyed.
+        let cfg = cfg_with(save::Format::Labelled);
+        assert_eq!(
+            resolve_format(Some(FormatArg::Plain), &cfg),
+            save::Format::Plain
+        );
+        assert_eq!(resolve_format(None, &cfg), save::Format::Labelled);
+    }
+
+    #[test]
+    fn every_flag_value_maps_to_its_format() {
+        // A mismatch here would silently save in the wrong layout.
+        for (arg, want) in [
+            (FormatArg::Plain, save::Format::Plain),
+            (FormatArg::Timestamped, save::Format::Timestamped),
+            (FormatArg::Labelled, save::Format::Labelled),
+        ] {
+            assert_eq!(save::Format::from(arg), want);
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -181,10 +250,10 @@ fn main() -> Result<()> {
             source,
             save_default,
             format,
-        } => run_daemon(cli.config, mode, source, save_default, format.into()),
+        } => run_daemon(cli.config, mode, source, save_default, format),
 
         Cmd::Transcribe { file, save, format } => {
-            run_transcribe(cli.config, file, save, format.into())
+            run_transcribe(cli.config, file, save, format)
         }
 
         Cmd::Meter { source, seconds } => run_meter(cli.config, source, seconds),
@@ -269,7 +338,7 @@ fn main() -> Result<()> {
                 ask_daemon(syrinx_client::ipc::Request::Toggle)?;
                 return Ok(());
             }
-            run(cli.config, mode, source, separate, stream, save, save_default, format.into(), split, pid_path)
+            run(cli.config, mode, source, separate, stream, save, save_default, format, split, pid_path)
         }
 
         Cmd::Start {
@@ -285,7 +354,7 @@ fn main() -> Result<()> {
             if let Some(pid) = state::running_pid(&pid_path) {
                 anyhow::bail!("already running (pid {pid})");
             }
-            run(cli.config, mode, source, separate, stream, save, save_default, format.into(), split, pid_path)
+            run(cli.config, mode, source, separate, stream, save, save_default, format, split, pid_path)
         }
     }
 }
@@ -299,7 +368,7 @@ fn run(
     stream: Option<PathBuf>,
     save_to: Option<PathBuf>,
     save_default: bool,
-    format: save::Format,
+    format: Option<FormatArg>,
     split: bool,
     pid_path: PathBuf,
 ) -> Result<()> {
@@ -330,6 +399,7 @@ fn run(
 
     // The flag wins over the config, so a one-off run can stream somewhere
     // else without editing anything.
+    let format = resolve_format(format, &cfg);
     let stream_target = stream
         .map(|p| (p, format))
         .or_else(|| cfg.stream_path().map(|p| (p, format)));
@@ -508,9 +578,10 @@ fn run_daemon(
     mode: Option<ModeArg>,
     source: Option<String>,
     save_each: bool,
-    format: save::Format,
+    format: Option<FormatArg>,
 ) -> Result<()> {
     let cfg = Config::load(config)?;
+    let format = resolve_format(format, &cfg);
     let mode = mode.map(OutputMode::from).unwrap_or(cfg.mode);
     let source_key = source.or_else(|| cfg.source_key.clone());
 
@@ -603,9 +674,10 @@ fn run_transcribe(
     config: Option<PathBuf>,
     file: PathBuf,
     save_to: Option<PathBuf>,
-    format: save::Format,
+    format: Option<FormatArg>,
 ) -> Result<()> {
     let cfg = Config::load(config)?;
+    let format = resolve_format(format, &cfg);
     eprintln!("decoding {}...", file.display());
     let samples = syrinx_client::bulk::decode(&file)?;
     let secs = syrinx_client::bulk::duration_secs(&samples);

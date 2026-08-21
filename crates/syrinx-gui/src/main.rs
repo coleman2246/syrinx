@@ -248,12 +248,15 @@ struct App {
 
 impl App {
     fn new(config: Config) -> Self {
+        let format = config.format;
         let mut app = Self {
             show_help: false,
             config,
             state: DaemonState::default(),
             sources: Vec::new(),
-            save_format: save::Format::default(),
+            // Replaced by the daemon's value on the first poll; this only
+            // covers the frame before that arrives.
+            save_format: format,
             last_poll: Instant::now() - POLL_INTERVAL,
             last_source_scan: Instant::now(),
             disconnected: false,
@@ -282,6 +285,11 @@ impl App {
         self.last_poll = Instant::now();
         match ipc::request(&Request::GetState) {
             Ok(Response::State(s)) => {
+                // The daemon is the authority: it owns the session that
+                // streams, and it persists the setting. Mirroring it here
+                // keeps the dropdown honest across restarts and across two
+                // windows open at once.
+                self.save_format = s.format;
                 self.state = s;
                 self.disconnected = false;
             }
@@ -857,6 +865,9 @@ impl App {
                             .clicked()
                         {
                             self.save_format = f;
+                            // The daemon streams; it has to be told, or the
+                            // dropdown only affects the Save button.
+                            action = Some(Request::SetFormat { format: f });
                         }
                     }
                 });
