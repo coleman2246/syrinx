@@ -58,6 +58,7 @@ mod tests {
             kind,
             detail: None,
             stable_name: Some(key.into()),
+            sink_description: None,
         }
     }
 
