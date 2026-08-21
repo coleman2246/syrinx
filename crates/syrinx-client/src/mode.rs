@@ -8,9 +8,12 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum OutputMode {
     /// Accumulate a transcript for the caller to read or save. Nothing is typed.
-    #[default]
     Transcribe,
     /// Type at the cursor as text arrives. Nothing is accumulated for display.
+    ///
+    /// The default: dictation into whatever you are working in is the point,
+    /// and a transcript you then have to copy across is a step in the way.
+    #[default]
     Type,
     /// Both: keep a transcript and type it.
     Both,
