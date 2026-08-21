@@ -173,9 +173,11 @@ fn write_template(path: &std::path::Path) -> Result<()> {
 /// variant cannot silently go undocumented -- the file is only as good as its
 /// guarantee that it lists every value that works.
 ///
-/// Only methods that work on the platform generating the file are listed.
-/// Offering a Linux user `sendinput` is noise, and offering a Windows user
-/// `wtype` is a wrong answer dressed as a choice.
+/// **The same on every platform.** It once listed only what the generating
+/// machine could do, which read well until you kept one config for a desktop
+/// and a laptop: the file was then wrong on whichever machine did not write
+/// it. Every option is listed with the platform it applies to, and `inject`
+/// defaults to `auto` so the default itself needs no platform of its own.
 pub fn template() -> String {
     let mut s = String::new();
     s.push_str(
@@ -201,13 +203,8 @@ pub fn template() -> String {
     }
     s.push_str(&format!("mode = \"{}\"\n\n", OutputMode::default().name()));
 
-    let usable: Vec<crate::inject::Method> = crate::inject::Method::ALL
-        .iter()
-        .copied()
-        .filter(|m| m.supported_here())
-        .collect();
     s.push_str("# How text is typed at the cursor, for the modes above that type.\n");
-    for m in &usable {
+    for m in crate::inject::Method::ALL {
         s.push_str(&format!("#   \"{}\"{} -- {}\n", m.name(), pad(m.name()), m.summary()));
     }
     s.push_str(&format!(
@@ -215,15 +212,10 @@ pub fn template() -> String {
         crate::inject::Method::default().name()
     ));
 
-    s.push_str(
-        "# Global hotkey to start and stop dictation, e.g. \"ctrl+alt+d\".\n\
-         # Modifiers: ctrl, alt, shift, super. Function keys work on their own.\n\
-         # Unset by default, because this claims the key for the whole desktop.\n",
-    );
-    if let Some(why) = crate::hotkey::supported_here() {
-        // Say so in the file rather than let someone set it and wonder.
-        s.push_str(&comment_wrap(why));
-    }
+    // Stated unconditionally rather than only on Wayland, so the file reads
+    // the same everywhere and explains why the same setting behaves
+    // differently on the machine at the other end.
+    s.push_str(&comment_wrap(crate::hotkey::PORTABILITY_NOTE));
     s.push_str("# hotkey = \"ctrl+alt+d\"\n\n");
 
     s.push_str(
@@ -232,10 +224,9 @@ pub fn template() -> String {
          # source_key = \"...\"\n\n",
     );
 
-    if cfg!(target_os = "linux") {
-        s.push_str("# Realtime signal number for the waybar status indicator.\n");
-        s.push_str(&format!("waybar_signal = {}\n", default_waybar_signal()));
-    }
+    s.push_str("# Realtime signal number for the waybar status indicator.\n");
+    s.push_str("# Linux only; ignored elsewhere.\n");
+    s.push_str(&format!("waybar_signal = {}\n", default_waybar_signal()));
     s
 }
 
@@ -246,13 +237,17 @@ pub fn template() -> String {
 fn comment_wrap(text: &str) -> String {
     const WIDTH: usize = 74;
     let mut out = String::new();
-    for para in text.lines() {
-        if para.starts_with(' ') || para.starts_with('\t') {
-            out.push_str(&format!("#    {}\n", para.trim()));
-            continue;
+    // Consecutive ordinary lines form one paragraph and are reflowed
+    // together. Wrapping each source line on its own re-breaks text that was
+    // already broken, which produces a line containing a single word.
+    let mut para: Vec<&str> = Vec::new();
+
+    let flush = |para: &mut Vec<&str>, out: &mut String| {
+        if para.is_empty() {
+            return;
         }
         let mut line = String::new();
-        for word in para.split_whitespace() {
+        for word in para.join(" ").split_whitespace() {
             if !line.is_empty() && line.len() + 1 + word.len() > WIDTH {
                 out.push_str(&format!("# {line}\n"));
                 line.clear();
@@ -265,7 +260,23 @@ fn comment_wrap(text: &str) -> String {
         if !line.is_empty() {
             out.push_str(&format!("# {line}\n"));
         }
+        para.clear();
+    };
+
+    for raw in text.lines() {
+        if raw.trim().is_empty() {
+            flush(&mut para, &mut out);
+            out.push_str("#\n");
+        } else if raw.starts_with(' ') || raw.starts_with('\t') {
+            // An indented line is an example meant to be copied; reflowing a
+            // config line would break it.
+            flush(&mut para, &mut out);
+            out.push_str(&format!("#    {}\n", raw.trim()));
+        } else {
+            para.push(raw);
+        }
     }
+    flush(&mut para, &mut out);
     out
 }
 
@@ -377,6 +388,18 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_comments_reflow_a_whole_paragraph() {
+        // Wrapping each source line separately leaves orphans: a line with
+        // one word on it, mid-sentence.
+        let text = "one two three four five six seven eight nine ten\n\
+                    eleven twelve thirteen fourteen fifteen sixteen";
+        for line in comment_wrap(text).lines() {
+            let words = line.trim_start_matches("# ").split_whitespace().count();
+            assert!(words > 1, "orphaned line: {line:?}");
+        }
+    }
+
+    #[test]
     fn wrapped_comments_keep_examples_copyable() {
         // An indented example is meant to be pasted; reflowing it breaks it.
         let out = comment_wrap("some prose here\n    bindsym $mod+n exec syrinx toggle");
@@ -399,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn the_template_documents_every_value_that_works_here() {
+    fn the_template_documents_every_value_there_is() {
         let text = template();
         for m in OutputMode::ALL {
             assert!(
@@ -408,7 +431,7 @@ mod tests {
                 m.name()
             );
         }
-        for m in crate::inject::Method::ALL.iter().filter(|m| m.supported_here()) {
+        for m in crate::inject::Method::ALL {
             assert!(
                 text.contains(&format!("\"{}\"", m.name())),
                 "inject {} is undocumented:\n{text}",
@@ -418,16 +441,21 @@ mod tests {
     }
 
     #[test]
-    fn the_template_omits_methods_that_cannot_work_here() {
-        // Offering a choice that cannot work is worse than offering none.
+    fn the_template_is_the_same_on_every_platform() {
+        // One config kept for a desktop and a laptop has to be right on both.
+        // Anything only true of the generating machine breaks that, so the
+        // template names no platform-specific default and hides no option.
         let text = template();
-        for m in crate::inject::Method::ALL.iter().filter(|m| !m.supported_here()) {
-            assert!(
-                !text.contains(&format!("inject = \"{}\"", m.name())),
-                "{} is offered as the default but cannot work here",
-                m.name()
-            );
+        assert!(text.contains("waybar_signal"), "a setting was hidden");
+        assert!(
+            text.contains("inject = \"auto\""),
+            "the default must not name a platform: {text}"
+        );
+        for m in crate::inject::Method::ALL {
+            assert!(text.contains(m.name()), "{} was hidden", m.name());
         }
+        // The Wayland note belongs in every copy, not just the Wayland one.
+        assert!(text.contains("Wayland"), "the portability note is missing");
     }
 
     #[test]

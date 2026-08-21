@@ -158,6 +158,21 @@ fn code_for(name: &str) -> Option<String> {
     )
 }
 
+/// What a config file says about hotkeys, on every platform.
+///
+/// The same text everywhere. A note that appeared only on the machine that
+/// generated the file would leave the other machine's user wondering why an
+/// identical setting behaved differently.
+pub const PORTABILITY_NOTE: &str = "\
+Global hotkey to start and stop dictation, e.g. \"ctrl+alt+d\".
+Modifiers: ctrl, alt, shift, super. Function keys work on their own.
+Unset by default, because this claims the key for the whole desktop.
+
+Registered by syrinx on Windows and on Linux under X11. Wayland does not let
+an application claim a global hotkey -- the compositor owns input -- so
+bind it in the compositor there instead, e.g. for Sway:
+    bindsym $mod+n exec syrinx toggle";
+
 /// Whether this platform lets a process claim a global hotkey at all.
 ///
 /// Wayland is the interesting case: the protocol has no way for a client to
