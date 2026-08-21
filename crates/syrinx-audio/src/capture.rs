@@ -19,12 +19,21 @@ impl Capture {
         match &source.target {
             #[cfg(target_os = "linux")]
             SourceTarget::PipeWireNode(id) => {
-                // Applications need their ports linked in; sources and sink
-                // monitors are addressable by target.
-                let cap = if source.kind == crate::SourceKind::Application {
-                    crate::pipewire::PwCapture::start_linked(*id, tx)?
-                } else {
-                    crate::pipewire::PwCapture::start(*id, tx)?
+                // Only a real capture device is addressable with `--target`.
+                //
+                // A sink's monitor and an application's stream both have to be
+                // linked port-to-port instead. A sink exposes monitor_FL/FR as
+                // *output* ports, and `--target <sink>` does not reliably wire
+                // them into a capture stream -- selecting a monitor that way
+                // produced silence while the same card's capture device
+                // happened to work, which reads as the two being swapped.
+                let cap = match source.kind {
+                    crate::SourceKind::Microphone => {
+                        crate::pipewire::PwCapture::start(*id, tx)?
+                    }
+                    crate::SourceKind::Monitor | crate::SourceKind::Application => {
+                        crate::pipewire::PwCapture::start_linked(*id, tx)?
+                    }
                 };
                 Ok(Capture::PipeWire(cap))
             }
