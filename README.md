@@ -60,11 +60,27 @@ What differs from Linux:
 |---|---|---|
 | Config | `~/.config/syrinx/` | `%APPDATA%\syrinx\` |
 | Daemon IPC | Unix socket in `$XDG_RUNTIME_DIR` | named pipe `\\.\pipe\syrinx.sock` |
-| Typing | `wtype` / `ydotool` / `paste` | `sendinput` |
+| Typing (`auto` resolves to) | `ydotool` if its daemon runs, else `wtype` | `sendinput` |
 | Stopping a session | SIGTERM | a stop-request file, polled |
 | Audio | PipeWire, including per-application capture | WASAPI via cpal |
 | System tray | ksni (StatusNotifierItem) | tray-icon |
 | Global hotkey | compositor binding | built in |
+
+## One config, two machines
+
+The generated config is **byte-identical on every platform**: same settings,
+same defaults, same comments. It once listed only what the generating machine
+could do, which read well until the same file was kept for a desktop and a
+laptop — it was then wrong on whichever machine had not written it.
+
+`inject = "auto"` is what makes the *default* portable rather than just the
+file. It resolves per machine: `sendinput` on Windows; on Linux `ydotool` when
+its daemon is running, otherwise `wtype`. Running `ydotoold` is a deliberate act
+— a daemon to install, enable, and grant `/dev/uinput` — so it is taken as
+consent, which means `auto` is also right in Electron apps where `wtype` fails.
+
+Anything set explicitly is honoured exactly as written, and refused with a clear
+message if it cannot work on that platform.
 
 ## Hotkey
 
@@ -135,9 +151,9 @@ bindsym $mod+n exec syrinx toggle --mode type
 
 ## Typing into Electron apps (Teams, Discord, VS Code)
 
-The default typing method is `wtype`, which uses the Wayland virtual-keyboard
-protocol. It is correct for most native Wayland applications but **fails in
-Electron and Chromium apps**: each call creates and destroys a virtual keyboard,
+On Linux the fallback typing method is `wtype`, which uses the Wayland
+virtual-keyboard protocol. It is correct for most native Wayland applications
+but **fails in Electron and Chromium apps**: each call creates and destroys a virtual keyboard,
 Chromium re-evaluates focus whenever input devices appear, and the text field
 loses focus — so the keystrokes are interpreted as global shortcuts instead. In
 Teams that looks like the chat list jumping about rather than a message being
@@ -152,9 +168,10 @@ sudo pacman -S ydotool
 systemctl --user enable --now ydotool     # the daemon; ydotool cannot type without it
 ```
 
-Then **add** the `inject` line to `~/.config/syrinx/config.toml`. The whole file
-should look like this — `token` is required, so replacing the file with only the
-one new line will stop it loading:
+With the daemon running, the default `inject = "auto"` picks `ydotool` by
+itself — see below — so no config change is needed. To pin it explicitly, the
+whole file should look like this; `token` is required, so replacing the file
+with only the one new line will stop it loading:
 
 ```toml
 url = "ws://127.0.0.1:8770/v1/stream"
@@ -162,7 +179,8 @@ token = "your-shared-token"
 inject = "ydotool"
 ```
 
-Options are `wtype` (default), `ydotool`, and `paste`. Paste copies to the
+Options are `auto` (default), `wtype`, `ydotool`, `paste`, and `sendinput`.
+Paste copies to the
 clipboard and sends Ctrl+V, restoring the previous clipboard afterwards — the
 most broadly compatible of the three, though terminals need Ctrl+Shift+V so it
 is a poor fit there.

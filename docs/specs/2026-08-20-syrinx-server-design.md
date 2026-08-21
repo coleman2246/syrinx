@@ -589,3 +589,24 @@ within 5s" with the reason discarded, and the dead child stayed a zombie for as
 long as the GUI was open. Output now goes to a log beside the PID file, the exit
 is detected while polling and reported with the log's tail, and the child is
 reaped in the background once the socket is up.
+
+
+## One config for every platform (2026-08-21)
+
+The generated config was platform-specific: it listed only the injection methods
+the generating machine could use, and omitted `waybar_signal` off Linux. That
+reasoning was "offering a Windows user `wtype` is a wrong answer dressed as a
+choice", which holds right up until the same file is kept for a desktop and a
+laptop. Then the file is wrong on whichever machine did not write it.
+
+It is now byte-identical on both, verified by hashing the output on Linux and
+Windows: `013031935437be...`. Every option is listed with the platform it
+applies to, and nothing is hidden.
+
+`inject` defaults to `auto` rather than to a concrete method, so the default
+needs no platform of its own. It resolves once per process: `sendinput` on
+Windows; on Linux `ydotool` if `ydotoold` is running, else `wtype`. Probing for
+ydotoold rather than assuming means `auto` is also correct in Electron
+applications, where `wtype` loses focus -- and running that daemon is
+deliberate enough to read as consent. Cached in a `OnceLock` because it is
+consulted once per transcript fragment, several times a second.
