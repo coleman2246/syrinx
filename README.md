@@ -18,6 +18,10 @@ Vosk's accuracy penalty: ~1.93% WER on librispeech test-clean, with punctuation.
 
 ## Modes
 
+The default is **type at the cursor**: dictation into whatever you are working
+in is the point, and a transcript you then have to copy across is a step in the
+way. Set `mode = "transcribe"` for a transcript instead, or `"both"`.
+
 - **live** — near-real-time, typed at the cursor. Append-only: the server never
   asks the client to delete text, because it is typing into arbitrary
   applications where that would be destructive.
@@ -131,8 +135,18 @@ instead.
 
 ### Reaching the server
 
-The client is thin: no model, no GPU work, just audio out and text back. Point
-`url` at the machine running the server.
+The client is thin: no model, no GPU work, just audio out and text back. Name
+the machine the server is on:
+
+```toml
+server = "192.168.0.235"     # or a hostname: dock.internal
+```
+
+Just the host. Syrinx supplies the port and the endpoint, so there is nothing
+to memorise and one thing to change when the server moves. Append a port
+(`dock.internal:9000`) if it is not on the default. A complete `url = "..."`
+still works as an override, for a reverse proxy on a path syrinx would not
+choose.
 
 The server binds to `127.0.0.1` by default, which no other machine can reach.
 For a remote client set `bind = "0.0.0.0:8770"` in the **server's** config.
@@ -191,7 +205,7 @@ whole file should look like this; `token` is required, so replacing the file
 with only the one new line will stop it loading:
 
 ```toml
-url = "ws://127.0.0.1:8770/v1/stream"
+server = "127.0.0.1"
 token = "your-shared-token"
 inject = "ydotool"
 ```

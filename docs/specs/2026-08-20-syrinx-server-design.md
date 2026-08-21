@@ -610,3 +610,32 @@ ydotoold rather than assuming means `auto` is also correct in Electron
 applications, where `wtype` loses focus -- and running that daemon is
 deliberate enough to read as consent. Cached in a `OnceLock` because it is
 consulted once per transcript fragment, several times a second.
+
+
+## A host instead of a URL (2026-08-21)
+
+The client config asked for `url = "ws://192.168.0.235:8770/v1/stream"`: four
+things to get right when only one of them ever changes. It is now
+`server = "192.168.0.235"`, with the scheme, port and endpoint supplied.
+
+Deliberately dull rules, because one that guesses is worse than one that is
+boring: a bare host gets the default port and the endpoint appended; anything
+written as a URL is respected as-is with only a missing path filled in, and no
+port is invented -- a proxy on 443 is exactly the case the `url` override
+exists for. A full URL remains accepted, so nothing that worked stops working.
+
+An older config is migrated on load: where its URL is one syrinx would have
+built anyway, the host is lifted out and the URL dropped. Anything unusual is
+left exactly as written. A test asserts the migration never changes where a
+client connects, which is the only real risk in it.
+
+The default mode is now `type`, not `transcribe`.
+
+### A trap this set
+
+Deleting the canonical config does **not** regenerate it: `Config::load` falls
+back to the pre-rename `~/.config/parakeet/config.toml`, which still exists on
+the development desktop. That fallback was silent, so an old file quietly took
+over -- and with the default now typing at the cursor rather than accumulating
+a transcript, an unnoticed config is no longer a harmless surprise. Loading a
+non-canonical path is now logged as a warning naming both paths.
