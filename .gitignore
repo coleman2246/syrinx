@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Models are large (2.4GB+) and volume-mounted, never committed
+/models/
+*.onnx
+*.onnx.data
+*.bin
+tokenizer.model
+
+# Audio fixtures can be large; golden test fixtures are added explicitly
+*.wav
+!tests/fixtures/golden/*.wav
+
+# Local config containing the shared auth token
+config.local.toml
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
