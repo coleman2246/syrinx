@@ -1531,6 +1531,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "parakeet-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "parakeet-proto",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "parakeet-proto"
 version = "0.1.0"
 dependencies = [
