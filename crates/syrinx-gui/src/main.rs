@@ -1,33 +1,46 @@
-//! A small control panel for parakeet dictation.
+//! A window onto the syrinx daemon.
 //!
-//! Shows what it is listening to, whether the server is up, and what it heard
-//! last. The source picker is the reason this exists: it can target a
-//! microphone, all system audio, or a single application -- so you can
-//! transcribe a video call or one browser tab without touching system defaults.
+//! The GUI owns no session. The daemon does, along with the tray icon, and this
+//! attaches to it over a Unix socket. That is what lets the window be closed
+//! without stopping dictation: winit documents `set_visible` as unsupported on
+//! Wayland, so a window cannot hide itself and keep running, and something that
+//! never had a window has to hold the session instead.
+//!
+//! Starting the GUI starts a daemon if none is running, so opening the window is
+//! enough to get a tray, and closing it leaves both alive.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eframe::egui;
-use syrinx_audio::{Source, SourceKind};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use syrinx_client::{
-    Config, OutputMode, SessionHandle, SessionOptions, SessionState, Status, save,
+    Config, OutputMode, Source, SourceKind, ipc,
+    ipc::{DaemonState, Request, Response},
+    save,
+    session::Status,
 };
-use syrinx_client::tray::{self, TrayCommand, TrayHandle, TrayState};
+
+/// How often the daemon is polled. Fast enough to feel live, slow enough that
+/// an idle window is not doing constant socket work.
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "syrinx_gui=info".into()),
+                .unwrap_or_else(|_| "syrinx_gui=info,syrinx_client=info".into()),
         )
         .init();
 
     let config = Config::load(None)?;
+    ensure_daemon()?;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([460.0, 340.0])
-            .with_min_inner_size([380.0, 260.0])
+            .with_inner_size([480.0, 380.0])
+            .with_min_inner_size([400.0, 280.0])
             .with_title("Syrinx"),
         ..Default::default()
     };
@@ -40,129 +53,123 @@ fn main() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// Start a daemon if none is listening, and wait for its socket.
+fn ensure_daemon() -> Result<()> {
+    if ipc::daemon_running() {
+        return Ok(());
+    }
+    ipc::clear_stale_socket();
+
+    // Same directory as this binary, so a viewer and its daemon come from one
+    // build rather than whatever is first on PATH.
+    let cmd = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("syrinx")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("syrinx"));
+
+    tracing::info!("starting the syrinx daemon");
+    std::process::Command::new(&cmd)
+        .arg("daemon")
+        // Detached: the daemon must outlive this window.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("starting the daemon via {}", cmd.display()))?;
+
+    // Binding the socket takes a moment; poll rather than guess at a sleep.
+    for _ in 0..50 {
+        if ipc::daemon_running() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::bail!("the daemon did not start listening within 5s")
+}
+
 struct App {
     config: Config,
-    mode: OutputMode,
-    tray: Option<TrayHandle>,
-    tray_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TrayCommand>>,
-    /// Set when the tray asks to quit, so the next frame can close the window.
-    quitting: bool,
-    /// Last saved path, shown so the user knows where it went.
-    saved_to: Option<String>,
-    save_format: save::Format,
+    /// Mirrored from the daemon; the GUI owns no session.
+    state: DaemonState,
     sources: Vec<Source>,
-    selected: Option<Source>,
-    session: Option<SessionHandle>,
-    state: SessionState,
+    save_format: save::Format,
+    last_poll: Instant,
+    /// Set when the socket drops, so the window can say so rather than showing
+    /// stale state as if it were live.
+    disconnected: bool,
+    status_line: Option<String>,
     list_error: Option<String>,
 }
 
 impl App {
     fn new(config: Config) -> Self {
-        let mode = config.mode;
-        let (tray, tray_rx) = match tray::start() {
-            Some((h, rx)) => (Some(h), Some(rx)),
-            None => (None, None),
-        };
         let mut app = Self {
             config,
-            mode,
-            tray,
-            tray_rx,
-            quitting: false,
-
-            saved_to: None,
-            save_format: save::Format::default(),
+            state: DaemonState::default(),
             sources: Vec::new(),
-            selected: None,
-            session: None,
-            state: SessionState::default(),
+            save_format: save::Format::default(),
+            last_poll: Instant::now() - POLL_INTERVAL,
+            disconnected: false,
+            status_line: None,
             list_error: None,
         };
         app.refresh_sources();
+        app.poll();
         app
     }
 
-    /// Re-enumerate, keeping the current selection if it still exists.
-    ///
-    /// Applications come and go and their node ids change, so selection is
-    /// matched on the stable key rather than held by reference.
     fn refresh_sources(&mut self) {
-        match syrinx_audio::list_sources() {
+        match syrinx_client::list_sources() {
             Ok(list) => {
                 self.list_error = None;
-                let want = self
-                    .selected
-                    .as_ref()
-                    .map(|s| s.stable_key())
-                    .or_else(|| self.config.source_key.clone());
-                self.selected = want
-                    .and_then(|k| syrinx_audio::resolve(&list, &k))
-                    // Default to a microphone, never to system audio: starting
-                    // to record the speakers because it happened to sort first
-                    // would be a surprising thing to do unasked.
-                    .or_else(|| {
-                        // Prefer a noise-suppressed input where one exists: on
-                        // this setup rnnoise_source is the same microphone with
-                        // a much lower noise floor, so defaulting to the raw
-                        // device would be a worse choice for the same hardware.
-                        list.iter()
-                            .find(|s| {
-                                s.kind == SourceKind::Microphone
-                                    && s.stable_key().contains("rnnoise")
-                            })
-                            .or_else(|| list.iter().find(|s| s.kind == SourceKind::Microphone))
-                            .cloned()
-                    })
-                    .or_else(|| list.first().cloned());
                 self.sources = list;
             }
             Err(e) => self.list_error = Some(format!("{e:#}")),
         }
     }
 
-    fn start(&mut self, ctx: &egui::Context) {
-        let Some(source) = self.selected.clone() else {
-            return;
-        };
-        let ctx = ctx.clone();
-        self.session = Some(syrinx_client::session::start(
-            SessionOptions {
-                url: self.config.url.clone(),
-                token: self.config.token.clone(),
-                source,
-                mode: self.mode,
-            },
-            move || ctx.request_repaint(),
-        ));
+    fn poll(&mut self) {
+        self.last_poll = Instant::now();
+        match ipc::request(&Request::GetState) {
+            Ok(Response::State(s)) => {
+                self.state = s;
+                self.disconnected = false;
+            }
+            Ok(Response::Error { message }) => self.status_line = Some(message),
+            Ok(_) => {}
+            Err(_) => self.disconnected = true,
+        }
+    }
+
+    /// Send a command and refresh immediately, so the UI does not wait a poll
+    /// interval to reflect a button the user just pressed.
+    fn send(&mut self, req: Request) {
+        match ipc::request(&req) {
+            Ok(Response::Error { message }) => self.status_line = Some(message),
+            Ok(Response::Saved { path }) => self.status_line = Some(format!("Saved to {path}")),
+            Ok(_) => self.status_line = None,
+            Err(e) => {
+                self.disconnected = true;
+                self.status_line = Some(format!("{e:#}"));
+            }
+        }
+        self.poll();
+    }
+
+    fn selected_source(&self) -> Option<&Source> {
+        let key = self.state.source_key.as_deref()?;
+        self.sources.iter().find(|s| s.stable_key() == key)
     }
 }
 
 impl eframe::App for App {
-    // eframe 0.36 hands the app a Ui directly rather than a Context.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if let Some(s) = &self.session {
-            self.state = s.state();
-            if self.state.status == Status::Idle {
-                self.session = None;
-            }
-        }
-        let running = self.session.is_some();
         let ctx = ui.ctx().clone();
-
-        self.pump_tray(&ctx, running);
-
-        // Closing the window exits the GUI. It cannot hide instead: winit
-        // documents set_visible as "Unsupported" on Wayland, because Wayland
-        // has no hide-window concept -- a surface either exists or it does not.
-        //
-        // Background operation therefore lives in `syrinx tray`, a headless
-        // process that owns the tray and the session with no window at all. The
-        // GUI is a viewer you open and close; the tray is the thing that keeps
-        // running.
-        if self.quitting {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if self.last_poll.elapsed() >= POLL_INTERVAL {
+            self.poll();
         }
+        let running = self.state.status.is_active();
 
         ui.add_space(4.0);
         self.status_row(ui);
@@ -171,105 +178,36 @@ impl eframe::App for App {
         ui.add_space(4.0);
         self.mode_row(ui, running);
         ui.separator();
-        // Reserve room for the separator, the controls row and any error line.
-        let reserved = 90.0;
+
+        let reserved = 96.0;
         let height = ui.available_height() - reserved;
         self.transcript_box(ui, height);
         ui.separator();
         self.controls(ui, &ctx, running);
 
+        if self.disconnected {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 80, 80),
+                "Lost the daemon. Close and reopen this window to restart it.",
+            );
+        }
         if let Some(e) = &self.state.error {
-            ui.add_space(4.0);
             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), e);
         }
         if let Some(e) = &self.list_error {
             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), e);
         }
-        if let Some(p) = &self.saved_to {
-            ui.colored_label(egui::Color32::from_rgb(120, 190, 120), format!("Saved to {p}"));
+        if let Some(s) = &self.status_line {
+            ui.colored_label(egui::Color32::from_rgb(120, 190, 120), s);
         }
 
-        // Repaint while listening so the status stays live; when idle the app
-        // is fully event-driven and uses no CPU.
-        if running {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        }
+        // Poll steadily rather than only on interaction, since state changes
+        // originate in the daemon and the tray, not just here.
+        ctx.request_repaint_after(POLL_INTERVAL);
     }
 }
 
 impl App {
-    /// Drain tray commands and mirror current state back to the tray.
-    fn pump_tray(&mut self, ctx: &egui::Context, running: bool) {
-        let mut cmds = Vec::new();
-        if let Some(rx) = &mut self.tray_rx {
-            while let Ok(c) = rx.try_recv() {
-                cmds.push(c);
-            }
-        }
-        for c in cmds {
-            match c {
-                TrayCommand::Toggle => {
-                    if running {
-                        self.stop();
-                    } else {
-                        self.start(ctx);
-                    }
-                }
-                TrayCommand::Start if !running => self.start(ctx),
-                TrayCommand::Stop if running => self.stop(),
-                TrayCommand::Start | TrayCommand::Stop => {}
-                TrayCommand::SetMode(m) if !running => self.mode = m,
-                TrayCommand::SetMode(_) => {}
-                TrayCommand::ShowWindow => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-
-                }
-                TrayCommand::Quit => self.quitting = true,
-            }
-        }
-        if let Some(tray) = &self.tray {
-            tray.update(TrayState {
-                status: self.state.status,
-                mode: self.mode,
-                last_fragment: self.state.last_fragment.clone(),
-            });
-        }
-    }
-
-    fn stop(&mut self) {
-        if let Some(s) = &mut self.session {
-            s.stop();
-        }
-    }
-
-    /// Save the transcript, remembering where it went.
-    fn save_transcript(&mut self, pick_path: bool) {
-        let segments = self.state.segments.clone();
-        let text = self.state.transcript.clone();
-        let format = self.save_format;
-        let result = if pick_path {
-            match rfd::FileDialog::new()
-                .set_file_name(save::filename_for(&save::timestamp()))
-                .set_directory(save::default_dir())
-                .save_file()
-            {
-                Some(p) => save::save_rendered(Some(&p), &segments, &text, format),
-                // Cancelled: not an error, and not something to report.
-                None => return,
-            }
-        } else {
-            save::save_rendered(None, &segments, &text, format)
-        };
-        match result {
-            Ok(p) => {
-                self.saved_to = Some(p.display().to_string());
-                self.state.error = None;
-            }
-            Err(e) => self.state.error = Some(format!("{e:#}")),
-        }
-    }
-
     fn status_row(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (colour, dot) = match self.state.status {
@@ -280,7 +218,10 @@ impl App {
                 Status::Idle => (egui::Color32::GRAY, "○"),
             };
             ui.colored_label(colour, egui::RichText::new(dot).size(18.0));
-            ui.colored_label(colour, egui::RichText::new(self.state.status.label()).strong());
+            ui.colored_label(
+                colour,
+                egui::RichText::new(self.state.status.label()).strong(),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let (Some(m), Some(c)) = (&self.state.model, self.state.chunk_ms) {
                     ui.weak(format!("{m} · {c}ms chunks"));
@@ -290,16 +231,14 @@ impl App {
     }
 
     fn source_row(&mut self, ui: &mut egui::Ui, running: bool) {
+        let mut chosen: Option<String> = None;
         ui.horizontal(|ui| {
             ui.label("Source:");
-            // Changing source mid-session would need a reconnect; simpler and
-            // clearer to require stopping first.
             ui.add_enabled_ui(!running, |ui| {
                 let label = self
-                    .selected
-                    .as_ref()
+                    .selected_source()
                     .map(|s| s.display())
-                    .unwrap_or_else(|| "none".into());
+                    .unwrap_or_else(|| "default".into());
                 egui::ComboBox::from_id_salt("source")
                     .selected_text(label)
                     .width(300.0)
@@ -313,9 +252,9 @@ impl App {
                                 ui.weak(s.kind.label());
                                 last = Some(s.kind);
                             }
-                            let chosen = self.selected.as_ref() == Some(s);
-                            if ui.selectable_label(chosen, s.display()).clicked() {
-                                self.selected = Some(s.clone());
+                            let is = self.state.source_key.as_deref() == Some(&s.stable_key());
+                            if ui.selectable_label(is, s.display()).clicked() {
+                                chosen = Some(s.stable_key());
                             }
                         }
                     });
@@ -324,25 +263,33 @@ impl App {
                 }
             });
         });
+        if let Some(key) = chosen {
+            self.send(Request::SetSource { key });
+        }
     }
 
-    /// Fills whatever vertical space is left. A fixed height wastes most of the
-    /// window when tiled, which on Sway is the normal case.
     fn mode_row(&mut self, ui: &mut egui::Ui, running: bool) {
+        let mut chosen: Option<OutputMode> = None;
         ui.horizontal(|ui| {
             ui.label("Mode:");
-            // Changing mode mid-session would need a reconnect, since the wire
-            // mode is fixed at session.start.
+            // Fixed at session start on the wire, so changing it needs a
+            // reconnect.
             ui.add_enabled_ui(!running, |ui| {
                 for m in OutputMode::ALL {
-                    if ui.selectable_label(self.mode == m, m.label()).clicked() {
-                        self.mode = m;
+                    if ui
+                        .selectable_label(self.state.mode == m, m.label())
+                        .clicked()
+                    {
+                        chosen = Some(m);
                     }
                 }
             });
         });
-        if self.mode.types_at_cursor() {
+        if self.state.mode.types_at_cursor() {
             ui.weak("Types into whatever window has focus. Append-only: it never deletes.");
+        }
+        if let Some(mode) = chosen {
+            self.send(Request::SetMode { mode });
         }
     }
 
@@ -353,16 +300,15 @@ impl App {
             .max_height(height.max(80.0))
             .show(ui, |ui| {
                 if self.state.transcript.is_empty() {
-                    if self.mode == OutputMode::Type {
-                        ui.weak(if self.state.last_fragment.is_empty() {
-                            "Typing at the cursor. Nothing spoken yet."
-                        } else {
-                            "Typing at the cursor."
-                        });
+                    if self.state.mode == OutputMode::Type {
+                        ui.weak("Typing at the cursor; no transcript is kept in this mode.");
                         if !self.state.last_fragment.is_empty() {
                             ui.label(
-                                egui::RichText::new(format!("last: {}", self.state.last_fragment))
-                                    .italics(),
+                                egui::RichText::new(format!(
+                                    "last: {}",
+                                    self.state.last_fragment
+                                ))
+                                .italics(),
                             );
                         }
                     } else {
@@ -375,18 +321,14 @@ impl App {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, running: bool) {
+        let mut action: Option<Request> = None;
         ui.horizontal(|ui| {
             if running {
-                if ui.button("Stop").clicked()
-                    && let Some(s) = &mut self.session
-                {
-                    s.stop();
+                if ui.button("Stop").clicked() {
+                    action = Some(Request::Stop);
                 }
-            } else if ui
-                .add_enabled(self.selected.is_some(), egui::Button::new("Start"))
-                .clicked()
-            {
-                self.start(ctx);
+            } else if ui.button("Start").clicked() {
+                action = Some(Request::Start);
             }
 
             let has_text = !self.state.transcript.trim().is_empty();
@@ -398,13 +340,23 @@ impl App {
                 .on_hover_text("Save to the default transcripts folder")
                 .clicked()
             {
-                self.save_transcript(false);
+                action = Some(Request::Save {
+                    format: self.save_format,
+                    path: None,
+                });
             }
             if ui
                 .add_enabled(has_text, egui::Button::new("Save as…"))
                 .clicked()
+                && let Some(p) = rfd::FileDialog::new()
+                    .set_file_name(save::filename_for(&save::timestamp()))
+                    .set_directory(save::default_dir())
+                    .save_file()
             {
-                self.save_transcript(true);
+                action = Some(Request::Save {
+                    format: self.save_format,
+                    path: Some(p.display().to_string()),
+                });
             }
             egui::ComboBox::from_id_salt("save_format")
                 .selected_text(self.save_format.label())
@@ -432,5 +384,9 @@ impl App {
                 ui.weak(short).on_hover_text(&self.config.url);
             });
         });
+        ui.weak("Closing this window leaves dictation running in the tray.");
+        if let Some(a) = action {
+            self.send(a);
+        }
     }
 }

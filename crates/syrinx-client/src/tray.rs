@@ -118,7 +118,21 @@ impl ksni::Tray for SyrinxTray {
         use ksni::menu::{CheckmarkItem, MenuItem, StandardItem, SubMenu};
 
         let listening = self.state.status.is_active();
+        // A disabled header showing status and mode. The tooltip is not always
+        // visible -- waybar shows it only on hover -- so the menu has to state
+        // what mode it is in rather than only letting you choose one.
         let mut items: Vec<MenuItem<Self>> = vec![
+            StandardItem {
+                label: format!(
+                    "{}  ·  {}",
+                    self.state.status.label(),
+                    self.state.mode.label()
+                ),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
             StandardItem {
                 label: if listening { "Stop" } else { "Start" }.into(),
                 icon_name: if listening {
@@ -162,7 +176,9 @@ impl ksni::Tray for SyrinxTray {
 
         items.push(
             SubMenu {
-                label: "Mode".into(),
+                // Named with the current value so the mode is legible without
+                // opening the submenu.
+                label: format!("Mode: {}", self.state.mode.label()),
                 submenu: mode_items,
                 ..Default::default()
             }

@@ -5,6 +5,8 @@
 //! selection, status -- had to be built twice and could drift between them.
 
 pub mod config;
+pub mod daemon;
+pub mod ipc;
 pub mod inject;
 pub mod mode;
 pub mod save;

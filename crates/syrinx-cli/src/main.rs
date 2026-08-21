@@ -96,9 +96,9 @@ enum Cmd {
     },
     /// Report whether a session is active.
     Status,
-    /// Run headless in the system tray: no window, click the icon to
-    /// start and stop. This is what keeps running in the background.
-    Tray {
+    /// Run the background daemon: tray icon, no window. The GUI attaches to
+    /// this, so closing the GUI leaves dictation running.
+    Daemon {
         #[arg(long, value_enum)]
         mode: Option<ModeArg>,
         #[arg(long)]
@@ -126,12 +126,12 @@ fn main() -> Result<()> {
     let pid_path = state::default_pid_path();
 
     match cli.command {
-        Cmd::Tray {
+        Cmd::Daemon {
             mode,
             source,
             save_default,
             format,
-        } => run_tray(cli.config, mode, source, save_default, format.into()),
+        } => run_daemon(cli.config, mode, source, save_default, format.into()),
 
         Cmd::Sources => {
             let mut last = None;
@@ -290,121 +290,41 @@ fn wait_for_stop_signal() {
     });
 }
 
-/// Headless tray loop.
+/// Run the background daemon: session, tray and IPC socket.
 ///
-/// The GUI cannot serve this purpose: winit documents `set_visible` as
-/// unsupported on Wayland, so a window cannot hide itself and keep running.
-/// Background operation needs a process that never had a window to begin with.
-fn run_tray(
+/// The GUI cannot serve this purpose. winit documents `set_visible` as
+/// unsupported on Wayland, so a window cannot hide itself and keep running;
+/// something that never had a window has to own the session.
+fn run_daemon(
     config: Option<PathBuf>,
     mode: Option<ModeArg>,
     source: Option<String>,
-    save_default: bool,
+    save_each: bool,
     format: save::Format,
 ) -> Result<()> {
-    use syrinx_client::tray::{TrayCommand, TrayState};
-
     let cfg = Config::load(config)?;
-    let mut mode = mode.map(OutputMode::from).unwrap_or(cfg.mode);
-    let source_pref = source.or_else(|| cfg.source_key.clone());
+    let mode = mode.map(OutputMode::from).unwrap_or(cfg.mode);
+    let source_key = source.or_else(|| cfg.source_key.clone());
 
-    let Some((tray, mut rx)) = syrinx_client::tray::start() else {
-        anyhow::bail!(
-            "no system tray available. A StatusNotifierItem host must be running \
-             (waybar with its tray module, or a desktop panel)."
-        );
-    };
-    info!("tray running; click the icon to start and stop");
-
-    let mut session: Option<syrinx_client::SessionHandle> = None;
-    let mut quit = false;
-
-    // Signals stop the whole tray, not just a session, so ^C behaves.
-    let (sig_tx, sig_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    // Signals stop the daemon, so ^C and `systemctl stop` behave.
+    std::thread::spawn(|| {
         wait_for_stop_signal();
-        let _ = sig_tx.send(());
+        // Ask politely over IPC so the socket is cleaned up on the way out.
+        let _ = syrinx_client::ipc::request(&syrinx_client::ipc::Request::Quit);
     });
 
-    while !quit {
-        while let Ok(cmd) = rx.try_recv() {
-            match cmd {
-                TrayCommand::Toggle | TrayCommand::Start | TrayCommand::Stop => {
-                    let running = session.as_ref().is_some_and(|s| s.is_running());
-                    let want_stop = matches!(cmd, TrayCommand::Stop)
-                        || (running && matches!(cmd, TrayCommand::Toggle));
-                    if want_stop {
-                        if let Some(s) = &mut session {
-                            s.stop();
-                        }
-                    } else if !running {
-                        let sources = syrinx_client::list_sources()?;
-                        let src =
-                            syrinx_client::choose_source(&sources, source_pref.as_deref())?;
-                        session = Some(syrinx_client::session::start(
-                            SessionOptions {
-                                url: cfg.url.clone(),
-                                token: cfg.token.clone(),
-                                source: src,
-                                mode,
-                            },
-                            || {},
-                        ));
-                    }
-                }
-                TrayCommand::SetMode(m) => {
-                    if !session.as_ref().is_some_and(|s| s.is_running()) {
-                        mode = m;
-                    }
-                }
-                // Nothing to show: this process has no window by design.
-                TrayCommand::ShowWindow => {
-                    info!("no window in tray mode; run `syrinx-gui` for one");
-                }
-                TrayCommand::Quit => quit = true,
-            }
-        }
-
-        if sig_rx.try_recv().is_ok() {
-            quit = true;
-        }
-
-        // A finished session is reaped here, which is also where its transcript
-        // gets saved -- the tray has no other moment to notice it ended.
-        if let Some(s) = &session
-            && !s.is_running()
-        {
-            let st = s.state();
-            if save_default && mode.keeps_transcript() {
-                match save::save_rendered(None, &st.segments, &st.transcript, format) {
-                    Ok(p) => info!("saved to {}", p.display()),
-                    // An empty transcript is the normal "stopped without
-                    // speaking" case, not an error worth shouting about.
-                    Err(e) => info!("not saved: {e}"),
-                }
-            }
-            if let Some(e) = st.error {
-                tracing::error!("session ended with an error: {e}");
-            }
-            session = None;
-        }
-
-        let st = session
-            .as_ref()
-            .map(|s| s.state())
-            .unwrap_or_default();
-        tray.update(TrayState {
-            status: st.status,
-            mode,
-            last_fragment: st.last_fragment.clone(),
-        });
-
-        std::thread::sleep(std::time::Duration::from_millis(120));
-    }
-
-    if let Some(s) = &mut session {
-        s.stop();
-    }
-    info!("tray stopped");
-    Ok(())
+    syrinx_client::daemon::run(syrinx_client::daemon::DaemonOptions {
+        config: cfg,
+        mode,
+        source_key,
+        save_each,
+        format,
+        // Sits beside this binary, so a viewer opens from the same build.
+        gui_command: std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("syrinx-gui")))
+            .filter(|p| p.exists())
+            .map(|p| p.display().to_string())
+            .or_else(|| Some("syrinx-gui".into())),
+    })
 }
