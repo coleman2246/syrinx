@@ -386,3 +386,17 @@ Paste copies to the
 clipboard and sends Ctrl+V, restoring the previous clipboard afterwards — the
 most broadly compatible of the three, though terminals need Ctrl+Shift+V so it
 is a poor fit there.
+
+## Licence
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+Every dependency is permissive — MIT, Apache-2.0, BSD, ISC, Zlib, Unicode-3.0
+or Unlicense — so all of them are GPL-3 compatible. Checked rather than
+assumed: nothing in the tree needed a second look.
+
+**The model is licensed separately and is not covered by this.** It is NVIDIA's,
+under the [NVIDIA Open Model License
+Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/),
+which permits commercial use. Weights are neither in this repository nor in the
+container image, so nothing here redistributes them.

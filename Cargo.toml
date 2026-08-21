@@ -4,8 +4,12 @@ members = ["crates/syrinx-audio", "crates/syrinx-proto", "crates/syrinx-server",
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
-license = "MIT"
+# ort 2.0.0-rc.13 requires 1.88, so 1.85 was never true -- it is what the
+# container builder pins, and a lower number here only misleads.
+rust-version = "1.88"
+# "or later" is the FSF's own recommendation and what their standard header
+# says; GPL-3.0-only would pin this to a version that can never be updated.
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
