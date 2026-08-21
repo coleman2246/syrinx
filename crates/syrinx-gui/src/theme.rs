@@ -31,7 +31,6 @@ pub mod palette {
     pub const SUNKEN: Color32 = Color32::from_rgb(0x14, 0x14, 0x14);
 
     pub const BORDER: Color32 = Color32::from_rgb(0x40, 0x40, 0x40);
-    pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x56, 0x56, 0x56);
 
     pub const TEXT: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
     pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xC7, 0xC7, 0xC7);
