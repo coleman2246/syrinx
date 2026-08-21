@@ -13,6 +13,6 @@ mod audio;
 mod message;
 mod mode;
 
-pub use audio::{SAMPLE_RATE, downmix_to_mono, pcm_s16le_to_f32};
+pub use audio::{SAMPLE_RATE, downmix_to_mono, pcm_s16le_to_f32, resample_to_16k};
 pub use message::{ClientMessage, ServerMessage};
 pub use mode::{Encoding, ErrorCode, Mode};

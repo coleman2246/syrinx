@@ -45,8 +45,13 @@ fn build_loader(
             #[cfg(not(feature = "cuda"))]
             Provider::Cpu | Provider::Cuda => {
                 bail!(
-                    "provider {provider:?} requires the `cuda` cargo feature; \
-                     this binary was built without it"
+                    "provider {provider:?} requires the `cuda` cargo feature, and this \
+                     binary was built without it. Cargo writes both variants to the same \
+                     path, so a plain `cargo build` or `cargo test` replaces a GPU-capable \
+                     binary with one that is not. Rebuild with:\n  \
+                     ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so cargo build -p parakeet-server --features cuda\n  \
+                     (or just `make serve`, which does this for you). \
+                     To run without a GPU instead, set provider = \"cpu\" in the config."
                 )
             }
         }
