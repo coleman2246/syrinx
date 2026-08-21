@@ -13,7 +13,7 @@ use std::process::Command;
 use tracing::debug;
 
 /// How text is delivered to the focused window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Method {
     /// `wtype`, the Wayland virtual-keyboard protocol.
@@ -24,7 +24,6 @@ pub enum Method {
     /// focus when input devices appear, so the text field loses focus and the
     /// keystrokes are interpreted as global shortcuts. In Teams that shows up
     /// as the chat list jumping about instead of a message being typed.
-    #[default]
     Wtype,
     /// `ydotool`, writing to `/dev/uinput`.
     ///
@@ -40,6 +39,27 @@ pub enum Method {
     /// clipboard, restoring it afterwards, and terminals need Ctrl+Shift+V so
     /// they are not a good fit.
     Paste,
+    /// The Win32 `SendInput` API.
+    ///
+    /// The Windows equivalent, and the only one there. Text is sent as
+    /// UTF-16 key events with `KEYEVENTF_UNICODE`, which bypasses the
+    /// keyboard layout entirely -- the character arrives as written whatever
+    /// the user's layout is.
+    SendInput,
+}
+
+/// Platform default.
+///
+/// Every variant parses on every platform so a config file stays portable,
+/// but only one is right for the machine it runs on.
+impl Default for Method {
+    fn default() -> Self {
+        if cfg!(windows) {
+            Method::SendInput
+        } else {
+            Method::Wtype
+        }
+    }
 }
 
 impl Method {
@@ -48,19 +68,60 @@ impl Method {
             Method::Wtype => "wtype (Wayland)",
             Method::Ydotool => "ydotool (uinput)",
             Method::Paste => "clipboard paste",
+            Method::SendInput => "SendInput (Win32)",
         }
     }
 
-    /// The command this method needs on PATH.
-    fn binary(self) -> &'static str {
+    /// The value as written in the config file.
+    ///
+    /// Kept in step with serde by a test rather than by hope: these strings
+    /// go into a generated config, and one that does not parse is worse than
+    /// no generated config at all.
+    pub fn name(self) -> &'static str {
         match self {
             Method::Wtype => "wtype",
             Method::Ydotool => "ydotool",
-            Method::Paste => "wl-copy",
+            Method::Paste => "paste",
+            Method::SendInput => "sendinput",
         }
     }
 
-    pub const ALL: [Method; 3] = [Method::Wtype, Method::Ydotool, Method::Paste];
+    /// One line for the generated config, explaining when to pick this.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Method::Wtype => "Wayland virtual keyboard. Fails in Electron apps (Teams, Discord, VS Code)",
+            Method::Ydotool => "kernel uinput device. Works everywhere, needs ydotoold running",
+            Method::Paste => "clipboard then Ctrl+V. Broad, but wrong for terminals (they want Ctrl+Shift+V)",
+            Method::SendInput => "Win32 SendInput. Layout-independent Unicode key events",
+        }
+    }
+
+    /// Whether this method can work on the platform now running.
+    pub fn supported_here(self) -> bool {
+        match self {
+            Method::Wtype | Method::Ydotool | Method::Paste => cfg!(target_os = "linux"),
+            Method::SendInput => cfg!(windows),
+        }
+    }
+
+    /// The command this method needs on PATH, if it needs one.
+    ///
+    /// `SendInput` is an API call rather than a process, so it has none.
+    fn binary(self) -> Option<&'static str> {
+        match self {
+            Method::Wtype => Some("wtype"),
+            Method::Ydotool => Some("ydotool"),
+            Method::Paste => Some("wl-copy"),
+            Method::SendInput => None,
+        }
+    }
+
+    pub const ALL: [Method; 4] = [
+        Method::Wtype,
+        Method::Ydotool,
+        Method::Paste,
+        Method::SendInput,
+    ];
 }
 
 /// Type `text` at the cursor.
@@ -82,7 +143,19 @@ pub fn type_text(text: &str, method: Method) -> Result<()> {
             "ydotool",
         ),
         Method::Paste => paste(text),
+        Method::SendInput => send_input(text),
     }
+}
+
+/// Type via the Win32 `SendInput` API.
+#[cfg(windows)]
+fn send_input(text: &str) -> Result<()> {
+    windows_input::type_text(text)
+}
+
+#[cfg(not(windows))]
+fn send_input(_text: &str) -> Result<()> {
+    bail!("the `sendinput` method is Windows-only")
 }
 
 /// Copy to the clipboard, paste, and put the clipboard back.
@@ -149,13 +222,27 @@ fn run(cmd: &mut Command, what: &str) -> Result<()> {
 /// Surfaces a missing tool up front rather than after the user has spoken a
 /// sentence into a session that was never going to type anything.
 pub fn preflight(method: Method) -> Result<()> {
-    let bin = method.binary();
-    match Command::new(bin).arg("--help").output() {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("{bin} not found on PATH; it is required for {}", method.label())
+    if !method.supported_here() {
+        let usable: Vec<&str> = Method::ALL
+            .iter()
+            .filter(|m| m.supported_here())
+            .map(|m| m.name())
+            .collect();
+        bail!(
+            "`inject = \"{}\"` does not work on this platform. Use one of: {}",
+            method.name(),
+            usable.join(", ")
+        );
+    }
+
+    if let Some(bin) = method.binary() {
+        match Command::new(bin).arg("--help").output() {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("{bin} not found on PATH; it is required for {}", method.label())
+            }
+            Err(e) => return Err(e).with_context(|| format!("checking for {bin}")),
         }
-        Err(e) => return Err(e).with_context(|| format!("checking for {bin}")),
     }
 
     // ydotool needs its daemon; without it every call fails at the point where
@@ -190,19 +277,50 @@ mod tests {
     }
 
     #[test]
-    fn wtype_is_the_default() {
+    #[cfg(target_os = "linux")]
+    fn wtype_is_the_default_on_linux() {
         // Changing the default would alter behaviour for everyone whose setup
         // already works.
         assert_eq!(Method::default(), Method::Wtype);
     }
 
     #[test]
+    #[cfg(windows)]
+    fn sendinput_is_the_default_on_windows() {
+        assert_eq!(Method::default(), Method::SendInput);
+    }
+
+    #[test]
     fn every_method_names_a_distinct_binary() {
-        let mut b: Vec<&str> = Method::ALL.iter().map(|m| m.binary()).collect();
+        let mut b: Vec<&str> = Method::ALL.iter().filter_map(|m| m.binary()).collect();
         b.sort_unstable();
         let n = b.len();
         b.dedup();
         assert_eq!(b.len(), n);
+    }
+
+    #[test]
+    fn config_names_match_what_serde_accepts() {
+        // These strings are written into a generated config file. If one did
+        // not round-trip, syrinx would emit a config it cannot itself read.
+        for m in Method::ALL {
+            let quoted = format!("\"{}\"", m.name());
+            assert_eq!(
+                serde_json::from_str::<Method>(&quoted).unwrap(),
+                m,
+                "name() disagrees with serde for {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exactly_one_method_is_the_platform_default() {
+        assert!(Method::default().supported_here());
+    }
+
+    #[test]
+    fn every_platform_has_at_least_one_usable_method() {
+        assert!(Method::ALL.iter().any(|m| m.supported_here()));
     }
 
     #[test]

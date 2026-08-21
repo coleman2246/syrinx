@@ -25,6 +25,24 @@ impl OutputMode {
         }
     }
 
+    /// The value as written in the config file. See `Method::name`.
+    pub fn name(self) -> &'static str {
+        match self {
+            OutputMode::Transcribe => "transcribe",
+            OutputMode::Type => "type",
+            OutputMode::Both => "both",
+        }
+    }
+
+    /// One line for the generated config.
+    pub fn summary(self) -> &'static str {
+        match self {
+            OutputMode::Transcribe => "keep a transcript to read and save. Nothing is typed",
+            OutputMode::Type => "type at the cursor as you speak. Nothing is kept",
+            OutputMode::Both => "type at the cursor and keep a transcript",
+        }
+    }
+
     pub fn types_at_cursor(self) -> bool {
         matches!(self, OutputMode::Type | OutputMode::Both)
     }
@@ -58,6 +76,16 @@ impl OutputMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_names_match_what_serde_accepts() {
+        // Written into the generated config; a mismatch would emit a file
+        // syrinx cannot read back.
+        for m in OutputMode::ALL {
+            let quoted = format!("\"{}\"", m.name());
+            assert_eq!(serde_json::from_str::<OutputMode>(&quoted).unwrap(), m);
+        }
+    }
 
     #[test]
     fn any_mode_that_types_must_use_the_append_only_wire_mode() {
