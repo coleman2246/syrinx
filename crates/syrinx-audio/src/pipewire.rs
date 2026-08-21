@@ -35,6 +35,7 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
             continue;
         };
 
+        let mut sink_desc: Option<String> = None;
         let (kind, name) = match class {
             // A real capture device, or the monitor of a sink. Monitors are
             // distinguished by node.name rather than media.class, since
@@ -69,6 +70,7 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
                 // Named for what it captures, not how. "Monitor of X" is the
                 // PipeWire mechanism; "everything playing through X" is what
                 // the user is choosing.
+                sink_desc = Some(desc.to_string());
                 (SourceKind::Monitor, format!("Everything playing on {desc}"))
             }
             // An application playing audio. Captured by linking its output
@@ -99,6 +101,7 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
             name,
             kind,
             detail,
+            sink_description: sink_desc,
             // Applications have no stable identity; devices keep node.name.
             stable_name: match kind {
                 SourceKind::Application => None,
@@ -107,10 +110,38 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
         });
     }
 
+    disambiguate_card_inputs(&mut out);
+
     // Group by kind for a stable, readable picker, then by name so the order
     // does not jump around as PipeWire renumbers nodes.
     out.sort_by_key(|s| (s.kind, s.name.to_lowercase()));
     Ok(out)
+}
+
+/// Mark microphones that share a name with an output.
+///
+/// A motherboard's line-in jack and its speakers are separate nodes on one
+/// card, and PipeWire gives both the same `node.description`. The capture side
+/// then appears under Microphone bearing the name of the sound card, which
+/// reads as the *output* having been filed under the wrong heading. It has not:
+/// it is the capture side of the same device. Saying so is clearer than leaving
+/// two identical names to be told apart by which list they are in.
+///
+/// "(input)" rather than anything more specific, because the collision happens
+/// for a motherboard line-in jack and for a USB microphone with a headphone
+/// output alike, and only "input" is true of both.
+fn disambiguate_card_inputs(sources: &mut [Source]) {
+    let sink_descriptions: Vec<String> = sources
+        .iter()
+        .filter(|s| s.kind == SourceKind::Monitor)
+        .filter_map(|s| s.sink_description.clone())
+        .collect();
+
+    for s in sources.iter_mut() {
+        if s.kind == SourceKind::Microphone && sink_descriptions.contains(&s.name) {
+            s.name = format!("{} (input)", s.name);
+        }
+    }
 }
 
 /// Enumerate capturable sources from the running PipeWire daemon.

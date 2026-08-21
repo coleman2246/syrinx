@@ -47,6 +47,9 @@ pub struct Source {
     /// Backend-stable identifier, when one exists. PipeWire `node.name` for
     /// devices; `None` for application streams, which have no stable identity.
     pub stable_name: Option<String>,
+    /// For monitors, the underlying output's description. Used to spot a
+    /// capture device sharing a name with an output on the same card.
+    pub sink_description: Option<String>,
 }
 
 impl Source {
@@ -95,6 +98,7 @@ mod tests {
             kind: SourceKind::Application,
             detail: detail.map(str::to_string),
             stable_name: None,
+            sink_description: None,
         }
     }
 
@@ -106,6 +110,7 @@ mod tests {
             kind: SourceKind::Microphone,
             detail: None,
             stable_name: Some("rnnoise_source".into()),
+            sink_description: None,
         };
         assert_eq!(s.stable_key(), "rnnoise_source");
     }

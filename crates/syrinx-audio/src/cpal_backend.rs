@@ -37,20 +37,23 @@ pub fn list_sources() -> Result<Vec<Source>> {
             detail: None,
             // cpal has no id beyond the name, so the name is the stable key.
             stable_name: None,
+            sink_description: None,
         });
     }
 
     for d in host.output_devices().context("enumerating output devices")? {
         let Some(name) = device_name(&d) else { continue };
+        let name_for_sink = name.clone();
         out.push(Source {
             target: SourceTarget::CpalDevice {
                 name: name.clone(),
                 loopback: true,
             },
-            name: format!("Monitor of {name}"),
+            name: format!("Everything playing on {name}"),
             kind: SourceKind::Monitor,
             detail: None,
             stable_name: None,
+            sink_description: Some(name_for_sink),
         });
     }
 
