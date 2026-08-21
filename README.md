@@ -7,6 +7,43 @@ Unlike whisper (which must see a complete utterance before emitting anything),
 a transducer emits tokens as audio arrives. That gives word-level latency without
 Vosk's accuracy penalty: ~1.93% WER on librispeech test-clean, with punctuation.
 
+## The model
+
+Speech recognition is [NVIDIA Nemotron Speech Streaming EN
+0.6B](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b) — a
+600M-parameter cache-aware FastConformer-RNNT, English, with punctuation and
+capitalisation. Being a transducer is why this streams at all: it emits tokens
+as audio arrives rather than needing a complete segment.
+
+It runs through [`parakeet-rs`](https://github.com/altunenes/parakeet-rs), and
+the ONNX export syrinx uses is the one that crate publishes:
+
+```bash
+MODEL=https://huggingface.co/altunenes/parakeet-rs/resolve/main/nemotron-speech-streaming-en-0.6b
+mkdir -p ~/models/nemotron && cd ~/models/nemotron
+for f in encoder.onnx encoder.onnx.data decoder_joint.onnx tokenizer.model; do
+  curl -fL# -O "$MODEL/$f"
+done
+```
+
+Or, with the HuggingFace CLI if you have it:
+
+```bash
+hf download altunenes/parakeet-rs \
+  --include "nemotron-speech-streaming-en-0.6b/*" --local-dir ~/models
+```
+
+That gives four files totalling 2.4 GB — `encoder.onnx`, `encoder.onnx.data`,
+`decoder_joint.onnx`, `tokenizer.model` — and the directory containing them is
+what `model_dir` points at. They are not in this repository and not in the
+container image: they are large, and they change on a different schedule from
+the code.
+
+**Licence:** the model is NVIDIA's, under the [NVIDIA Open Model License
+Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/),
+which permits commercial use. That is separate from the licence on this code —
+read it before shipping anything built on top.
+
 ## Layout
 
 | Crate | Purpose |

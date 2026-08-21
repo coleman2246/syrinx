@@ -72,6 +72,12 @@ roughly 150–400 MB, more for 4K HDR tonemapping. A footprint that is harmless 
 03:00 can break someone's playback at 20:00. Both neighbours fail in ways a
 person immediately notices — cameras stop recording, a film stops playing.
 
+Model weights come from
+[`altunenes/parakeet-rs`](https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-speech-streaming-en-0.6b),
+the ONNX export of
+[`nvidia/nemotron-speech-streaming-en-0.6b`](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b)
+(NVIDIA Open Model License, commercial use permitted).
+
 Measured model sizes (from the HuggingFace repo, not estimated):
 
 | Model | Size | Streams | Punctuation |

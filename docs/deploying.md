@@ -16,17 +16,28 @@ rather than an image someone built by hand.
 
 ## 2. Models
 
-The 2.4 GB model directory is not in the image and not in the repository. Copy
-it to the host once:
+The 2.4 GB model directory is not in the image and not in the repository.
+Either download it on the host:
 
 ```bash
-rsync -a --info=progress2 \
-  ~/.local/share/parakeet-dictation/nemotron/ \
-  gpu-host:/srv/syrinx/models/
+MODEL=https://huggingface.co/altunenes/parakeet-rs/resolve/main/nemotron-speech-streaming-en-0.6b
+sudo mkdir -p /srv/syrinx/models && cd /srv/syrinx/models
+for f in encoder.onnx encoder.onnx.data decoder_joint.onnx tokenizer.model; do
+  sudo curl -fL# -O "$MODEL/$f"
+done
+```
+
+`curl` rather than the HuggingFace CLI so a headless server needs no Python
+toolchain for this.
+
+or copy one you already have:
+
+```bash
+rsync -a --info=progress2 ~/models/nemotron-.../ gpu-host:/srv/syrinx/models/
 ```
 
 Four files: `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`,
-`tokenizer.model`.
+`tokenizer.model`. See the README for what the model is and its licence.
 
 ## 3. Configure
 
