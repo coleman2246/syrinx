@@ -18,5 +18,14 @@ uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 toml = "0.9"
 
+# The real GPU backend is optional so `cargo test` stays fast and CUDA-free.
+# CI runs the default feature set; the GPU path is built with --features cuda.
+parakeet-rs = { version = "0.3", features = ["cuda", "load-dynamic"], optional = true }
+
+[features]
+default = []
+cuda = ["dep:parakeet-rs"]
+
 [dev-dependencies]
 tokio-tungstenite = "0.30"
+hound = "3.5"

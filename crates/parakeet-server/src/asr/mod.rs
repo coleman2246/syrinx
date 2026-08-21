@@ -8,6 +8,10 @@
 pub mod lifecycle;
 pub mod mock;
 
+/// The real GPU backend. Optional so the default build needs no CUDA.
+#[cfg(feature = "cuda")]
+pub mod parakeet;
+
 use anyhow::Result;
 
 /// One independent decoding stream, holding per-session decoder state.
