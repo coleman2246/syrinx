@@ -65,3 +65,33 @@ A keybind for dictation:
 ```
 bindsym $mod+n exec syrinx toggle --mode type
 ```
+
+## Typing into Electron apps (Teams, Discord, VS Code)
+
+The default typing method is `wtype`, which uses the Wayland virtual-keyboard
+protocol. It is correct for most native Wayland applications but **fails in
+Electron and Chromium apps**: each call creates and destroys a virtual keyboard,
+Chromium re-evaluates focus whenever input devices appear, and the text field
+loses focus — so the keystrokes are interpreted as global shortcuts instead. In
+Teams that looks like the chat list jumping about rather than a message being
+typed.
+
+`ydotool` writes to `/dev/uinput` instead. The kernel presents one persistent
+virtual device that is indistinguishable from a real keyboard, so applications
+that mishandle the virtual-keyboard protocol still receive it normally.
+
+```bash
+sudo pacman -S ydotool
+systemctl --user enable --now ydotool     # the daemon; ydotool cannot type without it
+```
+
+Then in `~/.config/syrinx/config.toml`:
+
+```toml
+inject = "ydotool"
+```
+
+Options are `wtype` (default), `ydotool`, and `paste`. Paste copies to the
+clipboard and sends Ctrl+V, restoring the previous clipboard afterwards — the
+most broadly compatible of the three, though terminals need Ctrl+Shift+V so it
+is a poor fit there.

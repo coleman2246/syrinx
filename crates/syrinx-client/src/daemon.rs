@@ -434,6 +434,7 @@ impl DaemonRuntime {
         self.start_overlay();
 
         let (url, token) = (self.opts.config.url.clone(), self.opts.config.token.clone());
+        let inject = self.opts.config.inject;
         match self.opts.source_mode {
             crate::mode::SourceMode::Combined => {
                 self.sessions.push(crate::session::start(
@@ -444,6 +445,7 @@ impl DaemonRuntime {
                         mode: self.opts.mode,
                         // Attribution is meaningless once mixed.
                         label: None,
+                        inject,
                     },
                     || {},
                 ));
@@ -466,6 +468,7 @@ impl DaemonRuntime {
                             sources: vec![source],
                             mode,
                             label,
+                            inject,
                         },
                         || {},
                     ));

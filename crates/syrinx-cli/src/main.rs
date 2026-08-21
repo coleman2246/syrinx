@@ -293,6 +293,7 @@ fn run(
                 sources: chosen,
                 mode,
                 label: None,
+                inject: cfg.inject,
             },
             // The CLI has nothing to repaint, so state changes need no callback.
             || {},
@@ -309,6 +310,7 @@ fn run(
                         sources: vec![s],
                         mode: if i == 0 { mode } else { OutputMode::Transcribe },
                         label,
+                        inject: cfg.inject,
                     },
                     || {},
                 )

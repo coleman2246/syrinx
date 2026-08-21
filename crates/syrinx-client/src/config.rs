@@ -19,6 +19,10 @@ pub struct Config {
     pub source_key: Option<String>,
     #[serde(default)]
     pub mode: OutputMode,
+    /// How text is typed at the cursor. Electron applications such as Teams
+    /// need `ydotool`; see the Method docs.
+    #[serde(default)]
+    pub inject: crate::inject::Method,
     /// waybar realtime signal for the status indicator.
     #[serde(default = "default_waybar_signal")]
     pub waybar_signal: u8,
@@ -102,6 +106,13 @@ mod tests {
     }
 
     #[test]
+    fn the_injection_method_parses_from_config() {
+        let c: Config =
+            toml::from_str("token = \"a\"\ninject = \"ydotool\"").unwrap();
+        assert_eq!(c.inject, crate::inject::Method::Ydotool);
+    }
+
+    #[test]
     fn mode_parses_from_config() {
         let c: Config = toml::from_str("token = \"a\"\nmode = \"type\"").unwrap();
         assert_eq!(c.mode, OutputMode::Type);
@@ -116,6 +127,7 @@ mod tests {
             token: "t".into(),
             source_key: Some("rnnoise_source".into()),
             mode: OutputMode::Both,
+            inject: Default::default(),
             waybar_signal: 3,
         };
         let back: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();

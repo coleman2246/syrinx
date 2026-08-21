@@ -86,6 +86,8 @@ pub struct SessionOptions {
     pub mode: OutputMode,
     /// Label applied to this session's segments, for separate mode.
     pub label: Option<String>,
+    /// How text is typed at the cursor.
+    pub inject: crate::inject::Method,
 }
 
 /// Handle to a running session. Dropping it stops the session.
@@ -177,7 +179,7 @@ async fn run(
 
     if opts.mode.types_at_cursor() {
         // Fail before the microphone opens rather than after the user speaks.
-        inject::preflight()?;
+        inject::preflight(opts.inject)?;
     }
 
     let mut req = opts
@@ -262,6 +264,7 @@ async fn run(
     let n = notify.clone();
     let mode = opts.mode;
     let label = opts.label.clone();
+    let inject_method = opts.inject;
     let reader = tokio::spawn(async move {
         while let Some(Ok(msg)) = rx.next().await {
             let Ws::Text(t) = msg else { continue };
@@ -269,7 +272,7 @@ async fn run(
                 Ok(ServerMessage::TranscriptCommit { text, .. })
                 | Ok(ServerMessage::TranscriptProvisional { text, .. }) => {
                     if mode.types_at_cursor()
-                        && let Err(e) = inject::type_text(&text)
+                        && let Err(e) = inject::type_text(&text, inject_method)
                     {
                         error!("failed to type {text:?}: {e:#}");
                     }
