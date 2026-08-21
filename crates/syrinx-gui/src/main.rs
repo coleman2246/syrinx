@@ -89,23 +89,122 @@ fn ensure_daemon() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("syrinx"));
 
     tracing::info!("starting the syrinx daemon");
-    std::process::Command::new(&cmd)
+
+    // The daemon's output goes to a file rather than to /dev/null. It used to
+    // be discarded, so a daemon that refused to start -- a bad config, a port
+    // already taken, another daemon already running -- produced only "did not
+    // start listening within 5s", with the actual reason thrown away.
+    let log_path = daemon_log_path();
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("creating the daemon log at {}", log_path.display()))?;
+    let mut child = std::process::Command::new(&cmd)
         .arg("daemon")
-        // Detached: the daemon must outlive this window.
+        // Detached from this window's stdin: the daemon must outlive it.
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(
+            log.try_clone()
+                .context("duplicating the daemon log handle")?,
+        )
+        .stderr(log)
         .spawn()
         .with_context(|| format!("starting the daemon via {}", cmd.display()))?;
 
     // Binding the socket takes a moment; poll rather than guess at a sleep.
     for _ in 0..50 {
         if ipc::daemon_running() {
+            // Reaped in the background. Without this the daemon becomes a
+            // zombie the moment it exits and stays one for as long as this
+            // window is open.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             return Ok(());
+        }
+        // Died before it ever listened: say why rather than time out.
+        if let Ok(Some(status)) = child.try_wait() {
+            anyhow::bail!(
+                "the daemon exited immediately ({status}).\n{}",
+                tail(&log_path)
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    anyhow::bail!("the daemon did not start listening within 5s")
+    anyhow::bail!(
+        "the daemon did not start listening within 5s.\n{}",
+        tail(&log_path)
+    )
+}
+
+/// Where the daemon's output is kept, beside its PID file so it is per-user.
+fn daemon_log_path() -> PathBuf {
+    syrinx_client::state::default_pid_path().with_extension("log")
+}
+
+/// The last few lines of the daemon log, for an error message.
+fn tail(path: &std::path::Path) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return format!("(no output; see {})", path.display());
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return format!("(no output; see {})", path.display());
+    }
+    let start = lines.len().saturating_sub(5);
+    lines[start..].join("\n")
+}
+
+#[cfg(test)]
+mod ensure_daemon_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "syrinx-gui-test-{}-{tag}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn a_missing_log_still_points_somewhere_useful() {
+        // The daemon can fail before it writes anything. An empty message
+        // would leave the user with nothing at all to go on.
+        let p = scratch("missing");
+        let _ = std::fs::remove_file(&p);
+        let out = tail(&p);
+        assert!(out.contains(&p.display().to_string()), "got: {out}");
+    }
+
+    #[test]
+    fn an_empty_log_is_treated_as_no_output() {
+        let p = scratch("empty");
+        std::fs::write(&p, "   \n\n").unwrap();
+        assert!(tail(&p).contains("no output"), "got: {}", tail(&p));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn only_the_last_few_lines_are_shown() {
+        // A daemon that logged for an hour before dying should not paste an
+        // hour of logs into an error dialog.
+        let p = scratch("long");
+        let body: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+        let out = tail(&p);
+        assert!(out.contains("line 99"), "the end is what matters: {out}");
+        assert!(!out.contains("line 50"), "too much context: {out}");
+        assert_eq!(out.lines().count(), 5);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_daemon_log_sits_beside_the_pid_file() {
+        // Per-user, so two accounts on one machine cannot overwrite each
+        // other's diagnostics.
+        let log = daemon_log_path();
+        let pid = syrinx_client::state::default_pid_path();
+        assert_eq!(log.parent(), pid.parent());
+        assert_ne!(log, pid);
+    }
 }
 
 struct App {
