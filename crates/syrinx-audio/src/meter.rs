@@ -27,8 +27,34 @@ const BAND_EDGES: [f32; BANDS + 1] = [
     60.0, 120.0, 220.0, 380.0, 620.0, 1000.0, 1600.0, 2600.0, 4200.0, 6000.0, 8000.0,
 ];
 
-/// Root-mean-square amplitude, 0.0 to 1.0.
+/// Quietest level the display shows. Below this reads as silence.
+///
+/// Speech at a sensible recording level sits around -30 to -12 dBFS, and room
+/// tone well below -60. A linear scale renders all of that as a stub near zero,
+/// because amplitude is linear and hearing is not: -20 dBFS is a tenth of full
+/// scale by amplitude but sounds like a normal speaking voice.
+const FLOOR_DB: f32 = -60.0;
+
+/// Convert a normalised magnitude to a display level, 0.0 to 1.0.
+///
+/// Logarithmic, like every audio meter, so ordinary speech lands in the middle
+/// of the scale rather than against the bottom.
+fn to_display(normalised: f32) -> f32 {
+    if normalised <= 1e-9 {
+        return 0.0;
+    }
+    let db = 20.0 * normalised.log10();
+    ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
+}
+
+/// Root-mean-square level, 0.0 to 1.0, on the same logarithmic scale as the
+/// bands so the two agree.
 pub fn rms(samples: &[f32]) -> f32 {
+    to_display(rms_linear(samples))
+}
+
+/// Raw RMS amplitude, for callers that want the underlying figure.
+pub fn rms_linear(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
@@ -67,16 +93,18 @@ pub fn spectrum(samples: &[f32], sample_rate: u32) -> [f32; BANDS] {
         if lo_bin >= hi_bin {
             continue;
         }
-        let mut sum = 0.0;
+        // Peak within the band, not the mean. A band spans many bins, and
+        // averaging buries a tone that occupies one of them: at 16 kHz the
+        // 220-380 Hz band is eleven bins wide, so a pure tone reads about a
+        // tenth of its real level. Peak is also immune to band width, so a wide
+        // band is not louder just for being wide.
+        let mut peak = 0.0f32;
         for k in lo_bin..hi_bin {
-            sum += (re[k] * re[k] + im[k] * im[k]).sqrt();
+            peak = peak.max((re[k] * re[k] + im[k] * im[k]).sqrt());
         }
-        // Mean rather than total, so a wide band is not louder just for being
-        // wide.
-        let mean = sum / (hi_bin - lo_bin) as f32;
-        // Normalised by window size, then scaled: raw magnitudes are tiny for
-        // speech and would render as a flat line.
-        bands[b] = (mean / (FFT_SIZE as f32 / 4.0) * 8.0).clamp(0.0, 1.0);
+        // A Hann-windowed full-scale sine puts about N/4 in its peak bin, so
+        // this normalises to roughly 0..1 before the dB conversion.
+        bands[b] = to_display(peak / (FFT_SIZE as f32 / 4.0));
     }
     bands
 }
@@ -200,16 +228,23 @@ mod tests {
     }
 
     #[test]
-    fn a_louder_tone_reads_higher_than_a_quiet_one() {
+    fn a_louder_tone_reads_higher_by_the_right_amount() {
+        // On a logarithmic scale a 20 dB difference is a fixed offset, not a
+        // ratio: 20 of the 60 dB range, so a third of full scale. Asserting a
+        // doubling here would be assuming a linear meter.
         let loud = spectrum(&tone(1000.0, 16_000, FFT_SIZE), 16_000);
         let quiet: Vec<f32> = tone(1000.0, 16_000, FFT_SIZE)
             .iter()
             .map(|s| s * 0.1)
             .collect();
         let quiet = spectrum(&quiet, 16_000);
-        let l: f32 = loud.iter().sum();
-        let q: f32 = quiet.iter().sum();
-        assert!(l > q * 2.0, "loud {l} vs quiet {q}");
+        let l = loud.iter().cloned().fold(0.0f32, f32::max);
+        let q = quiet.iter().cloned().fold(0.0f32, f32::max);
+        let delta = l - q;
+        assert!(
+            (delta - 0.333).abs() < 0.05,
+            "20 dB should be a third of scale; loud {l}, quiet {q}, delta {delta}"
+        );
     }
 
     #[test]
@@ -223,10 +258,43 @@ mod tests {
     }
 
     #[test]
-    fn rms_of_a_half_amplitude_tone_is_about_a_third() {
+    fn raw_rms_of_a_half_amplitude_tone_is_about_a_third() {
         // sin at 0.5 amplitude has rms 0.5/sqrt(2) = 0.354.
-        let r = rms(&tone(440.0, 16_000, 16_000));
+        let r = rms_linear(&tone(440.0, 16_000, 16_000));
         assert!((r - 0.354).abs() < 0.01, "got {r}");
+    }
+
+    #[test]
+    fn the_scale_is_logarithmic_not_linear() {
+        // -20 dBFS is a tenth of full scale by amplitude but sounds like a
+        // normal speaking voice, so it must not render as a tenth of the bar.
+        let quiet = to_display(0.1);
+        assert!(
+            quiet > 0.6,
+            "-20 dBFS should read as two thirds of scale, got {quiet}"
+        );
+    }
+
+    #[test]
+    fn the_floor_reads_as_silence_and_full_scale_as_full() {
+        assert_eq!(to_display(0.0), 0.0);
+        // -60 dBFS is the floor.
+        assert!(to_display(0.001) < 0.02);
+        assert!((to_display(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn speech_level_audio_lands_in_the_upper_half() {
+        // A tone at -26 dBFS stands in for ordinary speech. On the old linear
+        // scale this rendered near zero, which is what made the meter look
+        // broken rather than quiet.
+        let quiet: Vec<f32> = tone(300.0, 16_000, FFT_SIZE)
+            .iter()
+            .map(|s| s * 0.1)
+            .collect();
+        let s = spectrum(&quiet, 16_000);
+        let peak = s.iter().cloned().fold(0.0f32, f32::max);
+        assert!(peak > 0.5, "speech-level audio read {peak}");
     }
 
     #[test]

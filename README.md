@@ -45,3 +45,23 @@ idle, checks free VRAM before loading, caps its own ORT arena, and refuses
 sessions rather than winning an allocation race against the cameras or a film.
 
 See the design document for measured model sizes and the full tenancy policy.
+
+## Sway
+
+The level overlay shown during typing modes is an ordinary Wayland window, so a
+tiling compositor tiles it unless told otherwise. One rule makes it behave as an
+overlay:
+
+```
+for_window [app_id="syrinx-overlay"] floating enable, sticky enable, border none, resize set 260 54
+```
+
+`sticky` keeps it visible across workspaces; without it the readout disappears
+the moment you switch away from where dictation started, which is precisely when
+you want it.
+
+A keybind for dictation:
+
+```
+bindsym $mod+n exec syrinx toggle --mode type
+```

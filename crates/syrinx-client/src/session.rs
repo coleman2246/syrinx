@@ -63,6 +63,10 @@ pub struct SessionState {
     pub model: Option<String>,
     pub chunk_ms: Option<u32>,
     pub error: Option<String>,
+    /// Live spectrum of the audio being sent, so a viewer can see the session
+    /// is receiving sound rather than only that it is running.
+    pub levels: Vec<f32>,
+    pub rms: f32,
 }
 
 /// Parameters for a run.
@@ -298,11 +302,25 @@ async fn run(
         }
     });
 
+    // Metered from the audio actually being sent, so what a viewer sees is the
+    // stream the server receives rather than a second capture of the same
+    // device.
+    let mut window: Vec<f32> = Vec::with_capacity(4096);
     loop {
         tokio::select! {
             _ = &mut stop_rx => break,
             chunk = audio_rx.recv() => match chunk {
                 Some(samples) => {
+                    window.extend_from_slice(&samples);
+                    if window.len() > 4096 {
+                        let excess = window.len() - 4096;
+                        window.drain(..excess);
+                    }
+                    {
+                        let mut s = state.lock().expect("state lock poisoned");
+                        s.levels = syrinx_audio::meter::spectrum(&window, SAMPLE_RATE).to_vec();
+                        s.rms = syrinx_audio::meter::rms(&samples);
+                    }
                     if tx.send(Ws::Binary(to_pcm_s16le(&samples).into())).await.is_err() {
                         break;
                     }

@@ -74,6 +74,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     let mut state = DaemonRuntime {
         opts,
         session: None,
+        overlay: None,
         preview: None,
         last_viewer: None,
         last: Default::default(),
@@ -175,6 +176,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     }
 
     state.stop();
+    state.stop_overlay();
     let _ = std::fs::remove_file(&sock);
     info!("daemon stopped");
     Ok(())
@@ -221,6 +223,8 @@ fn serve_client(stream: UnixStream, tx: mpsc::Sender<(Request, Option<mpsc::Send
 struct DaemonRuntime {
     opts: DaemonOptions,
     session: Option<SessionHandle>,
+    /// The level overlay, shown only for typing sessions.
+    overlay: Option<std::process::Child>,
     /// Live level meter, running only while idle and only while a viewer is
     /// watching. Holding a capture open otherwise would keep a microphone
     /// active for no reason.
@@ -294,7 +298,11 @@ impl DaemonRuntime {
             .map(|s| s.state())
             .unwrap_or_else(|| self.last.clone());
         let mut out = DaemonState::from_session(&s, self.opts.mode, self.opts.source_key.clone());
-        if let Some(p) = &self.preview {
+        // Preview levels apply only when idle; a running session meters the
+        // audio it is actually sending.
+        if !self.running()
+            && let Some(p) = &self.preview
+        {
             out.levels = p.levels().to_vec();
             out.rms = p.rms();
         }
@@ -325,6 +333,7 @@ impl DaemonRuntime {
         // A new session starts from a blank transcript; the previous one has
         // had its chance to be read and saved.
         self.last = Default::default();
+        self.start_overlay();
         self.session = Some(crate::session::start(
             SessionOptions {
                 url: self.opts.config.url.clone(),
@@ -339,6 +348,40 @@ impl DaemonRuntime {
     fn stop(&mut self) {
         if let Some(s) = &mut self.session {
             s.stop();
+        }
+    }
+
+    /// Show the level overlay, for typing modes only.
+    ///
+    /// Transcribe mode already shows text arriving in its own window, which is
+    /// feedback enough. Typing gives none -- text lands in whatever has focus,
+    /// and silence is indistinguishable from a dead microphone. An always-on-top
+    /// window over whatever you are reading has to earn its place, so it is not
+    /// shown when it would be redundant.
+    fn start_overlay(&mut self) {
+        if !self.opts.mode.types_at_cursor() {
+            return;
+        }
+        let Some(cmd) = &self.opts.gui_command else {
+            return;
+        };
+        match std::process::Command::new(cmd)
+            .arg("--overlay")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => self.overlay = Some(c),
+            Err(e) => warn!("could not show the level overlay: {e}"),
+        }
+    }
+
+    /// Close the overlay. It also closes itself when the session ends, but a
+    /// daemon shutting down should not leave one behind.
+    fn stop_overlay(&mut self) {
+        if let Some(mut c) = self.overlay.take() {
+            let _ = c.kill();
         }
     }
 
@@ -414,5 +457,6 @@ impl DaemonRuntime {
         // Keep the finished transcript visible and saveable.
         self.last = st;
         self.session = None;
+        self.stop_overlay();
     }
 }

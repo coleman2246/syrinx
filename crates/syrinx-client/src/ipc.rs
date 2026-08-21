@@ -84,8 +84,10 @@ impl DaemonState {
             chunk_ms: s.chunk_ms,
             error: s.error.clone(),
             source_key,
-            levels: Vec::new(),
-            rms: 0.0,
+            // A running session meters its own audio; the daemon overwrites
+            // these from the idle preview when there is no session.
+            levels: s.levels.clone(),
+            rms: s.rms,
         }
     }
 }

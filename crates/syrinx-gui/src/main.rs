@@ -11,6 +11,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod overlay;
+
 use anyhow::{Context, Result};
 use eframe::egui;
 use std::path::PathBuf;
@@ -41,6 +43,12 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| "syrinx_gui=info,syrinx_client=info".into()),
         )
         .init();
+
+    // The overlay is a readout over an existing daemon, not a viewer that
+    // starts one: it only makes sense while a session is already running.
+    if std::env::args().any(|a| a == "--overlay") {
+        return overlay::run();
+    }
 
     let config = Config::load(None)?;
     ensure_daemon()?;
