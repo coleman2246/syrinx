@@ -392,8 +392,10 @@ protocol against the simpler client. The GUI follows.
 
 ## Windows portability (audit, 2026-08-21)
 
-Audited before any Windows testing. Nothing here has been run on Windows; this
-is what a build would hit.
+> **Superseded by the section below.** The audit was written before any Windows
+> testing; the port has since been built and run. Kept because comparing the two
+> shows which predictions held. Most did. Two did not, and both were assumptions
+> stated as fact.
 
 ### Compiles and works
 
@@ -432,7 +434,7 @@ cover it.
   stamp, so saving still works but filenames are uglier. Worth replacing with a
   small time formatter.
 
-### Summary
+### Summary (as predicted, before testing)
 
 The **server** is portable in principle but is meant to run in a container on
 Linux, so this does not matter. The **GUI and CLI need an IPC transport
@@ -484,3 +486,66 @@ The real options:
   short concurrent sessions complete correctly, but three long ones did not
   finish inside ten minutes, which wants investigating before `max_sessions`
   above 1 is trusted for bulk work.
+
+
+## Windows port (measured, 2026-08-21)
+
+Built and run on Windows 11 Pro x64, MSVC toolchain, client on the LAN against
+the CUDA server on the development desktop. 148 tests pass on Windows.
+
+**Verified working:** source enumeration, first-run config creation under
+`%APPDATA%`, file transcription over the LAN, live transcription of system audio
+via WASAPI loopback, the daemon and its named-pipe IPC, and stopping a session
+and the daemon from the CLI.
+
+### What the audit got wrong
+
+**cpal loopback is only half transparent.** The audit said WASAPI "turns" an
+output device into loopback, and the cpal backend's own module doc said the same
+— I had written both from cpal's crate documentation, which says using an output
+device as an input "will transparently enable loopback mode". It does set
+`AUDCLNT_STREAMFLAGS_LOOPBACK` when *building* an input stream on a render
+endpoint. But `default_input_config()` refuses to describe one, answering
+"Device does not support input", so opening a system-audio source failed outright.
+The fix is one branch: take the config from `default_output_config()` and open it
+for input. Measured with a 440 Hz tone, the meter lights a single band at 60%.
+
+**A stop mechanism, not just a signal.** The audit expected "a named event or a
+console control handler" to replace SIGTERM. Both are worse than they look: a
+console control handler only reaches a process with a console, and the daemon has
+none. What shipped is a stop-request file beside the PID file, polled every 200 ms
+by the running session. `TerminateProcess` was rejected outright: it gives the
+session no chance to flush the last utterance, which is the one thing dictation
+must not lose.
+
+### What the audit missed
+
+**A daemon with no tray could not be stopped.** `stop`, `toggle` and `status`
+only ever consulted the PID file, which a daemon does not write — so `status`
+reported "idle" while the GUI was dictating, and `stop` was a no-op. On Linux the
+tray hid this. Windows has no tray, so the daemon could only be killed. All three
+commands now fall through to the daemon over IPC, and `quit` was added. This was
+a real Linux bug too, and directly against the stated goal that the CLI be
+equivalent to the GUI.
+
+**A PID file is not enough on Windows.** `OpenProcess` succeeding does not mean
+the process is alive: a handle stays valid for a process that has exited but not
+been reaped. The exit code has to be checked as well, or a crashed session reads
+as running forever and the toggle never starts again — the same failure the PID
+file exists to prevent.
+
+### Still Linux-only
+
+Per-application capture (PipeWire) and the system tray (ksni is DBus-based).
+Neither blocks dictation; the tray gap is covered by `syrinx quit`.
+
+### Not verified
+
+Typing at the cursor. `SendInput` is implemented and its encoding is unit-tested,
+but Windows refuses synthetic input from a non-interactive window station, so it
+cannot be exercised over SSH: the integration test reports 0 of 34 events
+delivered. It needs a run from a real login. The error message names elevation as
+the likely cause, which is the other common reason for the same symptom.
+
+The laptop microphone also reads silent, but privacy consent is `Allow` and the
+endpoints report OK, so this is most likely a quiet room rather than a fault.

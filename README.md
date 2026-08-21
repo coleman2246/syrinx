@@ -28,7 +28,9 @@ Vosk's accuracy penalty: ~1.93% WER on librispeech test-clean, with punctuation.
 
 ## Status
 
-Design approved, implementation not started.
+Working on Linux and Windows. The server runs on the development desktop; the
+container that moves it to `acdc` is the last piece outstanding.
+
 See [`docs/specs/`](docs/specs/) for the design document.
 
 ## Deployment notes
@@ -45,6 +47,39 @@ idle, checks free VRAM before loading, caps its own ORT arena, and refuses
 sessions rather than winning an allocation race against the cameras or a film.
 
 See the design document for measured model sizes and the full tenancy policy.
+
+## Windows
+
+Both the CLI and the GUI build and run on Windows with the MSVC toolchain.
+Verified on Windows 11 with a client on the LAN and the server on the desktop:
+system audio captured, streamed, and transcribed live.
+
+What differs from Linux:
+
+| | Linux | Windows |
+|---|---|---|
+| Config | `~/.config/syrinx/` | `%APPDATA%\syrinx\` |
+| Daemon IPC | Unix socket in `$XDG_RUNTIME_DIR` | named pipe `\\.\pipe\syrinx.sock` |
+| Typing | `wtype` / `ydotool` / `paste` | `sendinput` |
+| Stopping a session | SIGTERM | a stop-request file, polled |
+| Audio | PipeWire, including per-application capture | WASAPI via cpal |
+| System tray | yes | not yet — use `syrinx quit` |
+
+Per-application capture is Linux-only. Windows has had process loopback since
+10 2004, but cpal does not expose it, so it would mean hand-written WASAPI.
+Capturing *all* system audio works on both.
+
+`ffmpeg` must be on PATH to transcribe files. If winget installed it, PATH
+points at a zero-length reparse point that cannot be spawned even though
+`ffmpeg -version` works in a shell; put the real `bin` directory on PATH
+instead.
+
+### Building
+
+```powershell
+winget install Rustlang.Rustup      # MSVC toolchain, plus VS Build Tools
+cargo build -p syrinx-cli -p syrinx-gui
+```
 
 ## Sway
 
