@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// cleared on logout, so a stale file cannot survive a reboot.
 pub fn default_pid_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(dir).join("parakeet-type.pid")
+    PathBuf::from(dir).join("parakeet.pid")
 }
 
 /// Read the PID file and confirm the process is alive.
@@ -74,7 +74,7 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("parakeet-type-test-{name}-{}", std::process::id()));
+        p.push(format!("parakeet-test-{name}-{}", std::process::id()));
         p
     }
 

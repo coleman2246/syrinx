@@ -3318,19 +3318,47 @@ dependencies = [
 ]
 
 [[package]]
-name = "parakeet-gui"
+name = "parakeet-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "eframe",
- "egui",
+ "clap",
+ "parakeet-client",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "parakeet-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "futures-util",
+ "nix",
  "parakeet-audio",
  "parakeet-proto",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "parakeet-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eframe",
+ "egui",
+ "parakeet-audio",
+ "parakeet-client",
+ "parakeet-proto",
+ "serde",
+ "serde_json",
+ "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -3379,25 +3407,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "parakeet-type"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "cpal",
- "futures-util",
- "nix",
- "parakeet-proto",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -7,56 +7,12 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod session;
-
 use anyhow::Result;
 use eframe::egui;
 use parakeet_audio::{Source, SourceKind};
-use serde::Deserialize;
-use session::{SessionHandle, SessionState, Status};
-use std::path::PathBuf;
-
-#[derive(Debug, Deserialize, Clone)]
-struct Config {
-    #[serde(default = "default_url")]
-    url: String,
-    token: String,
-    /// Remembered source, as a `Source::stable_key`. Node ids change between
-    /// runs, so the key is what gets persisted.
-    #[serde(default)]
-    source_key: Option<String>,
-}
-
-fn default_url() -> String {
-    "ws://127.0.0.1:8770/v1/stream".into()
-}
-
-fn config_path() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config")
-        });
-    base.join("parakeet-gui/config.toml")
-}
-
-fn load_config() -> Result<Config> {
-    // Fall back to the dictation client's config: the two want the same server
-    // and token, and making the user write it twice invites them to diverge.
-    let mut candidates = vec![config_path()];
-    if let Some(p) = config_path().parent().and_then(|p| p.parent()) {
-        candidates.push(p.join("parakeet-type/config.toml"));
-    }
-    for p in &candidates {
-        if let Ok(text) = std::fs::read_to_string(p) {
-            return Ok(toml::from_str(&text)?);
-        }
-    }
-    anyhow::bail!(
-        "no config found. Create {} with:\n  url = \"ws://host:8770/v1/stream\"\n  token = \"...\"",
-        config_path().display()
-    )
-}
+use parakeet_client::{
+    Config, OutputMode, SessionHandle, SessionOptions, SessionState, Status,
+};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -66,7 +22,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let config = load_config()?;
+    let config = Config::load(None)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([460.0, 340.0])
@@ -85,6 +41,7 @@ fn main() -> Result<()> {
 
 struct App {
     config: Config,
+    mode: OutputMode,
     sources: Vec<Source>,
     selected: Option<Source>,
     session: Option<SessionHandle>,
@@ -94,8 +51,10 @@ struct App {
 
 impl App {
     fn new(config: Config) -> Self {
+        let mode = config.mode;
         let mut app = Self {
             config,
+            mode,
             sources: Vec::new(),
             selected: None,
             session: None,
@@ -149,10 +108,13 @@ impl App {
             return;
         };
         let ctx = ctx.clone();
-        self.session = Some(session::start(
-            self.config.url.clone(),
-            self.config.token.clone(),
-            source,
+        self.session = Some(parakeet_client::session::start(
+            SessionOptions {
+                url: self.config.url.clone(),
+                token: self.config.token.clone(),
+                source,
+                mode: self.mode,
+            },
             move || ctx.request_repaint(),
         ));
     }
@@ -174,6 +136,8 @@ impl eframe::App for App {
         self.status_row(ui);
         ui.add_space(8.0);
         self.source_row(ui, running);
+        ui.add_space(4.0);
+        self.mode_row(ui, running);
         ui.separator();
         // Reserve room for the separator, the controls row and any error line.
         let reserved = 90.0;
@@ -257,6 +221,24 @@ impl App {
 
     /// Fills whatever vertical space is left. A fixed height wastes most of the
     /// window when tiled, which on Sway is the normal case.
+    fn mode_row(&mut self, ui: &mut egui::Ui, running: bool) {
+        ui.horizontal(|ui| {
+            ui.label("Mode:");
+            // Changing mode mid-session would need a reconnect, since the wire
+            // mode is fixed at session.start.
+            ui.add_enabled_ui(!running, |ui| {
+                for m in OutputMode::ALL {
+                    if ui.selectable_label(self.mode == m, m.label()).clicked() {
+                        self.mode = m;
+                    }
+                }
+            });
+        });
+        if self.mode.types_at_cursor() {
+            ui.weak("Types into whatever window has focus. Append-only: it never deletes.");
+        }
+    }
+
     fn transcript_box(&self, ui: &mut egui::Ui, height: f32) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -264,7 +246,21 @@ impl App {
             .max_height(height.max(80.0))
             .show(ui, |ui| {
                 if self.state.transcript.is_empty() {
-                    ui.weak("Nothing transcribed yet.");
+                    if self.mode == OutputMode::Type {
+                        ui.weak(if self.state.last_fragment.is_empty() {
+                            "Typing at the cursor. Nothing spoken yet."
+                        } else {
+                            "Typing at the cursor."
+                        });
+                        if !self.state.last_fragment.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("last: {}", self.state.last_fragment))
+                                    .italics(),
+                            );
+                        }
+                    } else {
+                        ui.weak("Nothing transcribed yet.");
+                    }
                 } else {
                     ui.label(&self.state.transcript);
                 }

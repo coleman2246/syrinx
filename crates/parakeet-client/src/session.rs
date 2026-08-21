@@ -1,29 +1,18 @@
-//! The dictation session: capture, stream, and report back to the UI.
+//! The dictation session. One implementation, shared by the CLI and the GUI.
 //!
-//! Runs on a tokio runtime on its own thread. The UI never blocks on the
-//! network, and communicates only through [`SessionHandle`], so a stalled
-//! server cannot freeze the window.
+//! Runs its own tokio runtime on a dedicated thread and communicates through
+//! shared state, so a front-end never blocks on the network: a stalled server
+//! cannot freeze a GUI or wedge a CLI.
 
+use crate::inject;
+use crate::mode::OutputMode;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use parakeet_audio::{Capture, Source};
-use parakeet_proto::{ClientMessage, Encoding, Mode, SAMPLE_RATE, ServerMessage};
+use parakeet_proto::{ClientMessage, Encoding, SAMPLE_RATE, ServerMessage};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
-
-/// What the UI needs to draw. Cheap to clone and read every frame.
-#[derive(Debug, Clone, Default)]
-pub struct SessionState {
-    pub status: Status,
-    /// Everything transcribed this session.
-    pub transcript: String,
-    /// The most recent fragment, shown so the user can see it is alive.
-    pub last_fragment: String,
-    pub model: Option<String>,
-    pub chunk_ms: Option<u32>,
-    pub error: Option<String>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Status {
@@ -43,6 +32,32 @@ impl Status {
             Status::Stopping => "Stopping…",
         }
     }
+
+    pub fn is_active(self) -> bool {
+        !matches!(self, Status::Idle)
+    }
+}
+
+/// Everything a front-end needs to render. Cheap to clone.
+#[derive(Debug, Clone, Default)]
+pub struct SessionState {
+    pub status: Status,
+    /// Accumulated text. Empty in [`OutputMode::Type`], which keeps none.
+    pub transcript: String,
+    /// Most recent fragment, so a UI can show it is alive.
+    pub last_fragment: String,
+    pub model: Option<String>,
+    pub chunk_ms: Option<u32>,
+    pub error: Option<String>,
+}
+
+/// Parameters for a run.
+#[derive(Debug, Clone)]
+pub struct SessionOptions {
+    pub url: String,
+    pub token: String,
+    pub source: Source,
+    pub mode: OutputMode,
 }
 
 /// Handle to a running session. Dropping it stops the session.
@@ -61,6 +76,10 @@ impl SessionHandle {
             let _ = tx.send(());
         }
     }
+
+    pub fn is_running(&self) -> bool {
+        self.state().status.is_active()
+    }
 }
 
 impl Drop for SessionHandle {
@@ -69,15 +88,12 @@ impl Drop for SessionHandle {
     }
 }
 
-/// Start a session against `source`, typing nothing -- the GUI displays text
-/// rather than injecting it.
+/// Start a session on a background thread.
 ///
-/// `on_change` is called whenever state moves, so the UI can request a repaint
-/// instead of polling at a fixed rate.
+/// `on_change` fires whenever state moves, so a UI can repaint on demand rather
+/// than polling.
 pub fn start(
-    url: String,
-    token: String,
-    source: Source,
+    opts: SessionOptions,
     on_change: impl Fn() + Send + Sync + 'static,
 ) -> SessionHandle {
     let state = Arc::new(Mutex::new(SessionState {
@@ -85,9 +101,9 @@ pub fn start(
         ..Default::default()
     }));
     let (stop_tx, stop_rx) = oneshot::channel();
-
     let st = state.clone();
     let notify = Arc::new(on_change);
+
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -95,17 +111,17 @@ pub fn start(
         {
             Ok(rt) => rt,
             Err(e) => {
-                set_error(&st, format!("starting the async runtime: {e}"));
+                fail(&st, format!("starting the async runtime: {e}"));
                 notify();
                 return;
             }
         };
-        if let Err(e) = rt.block_on(run(url, token, source, st.clone(), stop_rx, notify.clone())) {
-            error!("session failed: {e:#}");
-            set_error(&st, format!("{e:#}"));
-        } else {
-            let mut s = st.lock().expect("state lock poisoned");
-            s.status = Status::Idle;
+        match rt.block_on(run(opts, st.clone(), stop_rx, notify.clone())) {
+            Ok(()) => st.lock().expect("state lock poisoned").status = Status::Idle,
+            Err(e) => {
+                error!("session failed: {e:#}");
+                fail(&st, format!("{e:#}"));
+            }
         }
         notify();
     });
@@ -116,16 +132,14 @@ pub fn start(
     }
 }
 
-fn set_error(state: &Arc<Mutex<SessionState>>, msg: String) {
+fn fail(state: &Arc<Mutex<SessionState>>, msg: String) {
     let mut s = state.lock().expect("state lock poisoned");
     s.error = Some(msg);
     s.status = Status::Idle;
 }
 
 async fn run(
-    url: String,
-    token: String,
-    source: Source,
+    opts: SessionOptions,
     state: Arc<Mutex<SessionState>>,
     mut stop_rx: oneshot::Receiver<()>,
     notify: Arc<impl Fn() + Send + Sync + 'static>,
@@ -133,26 +147,32 @@ async fn run(
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::protocol::Message as Ws;
 
-    let mut req = url
+    if opts.mode.types_at_cursor() {
+        // Fail before the microphone opens rather than after the user speaks.
+        inject::preflight()?;
+    }
+
+    let mut req = opts
+        .url
         .as_str()
         .into_client_request()
-        .with_context(|| format!("building a request for {url}"))?;
+        .with_context(|| format!("building a request for {}", opts.url))?;
     req.headers_mut().insert(
         "authorization",
-        format!("Bearer {token}")
+        format!("Bearer {}", opts.token)
             .parse()
             .context("token is not a valid header value")?,
     );
 
     let (ws, _) = tokio_tungstenite::connect_async(req)
         .await
-        .with_context(|| format!("connecting to {url}"))?;
+        .with_context(|| format!("connecting to {}", opts.url))?;
     let (mut tx, mut rx) = ws.split();
 
-    // Transcript mode: the GUI owns its buffer, so the server may revise it.
     tx.send(Ws::Text(
         serde_json::to_string(&ClientMessage::SessionStart {
-            mode: Mode::Transcript,
+            // Typing forces the append-only wire mode; see OutputMode::wire_mode.
+            mode: opts.mode.wire_mode(),
             sample_rate: SAMPLE_RATE,
             encoding: Encoding::PcmS16le,
             language: None,
@@ -185,19 +205,31 @@ async fn run(
     notify();
 
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(32);
-    let _capture = Capture::start(&source, audio_tx).context("starting audio capture")?;
-    info!("session running against {}", source.display());
+    let _capture = Capture::start(&opts.source, audio_tx).context("starting audio capture")?;
+    info!(
+        "session running: {} -> {}",
+        opts.source.display(),
+        opts.mode.label()
+    );
 
     let st = state.clone();
     let n = notify.clone();
+    let mode = opts.mode;
     let reader = tokio::spawn(async move {
         while let Some(Ok(msg)) = rx.next().await {
             let Ws::Text(t) = msg else { continue };
             match serde_json::from_str::<ServerMessage>(&t) {
                 Ok(ServerMessage::TranscriptCommit { text, .. })
                 | Ok(ServerMessage::TranscriptProvisional { text, .. }) => {
+                    if mode.types_at_cursor()
+                        && let Err(e) = inject::type_text(&text)
+                    {
+                        error!("failed to type {text:?}: {e:#}");
+                    }
                     let mut s = st.lock().expect("state lock poisoned");
-                    s.transcript.push_str(&text);
+                    if mode.keeps_transcript() {
+                        s.transcript.push_str(&text);
+                    }
                     s.last_fragment = text;
                     drop(s);
                     n();
@@ -205,10 +237,9 @@ async fn run(
                 Ok(ServerMessage::TranscriptRevise {
                     retract_n, text, ..
                 }) => {
-                    // Transcript mode permits revision because the client owns
-                    // this buffer. No v1 server path emits it, but honouring it
-                    // here means a future post-processing layer needs no client
-                    // change.
+                    // Only reachable in transcribe-only mode, where the client
+                    // owns the buffer. A typing session runs in Live mode, so
+                    // the server never sends this.
                     let mut s = st.lock().expect("state lock poisoned");
                     let keep = s.transcript.chars().count().saturating_sub(retract_n);
                     s.transcript = s.transcript.chars().take(keep).collect();
@@ -245,10 +276,7 @@ async fn run(
         }
     }
 
-    {
-        let mut s = state.lock().expect("state lock poisoned");
-        s.status = Status::Stopping;
-    }
+    state.lock().expect("state lock poisoned").status = Status::Stopping;
     notify();
 
     let _ = tx
@@ -285,25 +313,43 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_input_is_clamped() {
-        let out = to_pcm_s16le(&[9.0]);
+    fn out_of_range_input_is_clamped_not_wrapped() {
+        let out = to_pcm_s16le(&[9.0, -9.0]);
         assert_eq!(i16::from_le_bytes([out[0], out[1]]), 32767);
+        assert_eq!(i16::from_le_bytes([out[2], out[3]]), -32767);
+    }
+
+    #[test]
+    fn encoding_round_trips_through_the_shared_decoder() {
+        // The server decodes with parakeet_proto::pcm_s16le_to_f32, so the two
+        // must agree or every transcript is subtly wrong.
+        let original = [0.0f32, 0.5, -0.5, 0.25];
+        let decoded = parakeet_proto::pcm_s16le_to_f32(&to_pcm_s16le(&original));
+        for (a, b) in original.iter().zip(&decoded) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
     }
 
     #[test]
     fn status_labels_are_distinct() {
-        // The status line is the only thing telling the user whether the mic is
-        // live; two states reading the same would be actively misleading.
         let all = [
             Status::Idle,
             Status::Connecting,
             Status::Listening,
             Status::Stopping,
         ];
-        let mut labels: Vec<&str> = all.iter().map(|s| s.label()).collect();
-        labels.sort_unstable();
-        let before = labels.len();
-        labels.dedup();
-        assert_eq!(labels.len(), before);
+        let mut l: Vec<&str> = all.iter().map(|s| s.label()).collect();
+        l.sort_unstable();
+        let n = l.len();
+        l.dedup();
+        assert_eq!(l.len(), n);
+    }
+
+    #[test]
+    fn only_idle_is_inactive() {
+        assert!(!Status::Idle.is_active());
+        assert!(Status::Connecting.is_active());
+        assert!(Status::Listening.is_active());
+        assert!(Status::Stopping.is_active());
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/parakeet-audio", "crates/parakeet-proto", "crates/parakeet-server", "crates/parakeet-type", "crates/parakeet-gui"]
+members = ["crates/parakeet-audio", "crates/parakeet-proto", "crates/parakeet-server", "crates/parakeet-gui", "crates/parakeet-client", "crates/parakeet-cli"]
 
 [workspace.package]
 edition = "2024"
@@ -16,3 +16,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parakeet-proto = { path = "crates/parakeet-proto" }
 parakeet-audio = { path = "crates/parakeet-audio" }
+parakeet-client = { path = "crates/parakeet-client" }
