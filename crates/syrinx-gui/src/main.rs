@@ -372,7 +372,7 @@ impl App {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.url_edit)
                     .desired_width(280.0)
-                    .hint_text("ws://host:8770/v1/stream"),
+                    .hint_text("192.168.0.235  or  dock.internal"),
             );
             let submitted =
                 resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -390,9 +390,9 @@ impl App {
                 self.editing_url = false;
             }
             if (submitted || apply) && !running {
-                match self.apply_url() {
+                match self.apply_server() {
                     Ok(()) => {
-                        self.status_line = Some(format!("Server set to {}", self.config.url));
+                        self.status_line = Some(format!("Server set to {}", self.config.server));
                         self.editing_url = false;
                     }
                     Err(e) => self.status_line = Some(format!("{e:#}")),
@@ -403,13 +403,16 @@ impl App {
     }
 
     /// Normalise, persist, and hand the new address to the daemon.
-    fn apply_url(&mut self) -> Result<()> {
-        let url = normalise_url(&self.url_edit)?;
-        self.config.url = url.clone();
+    fn apply_server(&mut self) -> Result<()> {
+        let server = normalise_server(&self.url_edit)?;
+        self.config.server = server.clone();
+        // A full-URL override would otherwise keep winning, leaving the client
+        // on the old machine while the field showed the new one.
+        self.config.url = None;
         self.config.save(&Config::default_path())?;
         // The daemon holds its own copy, so telling it is what actually takes
         // effect; writing the file only makes it survive a restart.
-        match ipc::request(&Request::SetUrl { url })? {
+        match ipc::request(&Request::SetServer { server })? {
             Response::Error { message } => anyhow::bail!(message),
             _ => Ok(()),
         }
@@ -846,17 +849,14 @@ impl App {
                 action = Some(Request::Clear);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let short = self
-                    .config
-                    .url
-                    .trim_start_matches("ws://")
-                    .trim_end_matches("/v1/stream");
+                // The host is what identifies the server; the rest is noise
+                // that was only ever there because the config demanded it.
                 if ui
-                    .link(short)
-                    .on_hover_text(format!("{}\nclick to change", self.config.url))
+                    .link(&self.config.server)
+                    .on_hover_text(format!("{}\nclick to change", self.config.url()))
                     .clicked()
                 {
-                    self.url_edit = self.config.url.clone();
+                    self.url_edit = self.config.server.clone();
                     self.editing_url = true;
                 }
             });
@@ -873,20 +873,30 @@ impl App {
 ///
 /// Typing just an IP is the common case, and failing on it would be needless
 /// friction when the rest of the address is always the same.
-fn normalise_url(input: &str) -> Result<String> {
-    let s = input.trim();
+/// Reduce whatever was typed to a host, or a host and port.
+///
+/// A pasted URL is accepted and stripped back: the field asks for a machine,
+/// but people paste what they have, and refusing it would be pedantry.
+fn normalise_server(input: &str) -> Result<String> {
+    let mut s = input.trim();
     if s.is_empty() {
-        anyhow::bail!("enter a server address");
+        anyhow::bail!("enter the machine the server is running on");
     }
-    if s.starts_with("ws://") || s.starts_with("wss://") {
-        return Ok(s.to_string());
+    for scheme in ["ws://", "wss://", "http://", "https://"] {
+        if let Some(rest) = s.strip_prefix(scheme) {
+            s = rest;
+            break;
+        }
     }
-    let with_port = if s.contains(':') {
-        s.to_string()
-    } else {
-        format!("{s}:8770")
-    };
-    Ok(format!("ws://{with_port}/v1/stream"))
+    // Drop any path: the endpoint is not the user's to choose here.
+    let s = s.split('/').next().unwrap_or(s).trim();
+    if s.is_empty() {
+        anyhow::bail!("enter the machine the server is running on");
+    }
+    if s.contains(char::is_whitespace) {
+        anyhow::bail!("a host cannot contain spaces");
+    }
+    Ok(s.to_string())
 }
 
 #[cfg(test)]
@@ -894,39 +904,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_bare_host_becomes_a_full_url() {
-        assert_eq!(
-            normalise_url("192.168.0.11").unwrap(),
-            "ws://192.168.0.11:8770/v1/stream"
-        );
+    fn a_bare_host_is_kept_as_typed() {
+        // The field asks for a machine, and that is all it should store.
+        assert_eq!(normalise_server("192.168.0.11").unwrap(), "192.168.0.11");
+        assert_eq!(normalise_server("dock.internal").unwrap(), "dock.internal");
     }
 
     #[test]
     fn a_host_and_port_keeps_the_port() {
         assert_eq!(
-            normalise_url("acdc.home.arpa:9000").unwrap(),
-            "ws://acdc.home.arpa:9000/v1/stream"
+            normalise_server("acdc.home.arpa:9000").unwrap(),
+            "acdc.home.arpa:9000"
         );
     }
 
     #[test]
-    fn a_full_url_is_left_alone() {
-        let u = "ws://host:1234/v1/stream";
-        assert_eq!(normalise_url(u).unwrap(), u);
-        assert_eq!(normalise_url("wss://host/v1/stream").unwrap(), "wss://host/v1/stream");
+    fn a_pasted_url_is_reduced_to_its_host() {
+        // People paste what they have; stripping it beats rejecting it.
+        for input in [
+            "ws://192.168.0.11:8770/v1/stream",
+            "http://192.168.0.11:8770",
+            "https://192.168.0.11:8770/anything",
+        ] {
+            let out = normalise_server(input).unwrap();
+            assert!(
+                out.starts_with("192.168.0.11"),
+                "{input} became {out}"
+            );
+            assert!(!out.contains("://"), "{input} kept its scheme: {out}");
+            assert!(!out.contains('/'), "{input} kept a path: {out}");
+        }
     }
 
     #[test]
     fn surrounding_whitespace_is_ignored() {
-        assert_eq!(
-            normalise_url("  10.0.0.5  ").unwrap(),
-            "ws://10.0.0.5:8770/v1/stream"
-        );
+        assert_eq!(normalise_server("  10.0.0.5  ").unwrap(), "10.0.0.5");
     }
 
     #[test]
     fn an_empty_address_is_an_error() {
-        assert!(normalise_url("").is_err());
-        assert!(normalise_url("   ").is_err());
+        assert!(normalise_server("").is_err());
+        assert!(normalise_server("   ").is_err());
+        // A scheme and nothing else names no machine.
+        assert!(normalise_server("ws://").is_err());
+    }
+
+    #[test]
+    fn a_host_with_spaces_is_refused() {
+        assert!(normalise_server("my server").is_err());
+    }
+
+    #[test]
+    fn what_the_field_accepts_is_what_the_config_can_use() {
+        // The two halves must agree, or the GUI would save something that
+        // does not resolve to the server the user just typed.
+        let host = normalise_server("  ws://dock.internal:9000/v1/stream ").unwrap();
+        assert_eq!(
+            syrinx_client::config::server_url(&host),
+            "ws://dock.internal:9000/v1/stream"
+        );
     }
 }

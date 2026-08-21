@@ -327,7 +327,7 @@ fn run(
     let mut handles: Vec<syrinx_client::SessionHandle> = match source_mode {
         syrinx_client::mode::SourceMode::Combined => vec![syrinx_client::session::start(
             SessionOptions {
-                url: cfg.url.clone(),
+                url: cfg.url(),
                 token: cfg.token.clone(),
                 sources: chosen,
                 mode,
@@ -344,7 +344,7 @@ fn run(
                 let label = Some(s.short_label());
                 syrinx_client::session::start(
                     SessionOptions {
-                        url: cfg.url.clone(),
+                        url: cfg.url(),
                         token: cfg.token.clone(),
                         sources: vec![s],
                         mode: if i == 0 { mode } else { OutputMode::Transcribe },
@@ -598,7 +598,7 @@ fn run_transcribe(
 
     let text = rt.block_on(async {
         let mut last_shown = -1i32;
-        syrinx_client::bulk::transcribe(&cfg.url, &cfg.token, &samples, |p| {
+        syrinx_client::bulk::transcribe(&cfg.url(), &cfg.token, &samples, |p| {
             // Whole percent only: a progress line that redraws hundreds of
             // times a second is just flicker.
             let pct = (p * 100.0) as i32;

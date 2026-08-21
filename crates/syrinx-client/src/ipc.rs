@@ -42,8 +42,8 @@ pub enum Request {
         keys: Vec<String>,
         source_mode: Option<crate::mode::SourceMode>,
     },
-    /// Point the daemon at a different server. Applies to the next session.
-    SetUrl { url: String },
+    /// Point the daemon at a different machine. Applies to the next session.
+    SetServer { server: String },
     /// Save the current transcript, returning the path written.
     Save { format: Format, path: Option<String> },
     /// Transcribe an audio file, replacing the current transcript.
