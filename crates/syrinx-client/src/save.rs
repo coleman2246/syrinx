@@ -20,6 +20,9 @@ pub enum Format {
     /// Each fragment prefixed with its time, `[MM:SS]`. What you want when the
     /// transcript is an index into a recording.
     Timestamped,
+    /// Time and source on each line. What you want for several sources
+    /// transcribed separately, where who said it matters as much as when.
+    Labelled,
 }
 
 impl Format {
@@ -27,10 +30,11 @@ impl Format {
         match self {
             Format::Plain => "Plain",
             Format::Timestamped => "Timestamped",
+            Format::Labelled => "Timestamped + source",
         }
     }
 
-    pub const ALL: [Format; 2] = [Format::Plain, Format::Timestamped];
+    pub const ALL: [Format; 3] = [Format::Plain, Format::Timestamped, Format::Labelled];
 }
 
 /// Format seconds as `[MM:SS]`, or `[HH:MM:SS]` past an hour.
@@ -70,7 +74,108 @@ pub fn render(segments: &[Segment], fallback: &str, format: Format) -> String {
             .map(|s| format!("{} {}", stamp(s.at), s.text.trim()))
             .collect::<Vec<_>>()
             .join("\n"),
+        // Falls back to the plain timestamp when a segment has no source, so a
+        // single-source recording saved this way is not littered with empty
+        // brackets.
+        Format::Labelled => segments
+            .iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .map(|s| match &s.source {
+                Some(src) => format!("{} [{}] {}", stamp(s.at), src, s.text.trim()),
+                None => format!("{} {}", stamp(s.at), s.text.trim()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
+}
+
+/// Split segments by source, in first-appearance order.
+///
+/// For saving each source to its own file. Order is by when a source was first
+/// heard rather than alphabetical, so file numbering matches the conversation.
+pub fn by_source(segments: &[Segment]) -> Vec<(String, Vec<Segment>)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<Segment>> =
+        std::collections::HashMap::new();
+    for s in segments {
+        let key = s.source.clone().unwrap_or_else(|| "transcript".into());
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(s.clone());
+    }
+    order
+        .into_iter()
+        .filter_map(|k| groups.remove(&k).map(|v| (k, v)))
+        .collect()
+}
+
+/// Turn a source name into something safe to put in a filename.
+pub fn slug(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Collapse runs and trim, so "Yeti (RNNoise)" does not become
+    // "yeti--rnnoise-".
+    let mut out = String::new();
+    let mut last_dash = false;
+    for c in s.chars() {
+        if c == '-' {
+            if !last_dash && !out.is_empty() {
+                out.push('-');
+            }
+            last_dash = true;
+        } else {
+            out.push(c);
+            last_dash = false;
+        }
+    }
+    out.trim_end_matches('-').chars().take(40).collect()
+}
+
+/// Save each source to its own file beside `base`, returning the paths.
+pub fn save_per_source(
+    base: &Path,
+    segments: &[Segment],
+    format: Format,
+) -> Result<Vec<PathBuf>> {
+    let groups = by_source(segments);
+    if groups.is_empty() {
+        anyhow::bail!("nothing to save: the transcript is empty");
+    }
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "transcript".into());
+    let ext = base
+        .extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "txt".into());
+    let dir = base.parent().unwrap_or(Path::new("."));
+
+    let mut written = Vec::new();
+    for (name, segs) in groups {
+        let path = dir.join(format!("{stem}-{}.{ext}", slug(&name)));
+        let body = render(&segs, "", format);
+        // A source that produced nothing is skipped rather than writing an
+        // empty file that looks like a failed recording.
+        if body.trim().is_empty() {
+            continue;
+        }
+        write(&path, &body)?;
+        written.push(path);
+    }
+    if written.is_empty() {
+        anyhow::bail!("nothing to save: no source produced any text");
+    }
+    Ok(written)
 }
 
 /// Default directory for saved transcripts.
@@ -218,7 +323,57 @@ mod tests {
         Segment {
             at,
             text: text.into(),
+            source: None,
         }
+    }
+
+    fn seg_src(at: f64, text: &str, src: &str) -> Segment {
+        Segment {
+            at,
+            text: text.into(),
+            source: Some(src.into()),
+        }
+    }
+
+    #[test]
+    fn labelled_format_names_the_source_on_each_line() {
+        let segs = [seg_src(0.0, "hello", "Mic"), seg_src(5.0, "hi", "System")];
+        let out = render(&segs, "", Format::Labelled);
+        assert_eq!(out, "[00:00] [Mic] hello\n[00:05] [System] hi");
+    }
+
+    #[test]
+    fn labelled_format_omits_empty_brackets_for_a_single_source() {
+        // A one-source recording saved this way should not be littered with
+        // empty labels.
+        let segs = [seg(1.0, "hello")];
+        assert_eq!(render(&segs, "", Format::Labelled), "[00:01] hello");
+    }
+
+    #[test]
+    fn segments_group_by_source_in_first_appearance_order() {
+        let segs = [
+            seg_src(0.0, "a", "System"),
+            seg_src(1.0, "b", "Mic"),
+            seg_src(2.0, "c", "System"),
+        ];
+        let groups = by_source(&segs);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "System", "first heard should come first");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0, "Mic");
+    }
+
+    #[test]
+    fn source_names_become_safe_filenames() {
+        assert_eq!(slug("Yeti (RNNoise)"), "yeti-rnnoise");
+        assert_eq!(slug("Firefox — YouTube"), "firefox-youtube");
+        assert!(!slug("a/b\\c").contains('/'));
+    }
+
+    #[test]
+    fn a_very_long_source_name_is_truncated() {
+        assert!(slug(&"x".repeat(200)).len() <= 40);
     }
 
     #[test]

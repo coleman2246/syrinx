@@ -26,6 +26,8 @@ enum FormatArg {
     Plain,
     /// Each fragment prefixed with [MM:SS].
     Timestamped,
+    /// Time and source on each line, for several sources at once.
+    Labelled,
 }
 
 impl From<FormatArg> for save::Format {
@@ -33,6 +35,7 @@ impl From<FormatArg> for save::Format {
         match f {
             FormatArg::Plain => save::Format::Plain,
             FormatArg::Timestamped => save::Format::Timestamped,
+            FormatArg::Labelled => save::Format::Labelled,
         }
     }
 }
@@ -64,10 +67,14 @@ enum Cmd {
         /// What to do with the text. Defaults to the config file's setting.
         #[arg(long, value_enum)]
         mode: Option<ModeArg>,
-        /// Source to capture, as shown by `syrinx sources`. Defaults to the
-        /// remembered one, else a microphone.
+        /// Source to capture, as shown by `syrinx sources`. Repeat for
+        /// several. Defaults to the remembered one, else a microphone.
         #[arg(long)]
-        source: Option<String>,
+        source: Vec<String>,
+        /// Transcribe each source as its own stream, labelled, instead of
+        /// mixing them into one. Only the first source types at the cursor.
+        #[arg(long)]
+        separate: bool,
         /// Write the transcript to this file when the session ends.
         #[arg(long)]
         save: Option<PathBuf>,
@@ -78,6 +85,10 @@ enum Cmd {
         /// its time, which makes the transcript an index into the recording.
         #[arg(long, value_enum, default_value = "plain")]
         format: FormatArg,
+        /// With --separate, write one file per source instead of one combined
+        /// file.
+        #[arg(long)]
+        split: bool,
     },
     /// Stop a running session.
     Stop,
@@ -86,13 +97,17 @@ enum Cmd {
         #[arg(long, value_enum)]
         mode: Option<ModeArg>,
         #[arg(long)]
-        source: Option<String>,
+        source: Vec<String>,
+        #[arg(long)]
+        separate: bool,
         #[arg(long)]
         save: Option<PathBuf>,
         #[arg(long, conflicts_with = "save")]
         save_default: bool,
         #[arg(long, value_enum, default_value = "plain")]
         format: FormatArg,
+        #[arg(long)]
+        split: bool,
     },
     /// Report whether a session is active.
     Status,
@@ -196,29 +211,33 @@ fn main() -> Result<()> {
         Cmd::Toggle {
             mode,
             source,
+            separate,
             save,
             save_default,
             format,
+            split,
         } => {
             if let Some(pid) = state::running_pid(&pid_path) {
                 state::signal_stop(pid)?;
                 info!("stopping pid {pid}");
                 return Ok(());
             }
-            run(cli.config, mode, source, save, save_default, format.into(), pid_path)
+            run(cli.config, mode, source, separate, save, save_default, format.into(), split, pid_path)
         }
 
         Cmd::Start {
             mode,
             source,
+            separate,
             save,
             save_default,
             format,
+            split,
         } => {
             if let Some(pid) = state::running_pid(&pid_path) {
                 anyhow::bail!("already running (pid {pid})");
             }
-            run(cli.config, mode, source, save, save_default, format.into(), pid_path)
+            run(cli.config, mode, source, separate, save, save_default, format.into(), split, pid_path)
         }
     }
 }
@@ -227,32 +246,75 @@ fn main() -> Result<()> {
 fn run(
     config: Option<PathBuf>,
     mode: Option<ModeArg>,
-    source: Option<String>,
+    sources_wanted: Vec<String>,
+    separate: bool,
     save_to: Option<PathBuf>,
     save_default: bool,
     format: save::Format,
+    split: bool,
     pid_path: PathBuf,
 ) -> Result<()> {
     let cfg = Config::load(config)?;
     let mode = mode.map(OutputMode::from).unwrap_or(cfg.mode);
 
-    let sources = syrinx_client::list_sources()?;
-    let remembered = source.as_deref().or(cfg.source_key.as_deref());
-    let source = syrinx_client::choose_source(&sources, remembered)?;
+    let available = syrinx_client::list_sources()?;
+    let chosen: Vec<syrinx_client::Source> = if sources_wanted.is_empty() {
+        vec![syrinx_client::choose_source(
+            &available,
+            cfg.source_key.as_deref(),
+        )?]
+    } else {
+        let mut v = Vec::new();
+        for key in &sources_wanted {
+            v.push(
+                syrinx_client::resolve(&available, key)
+                    .with_context(|| format!("no source matching {key:?}"))?,
+            );
+        }
+        v
+    };
+    let source_mode = if separate {
+        syrinx_client::mode::SourceMode::Separate
+    } else {
+        syrinx_client::mode::SourceMode::Combined
+    };
 
     state::write_pid(&pid_path, std::process::id() as i32)?;
     state::refresh_waybar(cfg.waybar_signal);
 
-    let mut handle = syrinx_client::session::start(
-        SessionOptions {
-            url: cfg.url.clone(),
-            token: cfg.token.clone(),
-            source,
-            mode,
-        },
-        // The CLI has nothing to repaint, so state changes need no callback.
-        || {},
-    );
+    // Separate mode is one session per source; combined is one session fed by
+    // a mix. Only the first source may type, since several streams typing into
+    // one cursor interleave into nonsense.
+    let mut handles: Vec<syrinx_client::SessionHandle> = match source_mode {
+        syrinx_client::mode::SourceMode::Combined => vec![syrinx_client::session::start(
+            SessionOptions {
+                url: cfg.url.clone(),
+                token: cfg.token.clone(),
+                sources: chosen,
+                mode,
+                label: None,
+            },
+            // The CLI has nothing to repaint, so state changes need no callback.
+            || {},
+        )],
+        syrinx_client::mode::SourceMode::Separate => chosen
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let label = Some(s.short_label());
+                syrinx_client::session::start(
+                    SessionOptions {
+                        url: cfg.url.clone(),
+                        token: cfg.token.clone(),
+                        sources: vec![s],
+                        mode: if i == 0 { mode } else { OutputMode::Transcribe },
+                        label,
+                    },
+                    || {},
+                )
+            })
+            .collect(),
+    };
 
     // SIGTERM is how `stop` and `toggle` ask us to finish, and Ctrl-C is the
     // interactive equivalent. Handling them rather than dying lets the session
@@ -263,14 +325,16 @@ fn run(
         let _ = sig_tx.send(());
     });
 
-    while handle.is_running() {
+    while handles.iter().any(|h| h.is_running()) {
         if sig_rx.try_recv().is_ok() {
-            handle.stop();
+            for h in &mut handles {
+                h.stop();
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    let final_state = handle.state();
+    let final_state = merge_cli_states(&handles);
     state::clear_pid(&pid_path);
     state::refresh_waybar(cfg.waybar_signal);
 
@@ -280,13 +344,22 @@ fn run(
         // Saving uses the same code the GUI's Save button does, so the two
         // produce byte-identical files.
         if save_to.is_some() || save_default {
-            let p = save::save_rendered(
-                save_to.as_deref(),
-                &final_state.segments,
-                &final_state.transcript,
-                format,
-            )?;
-            eprintln!("saved to {}", p.display());
+            if split {
+                let base = save_to.clone().unwrap_or_else(|| {
+                    save::default_dir().join(save::filename_for(&save::timestamp()))
+                });
+                for p in save::save_per_source(&base, &final_state.segments, format)? {
+                    eprintln!("saved to {}", p.display());
+                }
+            } else {
+                let p = save::save_rendered(
+                    save_to.as_deref(),
+                    &final_state.segments,
+                    &final_state.transcript,
+                    format,
+                )?;
+                eprintln!("saved to {}", p.display());
+            }
         }
     } else if save_to.is_some() || save_default {
         // Asking to save in a mode that keeps no transcript is a mistake worth
@@ -345,7 +418,8 @@ fn run_daemon(
     syrinx_client::daemon::run(syrinx_client::daemon::DaemonOptions {
         config: cfg,
         mode,
-        source_key,
+        source_keys: source_key.into_iter().collect(),
+        source_mode: Default::default(),
         save_each,
         format,
         // Sits beside this binary, so a viewer opens from the same build.
@@ -474,4 +548,23 @@ fn run_transcribe(
         None => println!("{text}"),
     }
     Ok(())
+}
+
+/// Merge several concurrent sessions into one view, ordered by time.
+fn merge_cli_states(
+    handles: &[syrinx_client::SessionHandle],
+) -> syrinx_client::SessionState {
+    let states: Vec<_> = handles.iter().map(|h| h.state()).collect();
+    if states.len() == 1 {
+        return states[0].clone();
+    }
+    let mut segments: Vec<syrinx_client::session::Segment> =
+        states.iter().flat_map(|s| s.segments.clone()).collect();
+    // Ordering by time reconstructs what was said in what order across
+    // sources, which is the point of transcribing them separately.
+    segments.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = states.into_iter().next().unwrap_or_default();
+    out.transcript = save::render(&segments, "", save::Format::Labelled);
+    out.segments = segments;
+    out
 }

@@ -61,6 +61,27 @@ impl Source {
         }
     }
 
+    /// A compact name for tagging transcript lines.
+    ///
+    /// `display()` is built for a picker, where the full device name helps you
+    /// choose. It is far too long to prefix every line of a transcript with:
+    /// "Everything playing on Starship/Matisse HD Audio Controller Analog
+    /// Stereo (default output)" buries the words it is labelling.
+    pub fn short_label(&self) -> String {
+        match self.kind {
+            // Which output it came from rarely matters; that it was the system
+            // rather than a person does.
+            SourceKind::Monitor => "System audio".to_string(),
+            // The application name alone, not the tab title, which changes
+            // mid-recording and would make the same source look like several.
+            SourceKind::Application => self.name.clone(),
+            SourceKind::Microphone => {
+                let n = self.name.trim_end_matches(" (input)");
+                truncate(n, 24)
+            }
+        }
+    }
+
     /// A key worth persisting across runs.
     ///
     /// Node ids and device indices are renumbered constantly, so a remembered
@@ -145,6 +166,43 @@ mod tests {
         // Byte-slicing a multi-byte title would panic mid-character.
         let s = app("Firefox", Some(&"日本語のタイトル".repeat(20)));
         let _ = s.display();
+    }
+
+    #[test]
+    fn a_monitor_is_labelled_by_what_it_is_not_which_device() {
+        // Prefixing every line with the full sink name buries the words.
+        let s = Source {
+            target: SourceTarget::PipeWireNode(1),
+            name: "Everything playing on Starship/Matisse HD Audio Controller Analog Stereo                    (default output)"
+                .into(),
+            kind: SourceKind::Monitor,
+            detail: None,
+            stable_name: None,
+            sink_description: None,
+        };
+        assert_eq!(s.short_label(), "System audio");
+    }
+
+    #[test]
+    fn an_application_is_labelled_by_name_not_by_what_it_is_playing() {
+        // The tab title changes mid-recording; using it would make one source
+        // look like several.
+        let s = app("Firefox", Some("Some Very Long Video Title - YouTube"));
+        assert_eq!(s.short_label(), "Firefox");
+    }
+
+    #[test]
+    fn a_microphone_label_drops_the_input_suffix_and_is_bounded() {
+        let s = Source {
+            target: SourceTarget::PipeWireNode(1),
+            name: "Blue Microphones Analog Stereo (input)".into(),
+            kind: SourceKind::Microphone,
+            detail: None,
+            stable_name: None,
+            sink_description: None,
+        };
+        assert!(!s.short_label().contains("(input)"));
+        assert!(s.short_label().chars().count() <= 24);
     }
 
     #[test]

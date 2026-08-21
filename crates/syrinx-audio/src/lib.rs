@@ -27,6 +27,7 @@
 pub mod capture;
 pub mod link;
 pub mod meter;
+pub mod mixer;
 pub mod source;
 
 #[cfg(target_os = "linux")]

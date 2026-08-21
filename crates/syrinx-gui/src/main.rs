@@ -18,7 +18,7 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use syrinx_client::{
-    Config, OutputMode, Source, SourceKind, ipc,
+    Config, OutputMode, Source, SourceKind, ipc, mode::SourceMode,
     ipc::{DaemonState, Request, Response},
     save,
     session::Status,
@@ -185,11 +185,6 @@ impl App {
         }
         self.poll();
     }
-
-    fn selected_source(&self) -> Option<&Source> {
-        let key = self.state.source_key.as_deref()?;
-        self.sources.iter().find(|s| s.stable_key() == key)
-    }
 }
 
 impl eframe::App for App {
@@ -240,8 +235,6 @@ impl eframe::App for App {
             ui.colored_label(egui::Color32::from_rgb(120, 190, 120), s);
         }
 
-        // Poll steadily rather than only on interaction, since state changes
-        // originate in the daemon and the tray, not just here.
         ctx.request_repaint_after(POLL_INTERVAL);
     }
 }
@@ -324,17 +317,30 @@ impl App {
     }
 
     fn source_row(&mut self, ui: &mut egui::Ui, running: bool) {
-        let mut chosen: Option<String> = None;
+        // Checkboxes rather than a single selection: several sources can be
+        // active at once, and a combo box cannot express that.
+        let mut new_keys: Option<Vec<String>> = None;
+        let mut new_mode: Option<SourceMode> = None;
+        // Cloned so the combo box closure does not hold a borrow of self while
+        // also needing to mutate it.
+        let selected: Vec<String> = self.state.source_keys.clone();
+
         ui.horizontal(|ui| {
-            ui.label("Source:");
+            ui.label("Sources:");
             ui.add_enabled_ui(!running, |ui| {
-                let label = self
-                    .selected_source()
-                    .map(|s| s.display())
-                    .unwrap_or_else(|| "default".into());
-                egui::ComboBox::from_id_salt("source")
-                    .selected_text(label)
-                    .width(300.0)
+                let summary = match selected.len() {
+                    0 => "none".to_string(),
+                    1 => self
+                        .sources
+                        .iter()
+                        .find(|s| s.stable_key() == selected[0])
+                        .map(|s| s.display())
+                        .unwrap_or_else(|| selected[0].clone()),
+                    n => format!("{n} sources"),
+                };
+                egui::ComboBox::from_id_salt("sources")
+                    .selected_text(summary)
+                    .width(290.0)
                     .show_ui(ui, |ui| {
                         let mut last: Option<SourceKind> = None;
                         for s in &self.sources {
@@ -345,9 +351,16 @@ impl App {
                                 ui.weak(s.kind.label());
                                 last = Some(s.kind);
                             }
-                            let is = self.state.source_key.as_deref() == Some(&s.stable_key());
-                            if ui.selectable_label(is, s.display()).clicked() {
-                                chosen = Some(s.stable_key());
+                            let key = s.stable_key();
+                            let mut on = selected.contains(&key);
+                            if ui.checkbox(&mut on, s.display()).changed() {
+                                let mut keys = selected.clone();
+                                if on {
+                                    keys.push(key);
+                                } else {
+                                    keys.retain(|k| k != &key);
+                                }
+                                new_keys = Some(keys);
                             }
                         }
                         // An application exists in the graph only while it is
@@ -364,8 +377,36 @@ impl App {
                 }
             });
         });
-        if let Some(key) = chosen {
-            self.send(Request::SetSource { key });
+
+        // Only meaningful with more than one source, so it stays out of the way
+        // until it means something.
+        if selected.len() > 1 {
+            ui.horizontal(|ui| {
+                ui.add_space(56.0);
+                ui.add_enabled_ui(!running, |ui| {
+                    for m in SourceMode::ALL {
+                        if ui
+                            .selectable_label(self.state.source_mode == m, m.label())
+                            .on_hover_text(match m {
+                                SourceMode::Combined => "Mix into one stream",
+                                SourceMode::Separate => {
+                                    "One labelled stream each; only the first types"
+                                }
+                            })
+                            .clicked()
+                        {
+                            new_mode = Some(m);
+                        }
+                    }
+                });
+            });
+        }
+
+        if new_keys.is_some() || new_mode.is_some() {
+            self.send(Request::SetSources {
+                keys: new_keys.unwrap_or_else(|| selected.clone()),
+                source_mode: new_mode,
+            });
         }
     }
 
@@ -523,6 +564,7 @@ impl App {
                             .on_hover_text(match f {
                                 save::Format::Plain => "Continuous prose",
                                 save::Format::Timestamped => "Each fragment prefixed [MM:SS]",
+                                save::Format::Labelled => "Time and source on each line",
                             })
                             .clicked()
                         {
@@ -543,6 +585,17 @@ impl App {
                 });
             }
             let has_text2 = !self.state.transcript.trim().is_empty();
+            if self.state.source_mode == SourceMode::Separate
+                && self.state.source_keys.len() > 1
+                && ui
+                    .add_enabled(has_text2, egui::Button::new("Save split"))
+                    .on_hover_text("One file per source")
+                    .clicked()
+            {
+                action = Some(Request::SaveSplit {
+                    format: self.save_format,
+                });
+            }
             if ui
                 .add_enabled(has_text2 && !running, egui::Button::new("Clear"))
                 .on_hover_text("Discard the transcript")

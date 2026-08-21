@@ -51,6 +51,9 @@ pub struct Segment {
     /// Seconds since the session started.
     pub at: f64,
     pub text: String,
+    /// Which source produced this, when more than one is in play. `None` for a
+    /// single source or a combined mix, where attribution is meaningless.
+    pub source: Option<String>,
 }
 
 /// Everything a front-end needs to render. Cheap to clone.
@@ -77,8 +80,12 @@ pub struct SessionState {
 pub struct SessionOptions {
     pub url: String,
     pub token: String,
-    pub source: Source,
+    /// Sources to capture. More than one is mixed into a single stream; for
+    /// independent streams the caller runs a session per source.
+    pub sources: Vec<Source>,
     pub mode: OutputMode,
+    /// Label applied to this session's segments, for separate mode.
+    pub label: Option<String>,
 }
 
 /// Handle to a running session. Dropping it stops the session.
@@ -231,16 +238,30 @@ async fn run(
     let started = std::time::Instant::now();
 
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(32);
-    let _capture = Capture::start(&opts.source, audio_tx).context("starting audio capture")?;
+    // One source opens directly; several are mixed. A single source through the
+    // mixer would work but adds a queue and a timer for nothing.
+    let _capture: Box<dyn std::any::Any + Send> = if opts.sources.len() == 1 {
+        Box::new(Capture::start(&opts.sources[0], audio_tx).context("starting audio capture")?)
+    } else {
+        Box::new(
+            syrinx_audio::mixer::MixedCapture::start(&opts.sources, audio_tx)
+                .context("starting the combined capture")?,
+        )
+    };
     info!(
         "session running: {} -> {}",
-        opts.source.display(),
+        opts.sources
+            .iter()
+            .map(|s| s.display())
+            .collect::<Vec<_>>()
+            .join(" + "),
         opts.mode.label()
     );
 
     let st = state.clone();
     let n = notify.clone();
     let mode = opts.mode;
+    let label = opts.label.clone();
     let reader = tokio::spawn(async move {
         while let Some(Ok(msg)) = rx.next().await {
             let Ws::Text(t) = msg else { continue };
@@ -258,6 +279,7 @@ async fn run(
                         s.segments.push(Segment {
                             at: started.elapsed().as_secs_f64(),
                             text: text.clone(),
+                            source: label.clone(),
                         });
                     }
                     s.last_fragment = text;
@@ -286,6 +308,7 @@ async fn run(
                     s.segments.push(Segment {
                         at: started.elapsed().as_secs_f64(),
                         text: text.clone(),
+                        source: label.clone(),
                     });
                     drop(s);
                     n();

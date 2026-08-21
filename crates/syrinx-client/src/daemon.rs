@@ -20,7 +20,10 @@ use tracing::{error, info, warn};
 pub struct DaemonOptions {
     pub config: Config,
     pub mode: OutputMode,
-    pub source_key: Option<String>,
+    /// Selected sources, in order. The first is the one that types at the
+    /// cursor in separate mode.
+    pub source_keys: Vec<String>,
+    pub source_mode: crate::mode::SourceMode,
     /// Save each session automatically as it ends.
     pub save_each: bool,
     pub format: save::Format,
@@ -83,7 +86,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
 
     let mut state = DaemonRuntime {
         opts,
-        session: None,
+        sessions: Vec::new(),
         overlay: None,
         file_job: None,
         preview: None,
@@ -94,11 +97,11 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     // Resolve the source up front so viewers show what would actually be used
     // rather than the word "default". Enumerating is a subprocess call, so it
     // happens once here rather than on every state poll.
-    if state.opts.source_key.is_none()
+    if state.opts.source_keys.is_empty()
         && let Ok(sources) = list_sources()
         && let Ok(s) = choose_source(&sources, None)
     {
-        state.opts.source_key = Some(s.stable_key());
+        state.opts.source_keys = vec![s.stable_key()];
     }
     let mut quit = false;
 
@@ -143,8 +146,21 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                     Response::Ok
                 }
                 Request::SetSource { key } => {
-                    state.opts.source_key = Some(key);
+                    state.opts.source_keys = vec![key];
                     Response::Ok
+                }
+                Request::SetSources { keys, source_mode } => {
+                    if state.running() {
+                        Response::Error {
+                            message: "stop the session before changing sources".into(),
+                        }
+                    } else {
+                        state.opts.source_keys = keys;
+                        if let Some(m) = source_mode {
+                            state.opts.source_mode = m;
+                        }
+                        Response::Ok
+                    }
                 }
                 Request::SetUrl { url } => {
                     // Sessions read the URL at start, so this takes effect on
@@ -160,6 +176,14 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                 },
                 Request::TranscribeFile { path } => match state.transcribe_file(&path) {
                     Ok(()) => Response::Ok,
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Request::SaveSplit { format } => match state.save_split(format) {
+                    Ok(paths) => Response::Saved {
+                        path: paths.join(", "),
+                    },
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),
                     },
@@ -266,7 +290,8 @@ struct FileJob {
 
 struct DaemonRuntime {
     opts: DaemonOptions,
-    session: Option<SessionHandle>,
+    /// Running sessions. One in combined mode, one per source in separate mode.
+    sessions: Vec<SessionHandle>,
     /// The level overlay, shown only for typing sessions.
     overlay: Option<std::process::Child>,
     /// Live level meter, running only while idle and only while a viewer is
@@ -289,7 +314,7 @@ struct DaemonRuntime {
 
 impl DaemonRuntime {
     fn running(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| s.is_running())
+        self.sessions.iter().any(|s| s.is_running())
     }
 
     /// Start, stop or re-point the level meter.
@@ -310,7 +335,7 @@ impl DaemonRuntime {
             return;
         }
 
-        let key = self.opts.source_key.clone();
+        let key = self.opts.source_keys.first().cloned();
         // Re-point when the selection changes, so the meter always shows what
         // pressing Start would actually record.
         let stale = match (&self.preview, &key) {
@@ -338,12 +363,18 @@ impl DaemonRuntime {
     fn snapshot(&self) -> DaemonState {
         // Falls back to the last finished session rather than to an empty
         // default, so a stopped transcript stays on screen.
-        let s = self
-            .session
-            .as_ref()
-            .map(|s| s.state())
-            .unwrap_or_else(|| self.last.clone());
-        let mut out = DaemonState::from_session(&s, self.opts.mode, self.opts.source_key.clone());
+        let s = if self.sessions.is_empty() {
+            self.last.clone()
+        } else {
+            merge_states(&self.sessions.iter().map(|s| s.state()).collect::<Vec<_>>())
+        };
+        let mut out = DaemonState::from_session(
+            &s,
+            self.opts.mode,
+            self.opts.source_keys.first().cloned(),
+        );
+        out.source_keys = self.opts.source_keys.clone();
+        out.source_mode = self.opts.source_mode;
 
         // A file job owns the status while it runs, so a viewer shows progress
         // rather than an idle window with nothing happening.
@@ -369,40 +400,82 @@ impl DaemonRuntime {
         if self.running() {
             return;
         }
-        let sources = match list_sources() {
+        let available = match list_sources() {
             Ok(s) => s,
             Err(e) => {
                 error!("listing sources: {e:#}");
                 return;
             }
         };
-        let source = match choose_source(&sources, self.opts.source_key.as_deref()) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("choosing a source: {e:#}");
-                return;
+
+        // Resolve every remembered key; anything that has gone away is skipped
+        // rather than failing the whole start.
+        let mut resolved: Vec<crate::Source> = Vec::new();
+        for key in &self.opts.source_keys {
+            match crate::resolve(&available, key) {
+                Some(s) => resolved.push(s),
+                None => warn!("source {key} is no longer present; skipping"),
             }
-        };
-        // Remember what was actually used, so a viewer shows the real source
-        // rather than the preference that may not have resolved.
-        self.opts.source_key = Some(source.stable_key());
+        }
+        if resolved.is_empty() {
+            match choose_source(&available, None) {
+                Ok(s) => resolved.push(s),
+                Err(e) => {
+                    error!("choosing a source: {e:#}");
+                    return;
+                }
+            }
+        }
+        self.opts.source_keys = resolved.iter().map(|s| s.stable_key()).collect();
+
         // A new session starts from a blank transcript; the previous one has
         // had its chance to be read and saved.
         self.last = Default::default();
         self.start_overlay();
-        self.session = Some(crate::session::start(
-            SessionOptions {
-                url: self.opts.config.url.clone(),
-                token: self.opts.config.token.clone(),
-                source,
-                mode: self.opts.mode,
-            },
-            || {},
-        ));
+
+        let (url, token) = (self.opts.config.url.clone(), self.opts.config.token.clone());
+        match self.opts.source_mode {
+            crate::mode::SourceMode::Combined => {
+                self.sessions.push(crate::session::start(
+                    SessionOptions {
+                        url,
+                        token,
+                        sources: resolved,
+                        mode: self.opts.mode,
+                        // Attribution is meaningless once mixed.
+                        label: None,
+                    },
+                    || {},
+                ));
+            }
+            crate::mode::SourceMode::Separate => {
+                for (i, source) in resolved.into_iter().enumerate() {
+                    // Only the first source may type: several streams typing
+                    // into one cursor interleave into nonsense. The rest are
+                    // transcribed and labelled.
+                    let mode = if i == 0 {
+                        self.opts.mode
+                    } else {
+                        OutputMode::Transcribe
+                    };
+                    let label = Some(source.short_label());
+                    self.sessions.push(crate::session::start(
+                        SessionOptions {
+                            url: url.clone(),
+                            token: token.clone(),
+                            sources: vec![source],
+                            mode,
+                            label,
+                        },
+                        || {},
+                    ));
+                }
+            }
+        }
     }
 
     fn stop(&mut self) {
-        if let Some(s) = &mut self.session {
+        for s in &mut self.sessions {
             s.stop();
         }
     }
@@ -540,11 +613,11 @@ impl DaemonRuntime {
     }
 
     fn save(&self, format: save::Format, path: Option<&str>) -> Result<String> {
-        let st = self
-            .session
-            .as_ref()
-            .map(|s| s.state())
-            .unwrap_or_else(|| self.last.clone());
+        let st = if self.sessions.is_empty() {
+            self.last.clone()
+        } else {
+            merge_states(&self.sessions.iter().map(|s| s.state()).collect::<Vec<_>>())
+        };
         let p = save::save_rendered(
             path.map(std::path::Path::new),
             &st.segments,
@@ -552,6 +625,20 @@ impl DaemonRuntime {
             format,
         )?;
         Ok(p.display().to_string())
+    }
+
+    /// Save one file per source, returning the paths written.
+    fn save_split(&self, format: save::Format) -> Result<Vec<String>> {
+        let st = if self.sessions.is_empty() {
+            self.last.clone()
+        } else {
+            merge_states(&self.sessions.iter().map(|s| s.state()).collect::<Vec<_>>())
+        };
+        let base = save::default_dir().join(save::filename_for(&save::timestamp()));
+        Ok(save::save_per_source(&base, &st.segments, format)?
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect())
     }
 
     /// Launch a viewer window.
@@ -568,11 +655,10 @@ impl DaemonRuntime {
 
     /// Notice a session that ended on its own, saving it if asked.
     fn reap_finished_session(&mut self) {
-        let Some(s) = &self.session else { return };
-        if s.is_running() {
+        if self.sessions.is_empty() || self.running() {
             return;
         }
-        let st = s.state();
+        let st = merge_states(&self.sessions.iter().map(|s| s.state()).collect::<Vec<_>>());
         if self.opts.save_each && self.opts.mode.keeps_transcript() {
             match save::save_rendered(None, &st.segments, &st.transcript, self.opts.format) {
                 Ok(p) => info!("saved to {}", p.display()),
@@ -585,7 +671,47 @@ impl DaemonRuntime {
         }
         // Keep the finished transcript visible and saveable.
         self.last = st;
-        self.session = None;
+        self.sessions.clear();
         self.stop_overlay();
     }
+}
+
+/// Fold several concurrent sessions into one view.
+///
+/// Segments carry their own timings, so ordering them by time reconstructs what
+/// was actually said in what order across sources -- which is the point of
+/// separate mode. The flat transcript follows that same order so a viewer reads
+/// a conversation rather than one speaker then the other.
+fn merge_states(states: &[crate::session::SessionState]) -> crate::session::SessionState {
+    if states.len() == 1 {
+        return states[0].clone();
+    }
+    let mut out = crate::session::SessionState {
+        // Active if any session is; the aggregate is running until all stop.
+        status: states
+            .iter()
+            .map(|s| s.status)
+            .find(|s| s.is_active())
+            .unwrap_or_default(),
+        model: states.iter().find_map(|s| s.model.clone()),
+        chunk_ms: states.iter().find_map(|s| s.chunk_ms),
+        error: states.iter().find_map(|s| s.error.clone()),
+        // Levels come from the first source; a merged spectrum would say less
+        // than one real one.
+        levels: states.first().map(|s| s.levels.clone()).unwrap_or_default(),
+        rms: states.first().map(|s| s.rms).unwrap_or(0.0),
+        last_fragment: states
+            .iter()
+            .map(|s| s.last_fragment.clone())
+            .find(|f| !f.is_empty())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+
+    let mut segments: Vec<crate::session::Segment> =
+        states.iter().flat_map(|s| s.segments.clone()).collect();
+    segments.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
+    out.transcript = crate::save::render(&segments, "", crate::save::Format::Labelled);
+    out.segments = segments;
+    out
 }

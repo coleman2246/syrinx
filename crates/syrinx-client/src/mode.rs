@@ -106,3 +106,51 @@ mod tests {
         assert_eq!(l.len(), n);
     }
 }
+
+/// How several selected sources are handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceMode {
+    /// Mix every source into one stream and transcribe it as one.
+    #[default]
+    Combined,
+    /// One independent session per source, each transcribed separately and
+    /// labelled by where it came from.
+    Separate,
+}
+
+impl SourceMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceMode::Combined => "Combined",
+            SourceMode::Separate => "Separate",
+        }
+    }
+
+    pub const ALL: [SourceMode; 2] = [SourceMode::Combined, SourceMode::Separate];
+}
+
+#[cfg(test)]
+mod source_mode_tests {
+    use super::*;
+
+    #[test]
+    fn source_modes_round_trip() {
+        for m in SourceMode::ALL {
+            let s = serde_json::to_string(&m).unwrap();
+            assert_eq!(serde_json::from_str::<SourceMode>(&s).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn combined_is_the_default() {
+        // One stream is what a single source already does, so it is the
+        // behaviour that does not change when a second is added.
+        assert_eq!(SourceMode::default(), SourceMode::Combined);
+    }
+
+    #[test]
+    fn labels_are_distinct() {
+        assert_ne!(SourceMode::Combined.label(), SourceMode::Separate.label());
+    }
+}

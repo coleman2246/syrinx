@@ -30,12 +30,19 @@ pub enum Request {
     Toggle,
     SetMode { mode: OutputMode },
     SetSource { key: String },
+    /// Replace the whole selection, and optionally how they are combined.
+    SetSources {
+        keys: Vec<String>,
+        source_mode: Option<crate::mode::SourceMode>,
+    },
     /// Point the daemon at a different server. Applies to the next session.
     SetUrl { url: String },
     /// Save the current transcript, returning the path written.
     Save { format: Format, path: Option<String> },
     /// Transcribe an audio file, replacing the current transcript.
     TranscribeFile { path: String },
+    /// Save one file per source. Separate mode only.
+    SaveSplit { format: Format },
     /// Discard the retained transcript.
     Clear,
     /// Stop the daemon entirely.
@@ -64,8 +71,13 @@ pub struct DaemonState {
     pub model: Option<String>,
     pub chunk_ms: Option<u32>,
     pub error: Option<String>,
-    /// Stable key of the source in use, so a viewer can show and change it.
+    /// Stable key of the first source, kept for viewers that show only one.
     pub source_key: Option<String>,
+    /// Every selected source, in order.
+    #[serde(default)]
+    pub source_keys: Vec<String>,
+    #[serde(default)]
+    pub source_mode: crate::mode::SourceMode,
     /// Ten-band spectrum of the selected source, for confirming there is signal
     /// before starting. Zeroed when nothing is being metered.
     #[serde(default)]
@@ -90,6 +102,8 @@ impl DaemonState {
             chunk_ms: s.chunk_ms,
             error: s.error.clone(),
             source_key,
+            source_keys: Vec::new(),
+            source_mode: Default::default(),
             // A running session meters its own audio; the daemon overwrites
             // these from the idle preview when there is no session.
             levels: s.levels.clone(),
