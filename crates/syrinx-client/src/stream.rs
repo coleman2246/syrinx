@@ -344,8 +344,14 @@ mod tests {
     #[test]
     fn an_unwritable_path_fails_at_open_not_mid_session() {
         // Better to refuse at start than to discover it after an hour of
-        // talking.
-        let e = StreamWriter::open(Path::new("/proc/version"), Format::Plain);
-        assert!(e.is_err(), "writing into /proc should not succeed");
+        // talking. A directory is the portable way to be unwritable-as-a-file:
+        // this used to point at /proc/version, which on Windows is not
+        // protected but simply absent, so the test created C:\proc\version
+        // and passed for the wrong reason.
+        let dir = scratch("unwritable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = StreamWriter::open(&dir, Format::Plain);
+        assert!(e.is_err(), "opening a directory as a file should fail");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
