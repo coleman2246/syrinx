@@ -74,6 +74,16 @@ points at a zero-length reparse point that cannot be spawned even though
 `ffmpeg -version` works in a shell; put the real `bin` directory on PATH
 instead.
 
+### Reaching the server
+
+The client is thin: no model, no GPU work, just audio out and text back. Point
+`url` at the machine running the server.
+
+The server binds to `127.0.0.1` by default, which no other machine can reach.
+For a remote client set `bind = "0.0.0.0:8770"` in the **server's** config.
+Authentication is the shared `token` and nothing else -- there is no TLS -- so
+this belongs on a trusted network only.
+
 ### Building
 
 ```powershell
