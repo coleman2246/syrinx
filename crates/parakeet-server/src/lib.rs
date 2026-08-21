@@ -10,7 +10,9 @@
 //! That split is deliberate: it is what allows the session lifecycle, mode
 //! invariants, auth and backpressure to run in CI on a machine with no CUDA.
 
+pub mod app;
 pub mod asr;
 pub mod auth;
 pub mod config;
 pub mod session;
+pub mod ws;
