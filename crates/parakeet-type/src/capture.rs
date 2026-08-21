@@ -35,7 +35,7 @@ pub fn start(tx: mpsc::Sender<Vec<f32>>) -> Result<cpal::Stream> {
     // falls through -- an earlier version assumed PipeWire would simply
     // negotiate 16 kHz and sent 48 kHz audio to a 16 kHz model, which does not
     // fail loudly, it just transcribes badly.
-    let chosen = native_16k_config(&device).unwrap_or_else(|| default.clone());
+    let chosen = native_16k_config(&device).unwrap_or(default);
 
     let channels = chosen.channels();
     // cpal 0.18: SampleRate is a plain u32.
