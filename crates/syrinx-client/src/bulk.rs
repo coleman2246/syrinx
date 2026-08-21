@@ -44,7 +44,7 @@ pub fn decode(path: &Path) -> Result<Vec<f32>> {
             "-",
         ])
         .output()
-        .context("running ffmpeg (is it installed?)")?;
+        .map_err(ffmpeg_spawn_error)?;
 
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -55,6 +55,23 @@ pub fn decode(path: &Path) -> Result<Vec<f32>> {
         bail!("{} contains no audio", path.display());
     }
     Ok(samples)
+}
+
+/// Explain why ffmpeg could not be started.
+///
+/// "is it installed?" was the whole message, which is wrong whenever it is
+/// installed but unreachable -- and on Windows that is common: winget puts a
+/// zero-length reparse point on PATH, and spawning through it fails with
+/// "untrusted mount point" even though `ffmpeg -version` works in a shell.
+/// Being told to install what you already installed sends you the wrong way.
+fn ffmpeg_spawn_error(e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return anyhow::anyhow!("ffmpeg is not on PATH. Install it to transcribe files.");
+    }
+    anyhow::Error::new(e).context(
+        "could not run ffmpeg. It appears to be on PATH but could not be started; \
+         if PATH points at a shim or symlink, put the real ffmpeg directory on PATH instead",
+    )
 }
 
 /// Duration of a decoded buffer, in seconds.
@@ -187,6 +204,22 @@ mod tests {
     fn a_missing_file_is_a_clear_error() {
         let e = decode(Path::new("/nonexistent/audio.mp3")).unwrap_err();
         assert!(e.to_string().contains("no such file"), "got {e}");
+    }
+
+    #[test]
+    fn a_missing_ffmpeg_says_to_install_it() {
+        let e = ffmpeg_spawn_error(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(format!("{e:#}").contains("not on PATH"), "got {e:#}");
+    }
+
+    #[test]
+    fn an_unreachable_ffmpeg_does_not_say_to_install_it() {
+        // The winget shim case: telling the user to install what they have
+        // installed sends them looking in the wrong place.
+        let e = ffmpeg_spawn_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let text = format!("{e:#}");
+        assert!(!text.contains("Install it"), "got {text}");
+        assert!(text.contains("shim or symlink"), "got {text}");
     }
 
     #[test]
