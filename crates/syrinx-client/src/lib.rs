@@ -8,6 +8,7 @@ pub mod bulk;
 pub mod config;
 pub mod daemon;
 pub mod ipc;
+pub mod hotkey;
 pub mod inject;
 pub mod mode;
 pub mod preview;
@@ -21,6 +22,10 @@ pub mod tray;
 /// Typing at the cursor on Windows. See `inject::Method::SendInput`.
 #[cfg(windows)]
 pub mod windows_input;
+
+/// The Windows tray icon and global hotkey, which share a message loop.
+#[cfg(windows)]
+pub mod windows_ui;
 
 pub use config::Config;
 pub use mode::OutputMode;
