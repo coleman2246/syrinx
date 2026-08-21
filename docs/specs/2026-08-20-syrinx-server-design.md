@@ -837,3 +837,27 @@ dictation over `wss://` works (15x real time), an untrusted issuer is refused
 with `UnknownIssuer`, and a hostname the certificate does not cover is refused.
 A TLS client that accepted anything would be worse than no TLS, because it
 would look safe.
+
+
+## The address is used exactly as written (2026-08-21)
+
+The host-not-URL change traded four things to get right for one, and that was
+the right trade until TLS arrived. Then a bare `dictate.example.com` became
+`ws://dictate.example.com:8770/v1/stream` -- plaintext, on a port nginx does
+not listen on -- when what was meant was `wss://` on 443. The rules were
+written to be dull rather than clever, and they still guessed wrong, because
+the information needed was never in the input.
+
+So the inference is gone. `url` is dialled exactly as written, `server` remains
+an accepted name for the same setting, and an address without a scheme is an
+error reported against the config file rather than a URL invented on the user's
+behalf. Validation, never substitution.
+
+This is worth remembering as a shape: a convenience that cannot be overridden
+is not a convenience. The escape hatch existed -- a separate `url` field -- but
+it was documented as being for unusual cases, so the obvious setting silently
+did the wrong thing while the correct one looked exotic.
+
+Raising `rust-version` to the truthful 1.88 in the same change enabled two
+clippy lints the understated 1.85 had been suppressing (`as_chunks`,
+`is_multiple_of`), both now fixed.

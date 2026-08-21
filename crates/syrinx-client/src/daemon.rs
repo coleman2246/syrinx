@@ -260,11 +260,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                 Request::SetServer { server } => {
                     // Sessions read the URL at start, so this takes effect on
                     // the next one rather than disturbing a running session.
-                    state.opts.config.server = server;
-                    // A host given explicitly replaces any full-URL override,
-                    // which would otherwise silently win and leave the client
-                    // pointed at the old machine.
-                    state.opts.config.url = None;
+                    state.opts.config.url = server;
                     Response::Ok
                 }
                 Request::Save { format, path } => match state.save(format, path.as_deref()) {
@@ -534,7 +530,7 @@ impl DaemonRuntime {
         self.last = Default::default();
         self.start_overlay();
 
-        let (url, token) = (self.opts.config.url(), self.opts.config.token.clone());
+        let (url, token) = (self.opts.config.url.clone(), self.opts.config.token.clone());
         let inject = self.opts.config.inject;
         // Shared by every session in separate mode. The file is opened for
         // append, so each write lands at the end atomically and fragments
@@ -646,7 +642,7 @@ impl DaemonRuntime {
         let samples = crate::bulk::decode(std::path::Path::new(path))?;
         let job = Arc::new(Mutex::new(FileJob::default()));
         self.file_job = Some(job.clone());
-        let (url, token) = (self.opts.config.url(), self.opts.config.token.clone());
+        let (url, token) = (self.opts.config.url.clone(), self.opts.config.token.clone());
 
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()

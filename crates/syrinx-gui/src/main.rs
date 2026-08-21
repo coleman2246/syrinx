@@ -451,7 +451,7 @@ impl App {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.url_edit)
                     .desired_width(280.0)
-                    .hint_text("192.168.1.10  or  laptop.lan"),
+                    .hint_text("ws://192.168.1.10:8770/v1/stream"),
             );
             let submitted =
                 resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -471,7 +471,7 @@ impl App {
             if (submitted || apply) && !running {
                 match self.apply_server() {
                     Ok(()) => {
-                        self.status_line = Some(format!("Server set to {}", self.config.server));
+                        self.status_line = Some(format!("Server set to {}", self.config.url));
                         self.editing_url = false;
                     }
                     Err(e) => self.status_line = Some(format!("{e:#}")),
@@ -484,10 +484,7 @@ impl App {
     /// Normalise, persist, and hand the new address to the daemon.
     fn apply_server(&mut self) -> Result<()> {
         let server = normalise_server(&self.url_edit)?;
-        self.config.server = server.clone();
-        // A full-URL override would otherwise keep winning, leaving the client
-        // on the old machine while the field showed the new one.
-        self.config.url = None;
+        self.config.url = server.clone();
         self.config.save(&Config::default_path())?;
         // The daemon holds its own copy, so telling it is what actually takes
         // effect; writing the file only makes it survive a restart.
@@ -970,14 +967,20 @@ impl App {
                 action = Some(Request::Clear);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // The host is what identifies the server; the rest is noise
-                // that was only ever there because the config demanded it.
+                // Shortened for the corner of a window; the full address is
+                // in the tooltip and in the edit field.
+                let short = self
+                    .config
+                    .url
+                    .trim_start_matches("ws://")
+                    .trim_start_matches("wss://")
+                    .trim_end_matches("/v1/stream");
                 if ui
-                    .link(&self.config.server)
-                    .on_hover_text(format!("{}\nclick to change", self.config.url()))
+                    .link(short)
+                    .on_hover_text(format!("{}\nclick to change", self.config.url))
                     .clicked()
                 {
-                    self.url_edit = self.config.server.clone();
+                    self.url_edit = self.config.url.clone();
                     self.editing_url = true;
                 }
             });
@@ -994,28 +997,26 @@ impl App {
 ///
 /// Typing just an IP is the common case, and failing on it would be needless
 /// friction when the rest of the address is always the same.
-/// Reduce whatever was typed to a host, or a host and port.
+/// Check a typed address without rewriting it.
 ///
-/// A pasted URL is accepted and stripped back: the field asks for a machine,
-/// but people paste what they have, and refusing it would be pedantry.
+/// Whitespace is trimmed and nothing else changes. This field used to reduce
+/// whatever was typed to a bare host and rebuild the URL around it, which is
+/// convenient until it guesses wrong -- and then there is no way to type what
+/// you actually meant.
 fn normalise_server(input: &str) -> Result<String> {
-    let mut s = input.trim();
+    let s = input.trim();
     if s.is_empty() {
-        anyhow::bail!("enter the machine the server is running on");
+        anyhow::bail!("enter the server address, e.g. ws://192.168.1.10:8770/v1/stream");
     }
-    for scheme in ["ws://", "wss://", "http://", "https://"] {
-        if let Some(rest) = s.strip_prefix(scheme) {
-            s = rest;
-            break;
-        }
-    }
-    // Drop any path: the endpoint is not the user's to choose here.
-    let s = s.split('/').next().unwrap_or(s).trim();
-    if s.is_empty() {
-        anyhow::bail!("enter the machine the server is running on");
+    if !(s.starts_with("ws://") || s.starts_with("wss://")) {
+        anyhow::bail!("the address needs a ws:// or wss:// scheme");
     }
     if s.contains(char::is_whitespace) {
-        anyhow::bail!("a host cannot contain spaces");
+        anyhow::bail!("an address cannot contain spaces");
+    }
+    let rest = s.split_once("://").map(|(_, r)| r).unwrap_or("");
+    if rest.is_empty() || rest.starts_with('/') {
+        anyhow::bail!("the address names no host");
     }
     Ok(s.to_string())
 }
@@ -1025,49 +1026,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_bare_host_is_kept_as_typed() {
-        // The field asks for a machine, and that is all it should store.
-        assert_eq!(normalise_server("192.168.1.20").unwrap(), "192.168.1.20");
-        assert_eq!(normalise_server("laptop.lan").unwrap(), "laptop.lan");
-    }
-
-    #[test]
-    fn a_host_and_port_keeps_the_port() {
-        assert_eq!(
-            normalise_server("gpu-host.home.arpa:9000").unwrap(),
-            "gpu-host.home.arpa:9000"
-        );
-    }
-
-    #[test]
-    fn a_pasted_url_is_reduced_to_its_host() {
-        // People paste what they have; stripping it beats rejecting it.
-        for input in [
-            "ws://192.168.1.20:8770/v1/stream",
-            "http://192.168.1.20:8770",
-            "https://192.168.1.20:8770/anything",
+    fn a_full_address_survives_untouched() {
+        for a in [
+            "ws://192.168.1.10:8770/v1/stream",
+            "wss://dictate.example.com/v1/stream",
+            "ws://localhost:9000/some/other/path",
         ] {
-            let out = normalise_server(input).unwrap();
-            assert!(
-                out.starts_with("192.168.1.20"),
-                "{input} became {out}"
-            );
-            assert!(!out.contains("://"), "{input} kept its scheme: {out}");
-            assert!(!out.contains('/'), "{input} kept a path: {out}");
+            assert_eq!(normalise_server(a).unwrap(), a);
         }
     }
 
     #[test]
-    fn surrounding_whitespace_is_ignored() {
-        assert_eq!(normalise_server("  10.0.0.5  ").unwrap(), "10.0.0.5");
+    fn surrounding_whitespace_is_trimmed_and_nothing_else() {
+        assert_eq!(
+            normalise_server("  ws://h:1/v1/stream  ").unwrap(),
+            "ws://h:1/v1/stream"
+        );
     }
 
     #[test]
-    fn an_empty_address_is_an_error() {
-        assert!(normalise_server("").is_err());
-        assert!(normalise_server("   ").is_err());
-        // A scheme and nothing else names no machine.
-        assert!(normalise_server("ws://").is_err());
+    fn an_incomplete_address_is_refused() {
+        // These used to be repaired into a URL. Refusing is the point: a
+        // guess that lands somewhere unintended is worse than a complaint.
+        for bad in ["", "   ", "10.0.0.5", "dictate.example.com", "ws://", "ws:///v1/stream"] {
+            assert!(normalise_server(bad).is_err(), "{bad:?} should be refused");
+        }
     }
 
     #[test]
@@ -1076,13 +1059,16 @@ mod tests {
     }
 
     #[test]
-    fn what_the_field_accepts_is_what_the_config_can_use() {
-        // The two halves must agree, or the GUI would save something that
-        // does not resolve to the server the user just typed.
-        let host = normalise_server("  ws://laptop.lan:9000/v1/stream ").unwrap();
-        assert_eq!(
-            syrinx_client::config::server_url(&host),
-            "ws://laptop.lan:9000/v1/stream"
-        );
+    fn the_field_does_not_rewrite_what_was_typed() {
+        // It used to reduce an address to a bare host and rebuild the URL.
+        let typed = "wss://dictate.example.com/v1/stream";
+        assert_eq!(normalise_server(typed).unwrap(), typed);
     }
+
+    #[test]
+    fn an_address_without_a_scheme_is_refused() {
+        assert!(normalise_server("192.168.1.10").is_err());
+        assert!(normalise_server("dictate.example.com").is_err());
+    }
+
 }

@@ -13,9 +13,14 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// A trailing odd byte is dropped rather than panicking, since network frames
 /// can split mid-sample.
 pub fn pcm_s16le_to_f32(bytes: &[u8]) -> Vec<f32> {
+    // as_chunks gives fixed-size arrays, so from_le_bytes needs no indexing
+    // and no bounds check. The remainder is dropped, which is the documented
+    // behaviour: a trailing odd byte is half a sample.
     bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c) as f32 / 32768.0)
         .collect()
 }
 
@@ -49,7 +54,7 @@ pub fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
         return samples.to_vec();
     }
 
-    if from_rate % SAMPLE_RATE == 0 {
+    if from_rate.is_multiple_of(SAMPLE_RATE) {
         let factor = (from_rate / SAMPLE_RATE) as usize;
         return samples
             .chunks_exact(factor)

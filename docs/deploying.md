@@ -90,12 +90,13 @@ If nothing else is on 80 and 443, skip nginx entirely and use
 ## 6. Point the clients at it
 
 ```toml
-server = "wss://dictate.example.com"
-token  = "the token from step 3"
+url   = "wss://dictate.example.com/v1/stream"
+token = "the token from step 3"
 ```
 
-On the LAN, `server = "192.168.1.10"` still works if the port is published
-there.
+The address is used exactly as written — no port, because `wss://` means 443.
+On the LAN it would be `url = "ws://192.168.1.10:8770/v1/stream"`, if the port
+is published there.
 
 ## Updating
 

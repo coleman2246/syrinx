@@ -153,10 +153,10 @@ the host: 80 is not optional, it is how the certificate is issued and renewed.
 Then point the client at it:
 
 ```toml
-server = "wss://dictate.example.com"
+url = "wss://dictate.example.com/v1/stream"
 ```
 
-No port needed; `wss://` means 443. The client validates the certificate chain
+No port, because `wss://` means 443. The client validates the certificate chain
 against the platform trust store and refuses on a bad one — verified against a
 private CA: an untrusted issuer fails with `UnknownIssuer` rather than
 connecting anyway.
@@ -294,14 +294,21 @@ The client is thin: no model, no GPU work, just audio out and text back. Name
 the machine the server is on:
 
 ```toml
-server = "192.168.1.10"     # or a hostname: laptop.lan
+url = "ws://192.168.1.10:8770/v1/stream"
 ```
 
-Just the host. Syrinx supplies the port and the endpoint, so there is nothing
-to memorise and one thing to change when the server moves. Append a port
-(`laptop.lan:9000`) if it is not on the default. A complete `url = "..."`
-still works as an override, for a reverse proxy on a path syrinx would not
-choose.
+Written out in full and used exactly as given: scheme, host, port, path.
+Nothing is inferred.
+
+syrinx used to accept a bare host and build the URL around it. That is
+convenient right up to the first address it gets wrong — a bare
+`dictate.example.com` became `ws://dictate.example.com:8770/v1/stream`, which
+is plaintext on the wrong port when what you meant was `wss://` on 443, and
+there was no way to say so. A setting you cannot override is worse than one
+you have to type.
+
+`server = "..."` is accepted as a name for the same setting, so older configs
+keep working.
 
 The server binds to `127.0.0.1` by default, which no other machine can reach.
 For a remote client set `bind = "0.0.0.0:8770"` in the **server's** config.
@@ -376,7 +383,7 @@ whole file should look like this; `token` is required, so replacing the file
 with only the one new line will stop it loading:
 
 ```toml
-server = "127.0.0.1"
+url = "ws://127.0.0.1:8770/v1/stream"
 token = "your-shared-token"
 inject = "ydotool"
 ```

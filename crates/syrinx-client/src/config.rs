@@ -10,22 +10,16 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Config {
-    /// Which machine the server is on: a hostname or an IP.
+    /// The address to dial, used exactly as written.
     ///
-    /// Just the host. The scheme, the port and the endpoint path are syrinx's
-    /// business, not something to memorise and retype -- and a full URL in a
-    /// config is four things to get right when only one of them ever changes.
-    /// A port may be appended (`laptop.lan:9000`) when the server is not on
-    /// the default.
-    #[serde(default = "default_server")]
-    pub server: String,
-    /// A complete WebSocket URL, overriding `server`.
+    /// Nothing is inferred: no scheme, no port, no path. syrinx used to take a
+    /// bare host and build the URL around it, which is convenient right up to
+    /// the first address it guesses wrong -- and then there is no way to say
+    /// what you actually meant. What is in the file is what gets dialled.
     ///
-    /// The escape hatch, for a reverse proxy on a different path or a scheme
-    /// syrinx would not have chosen. Also what an older config used, so one
-    /// written before `server` existed keeps working.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
+    /// `server` is accepted as a name for the same setting.
+    #[serde(default = "default_url", alias = "server")]
+    pub url: String,
     pub token: String,
     /// Remembered source, as a `Source::stable_key`. Node ids change between
     /// runs, so a key is stored rather than an id.
@@ -57,82 +51,15 @@ pub struct Config {
     pub waybar_signal: u8,
 }
 
-fn default_server() -> String {
-    "127.0.0.1".into()
+fn default_url() -> String {
+    "ws://127.0.0.1:8770/v1/stream".into()
 }
 
-/// The port the server listens on unless told otherwise.
-pub const DEFAULT_PORT: u16 = 8770;
-
-/// The streaming endpoint. Versioned, so a server can add a v2 without
-/// breaking clients that predate it.
-pub const ENDPOINT: &str = "/v1/stream";
-
-/// Build the WebSocket URL to dial from whatever the user wrote.
-///
-/// Forgiving on purpose: this is hand-edited, and a bare host is the shape
-/// that should be typed. Anything already looking like a URL is respected,
-/// so pasting one in still works.
-///
-/// The rule is deliberately simple, because a rule that guesses is worse than
-/// one that is dull:
-///
-/// - **A bare host** gets the default port and the endpoint added.
-/// - **A URL** is respected as written, and only a missing path is filled in.
-///   No port is invented: writing a scheme is an explicit act, and a proxy on
-///   443 is exactly the case the override exists for. `http`/`https` map to
-///   `ws`/`wss` because that is the pair everyone confuses.
-pub fn server_url(server: &str) -> String {
-    let s = server.trim().trim_end_matches('/');
-
-    // Already a URL: take it as given, only supplying the path if it has none.
-    for scheme in ["ws://", "wss://"] {
-        if let Some(rest) = s.strip_prefix(scheme) {
-            return if rest.contains('/') {
-                s.to_string()
-            } else {
-                format!("{s}{ENDPOINT}")
-            };
-        }
-    }
-    // http/https are what a browser taught everyone to type.
-    if let Some(rest) = s.strip_prefix("http://") {
-        return server_url(&format!("ws://{rest}"));
-    }
-    if let Some(rest) = s.strip_prefix("https://") {
-        return server_url(&format!("wss://{rest}"));
-    }
-
-    // A bare host, possibly with a port.
-    let authority = if s.starts_with('[') {
-        // Already-bracketed IPv6, with or without a port.
-        s.to_string()
-    } else if s.matches(':').count() > 1 {
-        // More than one colon can only be an IPv6 address: a host:port has
-        // exactly one. Brackets are required before a port can be appended.
-        format!("[{s}]:{DEFAULT_PORT}")
-    } else if s.contains(':') {
-        s.to_string()
-    } else {
-        format!("{s}:{DEFAULT_PORT}")
-    };
-    format!("ws://{authority}{ENDPOINT}")
-}
 fn default_waybar_signal() -> u8 {
     8
 }
 
 impl Config {
-    /// The WebSocket address to dial.
-    ///
-    /// Derived rather than stored, so `server` stays the single thing to edit.
-    pub fn url(&self) -> String {
-        match &self.url {
-            Some(u) => u.clone(),
-            None => server_url(&self.server),
-        }
-    }
-
     /// Where to stream the transcript, with `~` expanded.
     pub fn stream_path(&self) -> Option<PathBuf> {
         self.stream_to.as_deref().map(expand_tilde)
@@ -186,7 +113,9 @@ impl Config {
                             Self::default_path().display()
                         );
                     }
-                    let cfg = migrate(cfg);
+                    if let Err(e) = check_url(&cfg.url) {
+                        anyhow::bail!("`url` in {} {e}", p.display());
+                    }
                     // The generated file ships an empty token, so this is the
                     // normal second step of first-run rather than an edge case.
                     if cfg.token.trim().is_empty() {
@@ -238,13 +167,14 @@ impl Config {
             // their settings; fall back to a fresh document.
             .unwrap_or_else(|_| template().parse().expect("the template must parse"));
 
-        doc["server"] = toml_edit::value(&self.server);
-        match &self.url {
-            Some(u) => doc["url"] = toml_edit::value(u),
-            None => {
-                doc.remove("url");
-            }
-        }
+        // Written under whichever name the file already uses, so a config
+        // saying `server` is not silently rewritten to `url`.
+        let key = if doc.get("server").is_some() && doc.get("url").is_none() {
+            "server"
+        } else {
+            "url"
+        };
+        doc[key] = toml_edit::value(&self.url);
         doc["token"] = toml_edit::value(&self.token);
         doc["mode"] = toml_edit::value(self.mode.name());
         doc["inject"] = toml_edit::value(self.inject.name());
@@ -263,40 +193,6 @@ impl Config {
     }
 }
 
-/// Bring a config written before `server` existed up to date.
-///
-/// An older file carries a full `url` and no `server`. Where that URL is one
-/// syrinx would have built anyway, the host is lifted out and the URL dropped,
-/// so the file quietly becomes the simpler shape. Anything unusual is left
-/// exactly as written -- a reverse proxy on a custom path is the reason the
-/// override exists, and silently discarding it would point the client at a
-/// server that is not there.
-fn migrate(mut cfg: Config) -> Config {
-    let Some(url) = cfg.url.clone() else {
-        return cfg;
-    };
-    if let Some(host) = plain_host(&url) {
-        cfg.server = host;
-        cfg.url = None;
-    }
-    cfg
-}
-
-/// The host in a URL, if that URL is exactly what `server_url` would produce.
-fn plain_host(url: &str) -> Option<String> {
-    let rest = url.trim().strip_prefix("ws://")?;
-    let (authority, path) = rest.split_once('/')?;
-    if format!("/{path}") != ENDPOINT {
-        return None;
-    }
-    // Keep a non-default port; drop the default so the common case is bare.
-    let host = match authority.rsplit_once(':') {
-        Some((h, p)) if p == DEFAULT_PORT.to_string() && !h.is_empty() => h.to_string(),
-        _ => authority.to_string(),
-    };
-    (!host.is_empty()).then_some(host)
-}
-
 /// Write a key, or remove it entirely when there is no value.
 fn set_or_remove(doc: &mut toml_edit::DocumentMut, key: &str, value: Option<&str>) {
     match value {
@@ -305,6 +201,29 @@ fn set_or_remove(doc: &mut toml_edit::DocumentMut, key: &str, value: Option<&str
             doc.remove(key);
         }
     }
+}
+
+/// Reject an address that cannot possibly work, without rewriting it.
+///
+/// The value is used exactly as given, so this only says no -- it never
+/// substitutes. Catching it here means a typo is reported against the config
+/// file rather than surfacing later as a connection failure.
+fn check_url(url: &str) -> Result<(), String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return Err("is empty".into());
+    }
+    if !(u.starts_with("ws://") || u.starts_with("wss://")) {
+        return Err(format!(
+            "is {u:?}, which has no ws:// or wss:// scheme. \
+             Write the whole address, e.g. \"ws://192.168.1.10:8770/v1/stream\""
+        ));
+    }
+    let rest = u.split_once("://").map(|(_, r)| r).unwrap_or("");
+    if rest.is_empty() || rest.starts_with('/') {
+        return Err(format!("is {u:?}, which names no host"));
+    }
+    Ok(())
 }
 
 /// Write the starter config, without clobbering anything already there.
@@ -351,13 +270,13 @@ pub fn template() -> String {
          # Delete any line to go back to the default.\n\n",
     );
 
-    s.push_str(
-        "# Which machine the server is on: a hostname or an IP address.\n\
-         # Just the host -- syrinx supplies the port and the endpoint. Append\n\
-         # a port (\"laptop.lan:9000\") only if the server is not on the\n\
-         # default.\n",
-    );
-    s.push_str(&format!("server = \"{}\"\n\n", default_server()));
+    s.push_str(&comment_wrap(
+        "The address to dial, used exactly as written: scheme, host, port and \
+         path. Nothing is inferred. Behind TLS this is the public name and \
+         the port is left off, because wss means 443 -- for example \
+         wss://dictate.example.com/v1/stream",
+    ));
+    s.push_str(&format!("url = \"{}\"\n\n", default_url()));
 
     s.push_str(
         "# Shared secret, matching `token` in the server's config.toml.\n\
@@ -536,159 +455,6 @@ fn config_base() -> PathBuf {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_minimal_config_applies_defaults() {
-        let c: Config = toml::from_str(r#"token = "abc""#).unwrap();
-        assert_eq!(c.url(), "ws://127.0.0.1:8770/v1/stream");
-        assert_eq!(c.mode, OutputMode::Type);
-        assert_eq!(c.waybar_signal, 8);
-    }
-
-    #[test]
-    fn a_bare_host_is_all_that_is_needed() {
-        let c: Config = toml::from_str("token = \"t\"\nserver = \"laptop.lan\"").unwrap();
-        assert_eq!(c.url(), "ws://laptop.lan:8770/v1/stream");
-    }
-
-    #[test]
-    fn a_port_can_be_appended_to_the_host() {
-        assert_eq!(server_url("laptop.lan:9000"), "ws://laptop.lan:9000/v1/stream");
-    }
-
-    #[test]
-    fn a_pasted_url_is_respected() {
-        // People paste what they have. Refusing it would be pedantry.
-        assert_eq!(
-            server_url("ws://h:1/custom/path"),
-            "ws://h:1/custom/path"
-        );
-        assert_eq!(server_url("ws://h:1"), "ws://h:1/v1/stream");
-    }
-
-    #[test]
-    fn a_browser_scheme_is_translated() {
-        // http:// is what a browser taught everyone to type.
-        assert_eq!(server_url("http://h"), "ws://h/v1/stream");
-        assert!(server_url("https://h").starts_with("wss://"));
-    }
-
-    #[test]
-    fn a_url_never_has_a_port_invented_for_it() {
-        // Writing a scheme is explicit. A proxy on 443 is exactly the case
-        // the override exists for, and adding :8770 would break it.
-        for s in ["ws://h", "wss://h", "https://edge/asr"] {
-            assert!(
-                !server_url(s).contains(&DEFAULT_PORT.to_string()),
-                "{s} had a port invented: {}",
-                server_url(s)
-            );
-        }
-        // A bare host is the opposite case: the port is the whole point.
-        assert!(server_url("h").contains(&DEFAULT_PORT.to_string()));
-    }
-
-    #[test]
-    fn ipv6_addresses_get_their_brackets() {
-        // Without brackets the port cannot be told from the address.
-        assert_eq!(server_url("::1"), "ws://[::1]:8770/v1/stream");
-        assert_eq!(server_url("[::1]:9000"), "ws://[::1]:9000/v1/stream");
-    }
-
-    #[test]
-    fn surrounding_space_and_slashes_do_not_matter() {
-        assert_eq!(server_url("  host  "), "ws://host:8770/v1/stream");
-        assert_eq!(server_url("ws://host:1/v1/stream/"), "ws://host:1/v1/stream");
-    }
-
-    #[test]
-    fn an_explicit_url_overrides_the_host() {
-        // The escape hatch: a reverse proxy on a path syrinx would not choose.
-        let c: Config = toml::from_str(
-            "token = \"t\"\nserver = \"ignored\"\nurl = \"wss://edge/asr\"",
-        )
-        .unwrap();
-        assert_eq!(c.url(), "wss://edge/asr");
-    }
-
-    #[test]
-    fn an_old_config_becomes_the_simpler_shape() {
-        // Written before `server` existed. The host is lifted out so the file
-        // quietly modernises rather than needing a hand edit.
-        let c: Config =
-            toml::from_str("token = \"t\"\nurl = \"ws://192.168.1.10:8770/v1/stream\"").unwrap();
-        let c = migrate(c);
-        assert_eq!(c.server, "192.168.1.10");
-        assert_eq!(c.url, None);
-        assert_eq!(c.url(), "ws://192.168.1.10:8770/v1/stream");
-    }
-
-    #[test]
-    fn migration_keeps_a_non_default_port() {
-        let c: Config =
-            toml::from_str("token = \"t\"\nurl = \"ws://host:9000/v1/stream\"").unwrap();
-        assert_eq!(migrate(c).server, "host:9000");
-    }
-
-    #[test]
-    fn migration_leaves_an_unusual_url_alone() {
-        // Discarding a reverse-proxy path would point the client at a server
-        // that is not there.
-        for url in ["wss://edge/asr", "ws://host:8770/other", "ws://host"] {
-            let c: Config =
-                toml::from_str(&format!("token = \"t\"\nurl = \"{url}\"")).unwrap();
-            let c = migrate(c);
-            assert_eq!(c.url.as_deref(), Some(url), "{url} should be untouched");
-        }
-    }
-
-    #[test]
-    fn migrating_never_changes_where_a_client_connects() {
-        // The whole risk of a migration: it must be invisible.
-        for url in [
-            "ws://192.168.1.10:8770/v1/stream",
-            "ws://host:9000/v1/stream",
-            "wss://edge/asr",
-            "ws://host:8770/other",
-        ] {
-            let c: Config =
-                toml::from_str(&format!("token = \"t\"\nurl = \"{url}\"")).unwrap();
-            let before = c.url();
-            assert_eq!(migrate(c).url(), before, "{url} moved");
-        }
-    }
-
-    #[test]
-    fn a_missing_token_is_a_hard_error() {
-        // Better to refuse than to connect unauthenticated and be rejected
-        // with something less clear.
-        assert!(toml::from_str::<Config>(r#"url = "ws://x""#).is_err());
-    }
-
-    #[test]
-    fn a_parse_failure_shows_a_whole_valid_config() {
-        // Naming only the field at fault invites replacing the whole file with
-        // that one field, which then fails for a different reason. The hint has
-        // to be something that works if pasted as-is.
-        let path = std::env::temp_dir()
-            .join(format!("syrinx-cfg-test-{}.toml", std::process::id()));
-        std::fs::write(&path, "inject = \"ydotool\"\n").unwrap();
-
-        let e = Config::load(Some(path.clone())).unwrap_err();
-        let _ = std::fs::remove_file(&path);
-        let text = format!("{e:#}");
-        assert!(text.contains("token"), "should name the field: {text}");
-        assert!(text.contains("url ="), "should show a whole config: {text}");
-
-        // The hint itself must parse, or it is worse than no hint.
-        let example: String = EXAMPLE_HINT
-            .lines()
-            .filter(|l| l.starts_with("    ") && l.contains('='))
-            .map(|l| format!("{}\n", l.trim()))
-            .collect();
-        toml::from_str::<Config>(&example)
-            .unwrap_or_else(|e| panic!("the suggested config does not parse: {e}\n{example}"));
-    }
-
     /// A scratch path unique to this test, so tests can run in parallel.
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -699,6 +465,85 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    #[test]
+    fn a_minimal_config_applies_defaults() {
+        let c: Config = toml::from_str(r#"token = "abc""#).unwrap();
+        assert_eq!(c.url, "ws://127.0.0.1:8770/v1/stream");
+        assert_eq!(c.mode, OutputMode::Type);
+        assert_eq!(c.waybar_signal, 8);
+    }
+
+    #[test]
+    fn the_address_is_used_exactly_as_written() {
+        // The whole contract. syrinx used to build a URL around a bare host,
+        // which is convenient until it guesses wrong -- and then there is no
+        // way to express what you actually meant.
+        for written in [
+            "ws://192.168.1.10:8770/v1/stream",
+            "wss://dictate.example.com/v1/stream",
+            "ws://localhost:9000/some/other/path",
+            "wss://edge.example.com:8443/asr",
+        ] {
+            let c: Config =
+                toml::from_str(&format!("token = \"t\"\nurl = \"{written}\"")).unwrap();
+            assert_eq!(c.url, written, "the address was rewritten");
+        }
+    }
+
+    #[test]
+    fn server_is_accepted_as_a_name_for_the_same_setting() {
+        // Configs written before this change say `server`. They must keep
+        // working, and mean exactly the same thing.
+        let c: Config = toml::from_str(
+            "token = \"t\"\nserver = \"wss://dictate.example.com/v1/stream\"",
+        )
+        .unwrap();
+        assert_eq!(c.url, "wss://dictate.example.com/v1/stream");
+    }
+
+    #[test]
+    fn an_address_without_a_scheme_is_refused_not_repaired() {
+        // Previously "192.168.1.10" became a full URL. Now it is an error,
+        // reported against the config file rather than at connect time.
+        let e = check_url("192.168.1.10").unwrap_err();
+        assert!(e.contains("ws://"), "got: {e}");
+        assert!(e.contains("192.168.1.10"), "should quote what was written: {e}");
+    }
+
+    #[test]
+    fn an_empty_or_hostless_address_is_refused() {
+        assert!(check_url("").is_err());
+        assert!(check_url("   ").is_err());
+        assert!(check_url("ws://").is_err());
+        assert!(check_url("ws:///v1/stream").is_err());
+    }
+
+    #[test]
+    fn a_well_formed_address_passes() {
+        for u in [
+            "ws://h:1/v1/stream",
+            "wss://h/v1/stream",
+            "ws://[::1]:8770/v1/stream",
+            "  ws://h:1/v1/stream  ",
+        ] {
+            assert!(check_url(u).is_ok(), "{u} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_bad_address_names_the_file_it_came_from() {
+        // The error has to say where to go and fix it.
+        let dir = scratch("badurl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "token = \"t\"\nurl = \"192.168.1.10\"\n").unwrap();
+
+        let e = Config::load(Some(path.clone())).unwrap_err();
+        let text = format!("{e:#}");
+        assert!(text.contains(&path.display().to_string()), "got: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -739,7 +584,7 @@ mod tests {
         let text = template().replace("token = \"\"", "token = \"t\"");
         let c: Config = toml::from_str(&text)
             .unwrap_or_else(|e| panic!("template does not parse: {e}\n---\n{text}"));
-        assert_eq!(c.server, default_server());
+        assert_eq!(c.url, default_url());
         assert_eq!(c.mode, OutputMode::default());
         assert_eq!(c.inject, crate::inject::Method::default());
     }
@@ -854,8 +699,7 @@ mod tests {
         std::fs::write(&path, template()).unwrap();
 
         let original = Config {
-            server: "laptop.lan:9001".into(),
-            url: None,
+            url: "ws://laptop.lan:9001/v1/stream".into(),
             token: "a-token".into(),
             source_key: Some("some-source".into()),
             stream_to: Some("~/notes.txt".into()),
@@ -954,8 +798,7 @@ mod tests {
         // The GUI writes this file back when a source is chosen, so a value it
         // cannot re-read would silently lose the setting.
         let c = Config {
-            server: "h:1".into(),
-            url: None,
+            url: "ws://h:1/v1/stream".into(),
             stream_to: Some("~/notes.txt".into()),
             format: crate::save::Format::Timestamped,
             token: "t".into(),
