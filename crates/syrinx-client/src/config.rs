@@ -56,16 +56,24 @@ impl Config {
         for p in &candidates {
             match std::fs::read_to_string(p) {
                 Ok(text) => {
-                    return toml::from_str(&text)
-                        .with_context(|| format!("parsing {}", p.display()));
+                    // A parse failure is nearly always a missing required
+                    // field, and naming it without showing a whole valid file
+                    // invites replacing the file with just that field.
+                    return toml::from_str(&text).map_err(|e| {
+                        anyhow::anyhow!("{}\n\n{}", e, EXAMPLE_HINT).context(format!(
+                            "the config at {} is not valid",
+                            p.display()
+                        ))
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e).with_context(|| format!("reading {}", p.display())),
             }
         }
         anyhow::bail!(
-            "no config found. Create {} with:\n  url = \"ws://host:8770/v1/stream\"\n  token = \"...\"",
-            Self::default_path().display()
+            "no config found at {}.\n\n{}",
+            Self::default_path().display(),
+            EXAMPLE_HINT
         )
     }
 
@@ -77,6 +85,19 @@ impl Config {
             .with_context(|| format!("writing {}", path.display()))
     }
 }
+
+/// A complete, valid config.
+///
+/// Shown whole rather than as the one field at fault, because a snippet reads
+/// as "the file should contain this" and gets pasted over a working file.
+const EXAMPLE_HINT: &str = "\
+A complete config looks like this -- every field but `token` is optional,
+but the file must contain all of the ones you want:
+
+    url = \"ws://127.0.0.1:8770/v1/stream\"
+    token = \"your-shared-token\"
+    inject = \"wtype\"        # or \"ydotool\" for Electron apps, or \"paste\"
+    mode = \"transcribe\"     # or \"type\", or \"both\"";
 
 fn config_base() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
@@ -103,6 +124,31 @@ mod tests {
         // Better to refuse than to connect unauthenticated and be rejected
         // with something less clear.
         assert!(toml::from_str::<Config>(r#"url = "ws://x""#).is_err());
+    }
+
+    #[test]
+    fn a_parse_failure_shows_a_whole_valid_config() {
+        // Naming only the field at fault invites replacing the whole file with
+        // that one field, which then fails for a different reason. The hint has
+        // to be something that works if pasted as-is.
+        let path = std::env::temp_dir()
+            .join(format!("syrinx-cfg-test-{}.toml", std::process::id()));
+        std::fs::write(&path, "inject = \"ydotool\"\n").unwrap();
+
+        let e = Config::load(Some(path.clone())).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        let text = format!("{e:#}");
+        assert!(text.contains("token"), "should name the field: {text}");
+        assert!(text.contains("url ="), "should show a whole config: {text}");
+
+        // The hint itself must parse, or it is worse than no hint.
+        let example: String = EXAMPLE_HINT
+            .lines()
+            .filter(|l| l.starts_with("    ") && l.contains('='))
+            .map(|l| format!("{}\n", l.trim()))
+            .collect();
+        toml::from_str::<Config>(&example)
+            .unwrap_or_else(|e| panic!("the suggested config does not parse: {e}\n{example}"));
     }
 
     #[test]

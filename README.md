@@ -85,9 +85,13 @@ sudo pacman -S ydotool
 systemctl --user enable --now ydotool     # the daemon; ydotool cannot type without it
 ```
 
-Then in `~/.config/syrinx/config.toml`:
+Then **add** the `inject` line to `~/.config/syrinx/config.toml`. The whole file
+should look like this — `token` is required, so replacing the file with only the
+one new line will stop it loading:
 
 ```toml
+url = "ws://127.0.0.1:8770/v1/stream"
+token = "your-shared-token"
 inject = "ydotool"
 ```
 
