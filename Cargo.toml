@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/parakeet-audio", "crates/parakeet-proto", "crates/parakeet-server", "crates/parakeet-gui", "crates/parakeet-client", "crates/parakeet-cli"]
+members = ["crates/syrinx-audio", "crates/syrinx-proto", "crates/syrinx-server", "crates/syrinx-gui", "crates/syrinx-client", "crates/syrinx-cli"]
 
 [workspace.package]
 edition = "2024"
@@ -14,6 +14,6 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-parakeet-proto = { path = "crates/parakeet-proto" }
-parakeet-audio = { path = "crates/parakeet-audio" }
-parakeet-client = { path = "crates/parakeet-client" }
+syrinx-proto = { path = "crates/syrinx-proto" }
+syrinx-audio = { path = "crates/syrinx-audio" }
+syrinx-client = { path = "crates/syrinx-client" }

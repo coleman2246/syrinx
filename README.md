@@ -1,4 +1,4 @@
-# parakeet-stt
+# syrinx
 
 Self-hosted streaming speech-to-text, built on NVIDIA Parakeet/Nemotron
 cache-aware streaming ASR via [`parakeet-rs`](https://github.com/altunenes/parakeet-rs).
@@ -11,10 +11,10 @@ Vosk's accuracy penalty: ~1.93% WER on librispeech test-clean, with punctuation.
 
 | Crate | Purpose |
 |---|---|
-| `parakeet-proto` | Wire types. One definition of the protocol, shared by everything. |
-| `parakeet-server` | WebSocket + HTTP service. Ships as a CUDA 12.8 container. |
-| `parakeet-gui` | egui + cpal. Desktop and laptop, mic or system audio. |
-| `parakeet-type` | Headless Linux dictation client, types at the cursor via `wtype`. |
+| `syrinx-proto` | Wire types. One definition of the protocol, shared by everything. |
+| `syrinx-server` | WebSocket + HTTP service. Ships as a CUDA 12.8 container. |
+| `syrinx-gui` | egui + cpal. Desktop and laptop, mic or system audio. |
+| `syrinx` | Headless Linux dictation client, types at the cursor via `wtype`. |
 
 ## Modes
 

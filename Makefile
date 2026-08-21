@@ -22,24 +22,29 @@ lint:
 
 ## Build the server WITH GPU support. Do this before `serve`.
 build-cuda:
-	ORT_DYLIB_PATH=$(ORT) cargo build -p parakeet-server --features cuda
+	ORT_DYLIB_PATH=$(ORT) cargo build -p syrinx-server --features cuda
 
 ## Run the server. Always rebuilds with cuda first, so a prior `make test`
 ## cannot leave a non-GPU binary in place.
 serve: build-cuda
-	ORT_DYLIB_PATH=$(ORT) ./target/debug/parakeet-server $(CONFIG)
+	ORT_DYLIB_PATH=$(ORT) ./target/debug/syrinx-server $(CONFIG)
 
-## Run the dictation client.
+## Run the dictation client (types at the cursor).
 dictate:
-	cargo build -p parakeet-type
-	./target/debug/parakeet-type start
+	cargo build -p syrinx-cli
+	./target/debug/syrinx start --mode type
+
+## Run the GUI.
+gui:
+	cargo build -p syrinx-gui
+	./target/debug/syrinx-gui
 
 ## Report which execution provider is actually in use, and how fast.
 probe: build-cuda
-	PARAKEET_MODEL_DIR=$(MODEL) ORT_DYLIB_PATH=$(ORT) \
-		cargo run -p parakeet-server --features cuda --example gpu_probe
+	SYRINX_MODEL_DIR=$(MODEL) ORT_DYLIB_PATH=$(ORT) \
+		cargo run -p syrinx-server --features cuda --example gpu_probe
 
 ## Golden-audio tests against the real model.
 check: build-cuda
-	PARAKEET_MODEL_DIR=$(MODEL) ORT_DYLIB_PATH=$(ORT) \
-		cargo test -p parakeet-server --features cuda --test golden -- --ignored --nocapture
+	SYRINX_MODEL_DIR=$(MODEL) ORT_DYLIB_PATH=$(ORT) \
+		cargo test -p syrinx-server --features cuda --test golden -- --ignored --nocapture

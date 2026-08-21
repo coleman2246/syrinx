@@ -1,0 +1,33 @@
+[package]
+name = "syrinx-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+syrinx-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = { version = "0.8", features = ["ws", "multipart"] }
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+toml = "0.9"
+
+# The real GPU backend is optional so `cargo test` stays fast and CUDA-free.
+# CI runs the default feature set; the GPU path is built with --features cuda.
+parakeet-rs = { version = "0.3", features = ["cuda", "load-dynamic"], optional = true }
+# Used to dlopen cuDNN with RTLD_GLOBAL; see asr::parakeet::preload_cudnn.
+libc = { version = "0.2", optional = true }
+
+[features]
+default = []
+cuda = ["dep:parakeet-rs", "dep:libc"]
+
+[dev-dependencies]
+tokio-tungstenite = "0.30"
+hound = "3.5"
