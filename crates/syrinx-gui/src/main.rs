@@ -827,7 +827,7 @@ impl App {
                     action = Some(Request::SetStreamFile { path: None });
                     self.status_line = Some("Stopped streaming to file".into());
                 } else if let Some(p) = rfd::FileDialog::new()
-                    .set_file_name("transcript.txt")
+                    .set_file_name(save::filename_for(&save::timestamp()))
                     .set_directory(save::default_dir())
                     .save_file()
                 {

@@ -680,3 +680,27 @@ are now one palette, taken from Fluent 2 -- the violet brand colour, near-neutra
 greys, and Teams' own red and green for status. The transcript sits on a
 surface of its own rather than on bare canvas, which was reading as an empty
 window with text in the corner.
+
+
+## Timestamps in filenames (2026-08-21)
+
+`timestamp()` shelled out to `date +%Y-%m-%d_%H-%M-%S`, which is not a command
+on Windows: every generated filename there fell back to `epoch-1755…`. The
+audit predicted this and called it cosmetic; it is not, because a folder of
+epoch counts cannot be read or ordered by eye.
+
+Formatted in-process with `chrono` now -- one dependency, the same answer on
+both platforms, and one fewer process spawn per save. Local time, ordered
+largest unit first so that sorting by name sorts by time. The name is the
+timestamp alone: `2026-08-21_14-59-41.txt`.
+
+The **Stream…** dialog previously offered a fixed `transcript.txt`, which
+quietly invited overwriting the last session's file.
+
+### A repository bug found alongside it
+
+`.gitignore` had `!tests/fixtures/golden/*.wav`, which without `**` only
+matches at the repository root. The fixture lives under
+`crates/syrinx-server/tests/`, so it was never tracked -- the golden test could
+not run from a fresh clone, and the file never reached the Windows laptop,
+whose tree arrives by `git archive`.

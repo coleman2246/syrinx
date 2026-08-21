@@ -216,7 +216,7 @@ pub fn default_dir() -> PathBuf {
 /// Sortable by name, and safe on every filesystem: no colons, which Windows
 /// rejects and which make shell quoting awkward everywhere else.
 pub fn filename_for(stamp: &str) -> String {
-    format!("transcript-{stamp}.txt")
+    format!("{stamp}.txt")
 }
 
 /// Local time as `YYYY-MM-DD_HH-MM-SS`.
@@ -225,22 +225,16 @@ pub fn filename_for(stamp: &str) -> String {
 /// and falls back to a UTC epoch if that fails so saving never breaks over a
 /// timestamp.
 pub fn timestamp() -> String {
-    std::process::Command::new("date")
-        .arg("+%Y-%m-%d_%H-%M-%S")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            format!("epoch-{secs}")
-        })
+    chrono::Local::now().format(STAMP_FORMAT).to_string()
 }
+
+/// Local date and time, ordered so that sorting by name sorts by time.
+///
+/// Was `date +%Y-%m-%d_%H-%M-%S` in a subprocess, which is not a command on
+/// Windows: every filename there fell back to `epoch-1755…`, which is neither
+/// readable nor sortable by eye. Formatting it in-process gives the same answer
+/// on both platforms and drops a process spawn from every save.
+const STAMP_FORMAT: &str = "%Y-%m-%d_%H-%M-%S";
 
 /// Write `transcript` to `path`, creating parent directories.
 ///
@@ -288,6 +282,62 @@ pub fn save_rendered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timestamp_is_the_local_date_and_time() {
+        // Shape: 2026-08-21_14-53-07. Checked digit by digit because a wrong
+        // format string produces something plausible-looking but useless, and
+        // this ends up as a filename.
+        let s = timestamp();
+        assert_eq!(s.len(), 19, "got {s:?}");
+        let bytes = s.as_bytes();
+        for i in [4, 7] {
+            assert_eq!(bytes[i], b'-', "expected a date separator at {i} in {s:?}");
+        }
+        assert_eq!(bytes[10], b'_', "expected date and time to be split in {s:?}");
+        for i in [13, 16] {
+            assert_eq!(bytes[i], b'-', "expected a time separator at {i} in {s:?}");
+        }
+        for (i, c) in s.chars().enumerate() {
+            if ![4, 7, 10, 13, 16].contains(&i) {
+                assert!(c.is_ascii_digit(), "{c:?} at {i} is not a digit in {s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_timestamp_never_falls_back_to_an_epoch_count() {
+        // It used to shell out to `date`, which does not exist on Windows, so
+        // every filename there was `epoch-1755…`.
+        assert!(!timestamp().contains("epoch"), "{}", timestamp());
+    }
+
+    #[test]
+    fn timestamps_sort_the_same_way_as_time() {
+        // The whole reason for this ordering: a folder of these listed
+        // alphabetically is in the order they were recorded.
+        let mut names = ["2026-08-21_09-00-00", "2026-01-02_23-59-59", "2026-08-21_10-00-00"];
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["2026-01-02_23-59-59", "2026-08-21_09-00-00", "2026-08-21_10-00-00"]
+        );
+    }
+
+    #[test]
+    fn a_filename_is_the_timestamp_and_nothing_else() {
+        assert_eq!(filename_for("2026-08-21_14-53-07"), "2026-08-21_14-53-07.txt");
+    }
+
+    #[test]
+    fn a_generated_filename_is_legal_on_windows() {
+        // Windows refuses these characters outright, and a colon is the
+        // obvious way to write a time.
+        let name = filename_for(&timestamp());
+        for bad in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
+            assert!(!name.contains(bad), "{name:?} contains {bad:?}");
+        }
+    }
 
     #[test]
     fn config_names_match_what_serde_accepts() {

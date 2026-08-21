@@ -118,7 +118,9 @@ format = "timestamped"
 ```
 
 Or per run: `syrinx start --stream notes.txt`. In the GUI, the **Stream…**
-button picks a file.
+button picks a file, offering the current local time as the name —
+`2026-08-21_14-59-41.txt`, the same default **Save as…** uses. Ordered
+largest unit first, so sorting a folder by name sorts it by time.
 
 Every session appends to the same file, so stopping and starting continues
 where you left off, and a crash costs the last sentence rather than the whole
