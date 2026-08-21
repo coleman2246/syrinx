@@ -38,5 +38,10 @@ CUDA at **12.8** — a CUDA 13 image will not run there. The container pins CUDA
 12.8, which also works on the CUDA 13.3 development desktop by backward
 compatibility. One image, both machines.
 
-That GPU is shared with Frigate, a live camera recorder. The server must never
-exhaust VRAM. See the design document for the budget and the mitigations.
+That GPU is also shared with **Frigate** (live camera recording) and **Jellyfin**
+(NVENC transcoding), both of which fail visibly when starved. The server is
+therefore designed as the lowest-priority GPU tenant: it holds zero VRAM when
+idle, checks free VRAM before loading, caps its own ORT arena, and refuses
+sessions rather than winning an allocation race against the cameras or a film.
+
+See the design document for measured model sizes and the full tenancy policy.

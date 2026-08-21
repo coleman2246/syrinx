@@ -60,30 +60,66 @@ everything below 7.5, so Turing sits exactly on the boundary and remains
 supported — one GPU generation older and this hardware would be unusable with
 current toolkits.
 
-### VRAM is shared with a live security system
+### VRAM is contended by two services that fail visibly
 
-`acdc`'s 2070 Super has **8192 MiB** total, with ~580 MiB already used by Frigate
-(`frigate.detector:onnx`) and two ffmpeg transcoding processes. Frigate is a live
-camera recorder; exhausting VRAM would take it down.
+`acdc`'s 2070 Super has **8192 MiB** total and is shared with **Frigate** (live
+camera recording) and **Jellyfin** (NVENC transcoding). The nvidia-smi snapshot
+taken during design showed ~580 MiB in use by `frigate.detector:onnx` plus two
+ffmpeg processes — but that is a quiet-moment reading, not a ceiling.
 
-Approximate budget:
+Jellyfin's usage is **bursty and user-visible**: each concurrent transcode costs
+roughly 150–400 MB, more for 4K HDR tonemapping. A footprint that is harmless at
+03:00 can break someone's playback at 20:00. Both neighbours fail in ways a
+person immediately notices — cameras stop recording, a film stops playing.
 
-| Component | VRAM |
-|---|---|
-| Nemotron streaming 0.6B (fp32 ONNX) | ~2.4–3 GB |
-| Parakeet TDT offline (bulk jobs) | ~2.4–3 GB |
-| ORT CUDA arena overhead | several hundred MB |
-| Frigate + ffmpeg (existing) | ~0.6 GB |
+Measured model sizes (from the HuggingFace repo, not estimated):
 
-Both models resident simultaneously does not leave safe headroom. Therefore:
+| Model | Size | Streams | Punctuation |
+|---|---|---|---|
+| Nemotron streaming en 0.6B (fp32) | **2515 MB** | yes, 560 ms chunks | yes |
+| EOU 120M streaming (fp32) | **481 MB** | yes, 160 ms chunks | **no** |
+| TDT offline (fp32) | 2477 MB | no | yes |
+| **TDT offline int8** | **670 MB** | no | yes |
 
-- The bulk model is **lazy-loaded** on first job and **unloaded after an idle
-  timeout**. The two models are never both resident by default.
-- ORT is configured with an **explicit arena limit** so the server fails its own
-  allocation rather than starving Frigate.
-- **Admission control** refuses new sessions with a clear error instead of
-  running the GPU out of memory.
-- Bulk jobs can be forced to CPU when VRAM is tight.
+Two consequences. Bulk is largely solved: **int8 TDT is 670 MB rather than
+2477 MB**, a 3.7x reduction, so bulk jobs stop being the VRAM problem. But the
+streaming model has **no int8 build published**, so **2515 MB is the floor** for
+punctuated live transcription.
+
+#### Tenancy policy
+
+The governing rule: **this server is the lowest-priority GPU tenant on the host
+and must actively yield.** It must never be the process that wins an allocation
+race against the cameras or a film.
+
+- **Zero footprint when idle.** Models are lazy-loaded on first use and
+  **unloaded after an idle timeout**. The server holds no VRAM for most of the
+  day. A keep-warm window prevents reload thrash during a dictation session.
+- **Pre-load free-VRAM check.** Query free VRAM before loading. If there is not
+  room for the model plus a safety margin, do not load — refuse the session with
+  `error{code:"capacity"}`. Refusing is correct behaviour here, not a failure.
+- **Explicit ORT arena cap**, so the server fails its own allocation rather than
+  succeeding at a neighbour's expense.
+- **Admission control** derived from measured inference time, refusing sessions
+  rather than degrading everyone already connected.
+- **Bulk uses int8 TDT** and yields to streaming sessions, which take priority.
+
+#### CPU fallback is not a real fallback on this host
+
+`acdc` runs a **Ryzen 1700** (Zen 1, 8c/16t, 2017). Zen 1 splits 256-bit AVX2
+operations into two 128-bit halves, so it is roughly half-rate on exactly the
+vector math inference depends on. A 0.6B encoder is very unlikely to sustain
+real-time streaming there.
+
+So "fall back to CPU" must not be written into the design as though it were a
+graceful degradation path for the streaming model. Realistic options when the GPU
+is unavailable are, in order of preference:
+
+1. **Refuse the session** with a clear `capacity` error. Honest and predictable.
+2. **Degrade to the EOU 120M model**, which is 5x smaller and may keep up on
+   CPU — at the cost of punctuation.
+
+Actual CPU inference time must be measured before option 2 is relied upon.
 
 That Frigate already runs ONNX on this GPU is useful evidence: ORT + CUDA +
 Docker GPU passthrough is proven on this exact hardware.
@@ -279,7 +315,13 @@ protocol against the simpler client. The GUI follows.
 
 - Measured inference time per 560 ms chunk on both a 3060 Ti and a 2070 Super,
   which sets the real concurrency limit.
+- Measured **model load and unload time**, which sets the keep-warm window and
+  determines how much latency the idle-unload policy costs on first use.
+- Measured **CPU** inference time on Zen 1, to establish whether the EOU
+  degradation path is real or whether refusing is the only honest option.
 - Whether the official ONNX Runtime CUDA 12 build is packaged conveniently for
   the container, or whether it needs building from source in the image.
-- Whether int8-quantized Parakeet models are accurate enough to relieve VRAM
-  pressure, which would allow both models resident.
+- Whether quantizing the streaming Nemotron to int8 ourselves is viable. No int8
+  build is published for it, and streaming models carry cache tensors that can be
+  awkward to quantize, but a ~4x cut to ~650 MB would materially change the
+  tenancy story on a contended GPU.
