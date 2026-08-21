@@ -4,6 +4,7 @@
 //! near-identical session loop, which meant every feature -- modes, source
 //! selection, status -- had to be built twice and could drift between them.
 
+pub mod bulk;
 pub mod config;
 pub mod daemon;
 pub mod ipc;

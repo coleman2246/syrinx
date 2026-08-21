@@ -28,7 +28,7 @@ const FALL: f32 = 0.28;
 pub fn run() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([250.0, 48.0])
+            .with_inner_size([300.0, 68.0])
             .with_decorations(false)
             .with_always_on_top()
             .with_resizable(false)
@@ -57,6 +57,10 @@ struct Overlay {
     /// Smoothed bar heights, so the display eases rather than flickers.
     shown: Vec<f32>,
     status: Status,
+    /// Most recent text, so the overlay confirms words are being recognised
+    /// rather than only that sound is arriving. A meter can be lively while
+    /// the transcript is empty.
+    last: String,
     gone: bool,
 }
 
@@ -75,6 +79,9 @@ impl eframe::App for Overlay {
             Ok(ipc::Response::State(s)) => {
                 target = s.levels;
                 self.status = s.status;
+                if !s.last_fragment.trim().is_empty() {
+                    self.last = s.last_fragment.trim().to_string();
+                }
                 // The session ending is what closes this, so it never outlives
                 // the thing it reports on.
                 if !s.status.is_active() {
@@ -130,8 +137,13 @@ impl eframe::App for Overlay {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
 
+        // Room for one line of text under the bars.
+        let text_h = 18.0;
         let pad = 8.0;
-        let rect = full.shrink(pad);
+        let rect = egui::Rect::from_min_max(
+            full.min + egui::vec2(pad, pad),
+            egui::pos2(full.max.x - pad, full.max.y - pad - text_h),
+        );
         let gap = 3.0;
         let bar_w = (rect.width() - gap * (n as f32 - 1.0)) / n as f32;
         for i in 0..n {
@@ -153,6 +165,21 @@ impl eframe::App for Overlay {
             };
             painter.rect_filled(bar, 1.5, colour);
         }
+
+        // Last words, trimmed to what fits on one line.
+        let words: Vec<&str> = self.last.split_whitespace().rev().take(6).collect();
+        let line: String = words.into_iter().rev().collect::<Vec<_>>().join(" ");
+        painter.text(
+            egui::pos2(full.left() + pad, full.bottom() - pad - text_h + 2.0),
+            egui::Align2::LEFT_TOP,
+            if line.is_empty() { "listening…" } else { &line },
+            egui::FontId::proportional(12.0),
+            if line.is_empty() {
+                egui::Color32::from_rgb(130, 130, 140)
+            } else {
+                egui::Color32::from_rgb(225, 225, 235)
+            },
+        );
 
         ctx.request_repaint_after(POLL);
     }

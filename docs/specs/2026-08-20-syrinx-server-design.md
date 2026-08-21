@@ -389,3 +389,53 @@ protocol against the simpler client. The GUI follows.
   build is published for it, and streaming models carry cache tensors that can be
   awkward to quantize, but a ~4x cut to ~650 MB would materially change the
   tenancy story on a contended GPU.
+
+## Windows portability (audit, 2026-08-21)
+
+Audited before any Windows testing. Nothing here has been run on Windows; this
+is what a build would hit.
+
+### Compiles and works
+
+- `syrinx-proto`, `syrinx-audio::meter`, `syrinx-client::{mode, save, bulk}` are
+  all portable.
+- The cpal backend enumerates microphones and offers output devices as system
+  audio, which WASAPI turns into loopback.
+- File transcription: ffmpeg exists on Windows and the streaming path is
+  platform-neutral.
+
+### Will not compile
+
+| Component | Reason |
+|---|---|
+| `ipc.rs`, `daemon.rs` | `UnixStream` / `UnixListener` |
+| `state.rs` | `nix` for `kill(pid, 0)` and SIGTERM |
+| `cli/main.rs` | `tokio::signal::unix` |
+
+Named pipes are the Windows equivalent of a Unix socket, and a named event or a
+console control handler replaces SIGTERM. The shape of the code does not change,
+only the transport, so an `ipc::transport` module with two implementations would
+cover it.
+
+### Compiles but does nothing useful
+
+- `wtype` is Wayland-only, so **typing at the cursor does not work**. Windows
+  needs `SendInput`, which is a different mechanism, not a different binary.
+- `pw-dump` / `pw-record` / `pw-link` / `pactl` are PipeWire, so per-application
+  capture is unavailable. Windows has process loopback since 10 2004, but cpal
+  does not expose it.
+- `pkill -RTMIN+N waybar` is meaningless off Linux, and harmless: the command
+  simply fails.
+- `nvidia-smi` for the VRAM guard is present on Windows with an NVIDIA driver,
+  so that one is fine.
+- `date` for timestamps is not a Windows command. It falls back to an epoch
+  stamp, so saving still works but filenames are uglier. Worth replacing with a
+  small time formatter.
+
+### Summary
+
+The **server** is portable in principle but is meant to run in a container on
+Linux, so this does not matter. The **GUI and CLI need an IPC transport
+abstraction and a Windows text-injection path** before they build, and
+per-application capture will remain Linux-only. Transcribe mode, file
+transcription, the meter and system audio would all work.

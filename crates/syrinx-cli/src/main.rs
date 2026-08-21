@@ -3,7 +3,7 @@
 //! Deliberately thin: everything of substance lives in `syrinx-client`, so
 //! the CLI and the GUI cannot drift apart.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use syrinx_client::{Config, OutputMode, SessionOptions, save, state};
 use std::path::PathBuf;
@@ -110,6 +110,18 @@ enum Cmd {
         format: FormatArg,
     },
 
+    /// Transcribe an audio file. Anything ffmpeg can decode: wav, mp3, m4a,
+    /// opus, flac.
+    Transcribe {
+        /// File to transcribe.
+        file: PathBuf,
+        /// Write the transcript here instead of printing it.
+        #[arg(long)]
+        save: Option<PathBuf>,
+        #[arg(long, value_enum, default_value = "plain")]
+        format: FormatArg,
+    },
+
     /// Show a live level meter for a source, to confirm it is carrying audio.
     /// Runs until interrupted.
     Meter {
@@ -143,6 +155,10 @@ fn main() -> Result<()> {
             save_default,
             format,
         } => run_daemon(cli.config, mode, source, save_default, format.into()),
+
+        Cmd::Transcribe { file, save, format } => {
+            run_transcribe(cli.config, file, save, format.into())
+        }
 
         Cmd::Meter { source, seconds } => run_meter(cli.config, source, seconds),
 
@@ -396,6 +412,66 @@ fn run_meter(
     }
     if interactive {
         eprintln!();
+    }
+    Ok(())
+}
+
+/// Transcribe a file by streaming it through a normal session.
+fn run_transcribe(
+    config: Option<PathBuf>,
+    file: PathBuf,
+    save_to: Option<PathBuf>,
+    format: save::Format,
+) -> Result<()> {
+    let cfg = Config::load(config)?;
+    eprintln!("decoding {}...", file.display());
+    let samples = syrinx_client::bulk::decode(&file)?;
+    let secs = syrinx_client::bulk::duration_secs(&samples);
+    eprintln!("{secs:.1}s of audio; transcribing...");
+
+    let started = std::time::Instant::now();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building a runtime")?;
+
+    let text = rt.block_on(async {
+        let mut last_shown = -1i32;
+        syrinx_client::bulk::transcribe(&cfg.url, &cfg.token, &samples, |p| {
+            // Whole percent only: a progress line that redraws hundreds of
+            // times a second is just flicker.
+            let pct = (p * 100.0) as i32;
+            if pct != last_shown {
+                last_shown = pct;
+                eprint!("\r  {pct:>3}%");
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+            }
+        })
+        .await
+    })?;
+    eprintln!();
+
+    let elapsed = started.elapsed().as_secs_f64();
+    eprintln!(
+        "done in {elapsed:.1}s ({:.0}x real time)",
+        if elapsed > 0.0 { secs / elapsed } else { 0.0 }
+    );
+
+    // Timestamped output needs per-fragment timings, which this path does not
+    // record: a file is sent far faster than real time, so arrival order says
+    // nothing about position in the recording. Say so rather than writing
+    // times that would be wrong.
+    if format == save::Format::Timestamped {
+        eprintln!("note: timestamps are not available for file transcription; saving as plain");
+    }
+
+    match save_to {
+        Some(p) => {
+            save::write(&p, &text)?;
+            eprintln!("saved to {}", p.display());
+        }
+        None => println!("{text}"),
     }
     Ok(())
 }

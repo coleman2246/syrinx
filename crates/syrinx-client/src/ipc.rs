@@ -34,6 +34,8 @@ pub enum Request {
     SetUrl { url: String },
     /// Save the current transcript, returning the path written.
     Save { format: Format, path: Option<String> },
+    /// Transcribe an audio file, replacing the current transcript.
+    TranscribeFile { path: String },
     /// Discard the retained transcript.
     Clear,
     /// Stop the daemon entirely.
@@ -71,6 +73,10 @@ pub struct DaemonState {
     /// Overall level of the same, 0.0 to 1.0.
     #[serde(default)]
     pub rms: f32,
+    /// Progress through a file, 0.0 to 1.0. Only meaningful while transcribing
+    /// a file.
+    #[serde(default)]
+    pub progress: f32,
 }
 
 impl DaemonState {
@@ -88,6 +94,7 @@ impl DaemonState {
             // these from the idle preview when there is no session.
             levels: s.levels.clone(),
             rms: s.rms,
+            progress: 0.0,
         }
     }
 }

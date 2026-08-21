@@ -305,7 +305,7 @@ impl App {
         ui.horizontal(|ui| {
             let (colour, dot) = match self.state.status {
                 Status::Listening => (egui::Color32::from_rgb(220, 60, 60), "●"),
-                Status::Connecting | Status::Stopping => {
+                Status::Connecting | Status::Stopping | Status::Transcribing => {
                     (egui::Color32::from_rgb(220, 170, 60), "●")
                 }
                 Status::Idle => (egui::Color32::GRAY, "○"),
@@ -436,7 +436,9 @@ impl App {
                 painter.rect_filled(bar, 1.0, colour);
             }
 
-            if running {
+            if self.state.status == Status::Transcribing {
+                ui.weak(format!("file {:.0}%", self.state.progress * 100.0));
+            } else if running {
                 ui.weak("(session running)");
             } else if self.state.rms > 0.001 {
                 ui.weak(format!("{:.0}%", self.state.rms * 100.0));
@@ -528,6 +530,18 @@ impl App {
                         }
                     }
                 });
+            if ui
+                .add_enabled(!running, egui::Button::new("File…"))
+                .on_hover_text("Transcribe an audio file: wav, mp3, m4a, opus, flac")
+                .clicked()
+                && let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Audio", &["wav", "mp3", "m4a", "opus", "flac", "ogg", "aac"])
+                    .pick_file()
+            {
+                action = Some(Request::TranscribeFile {
+                    path: p.display().to_string(),
+                });
+            }
             let has_text2 = !self.state.transcript.trim().is_empty();
             if ui
                 .add_enabled(has_text2 && !running, egui::Button::new("Clear"))

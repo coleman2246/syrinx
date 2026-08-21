@@ -22,6 +22,8 @@ pub enum Status {
     Connecting,
     Listening,
     Stopping,
+    /// Working through an audio file rather than a live source.
+    Transcribing,
 }
 
 impl Status {
@@ -31,6 +33,7 @@ impl Status {
             Status::Connecting => "Connecting…",
             Status::Listening => "LISTENING",
             Status::Stopping => "Stopping…",
+            Status::Transcribing => "TRANSCRIBING FILE",
         }
     }
 

@@ -104,7 +104,9 @@ impl ksni::Tray for SyrinxTray {
         match self.state.status {
             // A record dot is unambiguous about the microphone being live.
             Status::Listening => "media-record".into(),
-            Status::Connecting | Status::Stopping => "audio-input-microphone".into(),
+            Status::Connecting | Status::Stopping | Status::Transcribing => {
+                "audio-input-microphone".into()
+            }
             Status::Idle => "microphone-sensitivity-muted".into(),
         }
     }

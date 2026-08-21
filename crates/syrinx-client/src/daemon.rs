@@ -85,6 +85,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         opts,
         session: None,
         overlay: None,
+        file_job: None,
         preview: None,
         last_viewer: None,
         last: Default::default(),
@@ -157,6 +158,12 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                         message: format!("{e:#}"),
                     },
                 },
+                Request::TranscribeFile { path } => match state.transcribe_file(&path) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
                 Request::Clear => {
                     state.clear();
                     Response::Ok
@@ -172,6 +179,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         }
 
         state.reap_finished_session();
+        state.reap_file_job();
         state.update_preview();
 
         let snap = state.snapshot();
@@ -247,6 +255,15 @@ fn serve_client(
     }
 }
 
+/// State of a file transcription.
+#[derive(Default)]
+struct FileJob {
+    progress: f32,
+    done: bool,
+    text: String,
+    error: Option<String>,
+}
+
 struct DaemonRuntime {
     opts: DaemonOptions,
     session: Option<SessionHandle>,
@@ -259,6 +276,8 @@ struct DaemonRuntime {
     /// When a viewer last asked for state. Metering stops shortly after the
     /// last one closes.
     last_viewer: Option<std::time::Instant>,
+    /// A file transcription in flight: its progress, and the text when done.
+    file_job: Option<Arc<Mutex<FileJob>>>,
     /// The last finished session's state.
     ///
     /// Without this, stopping wipes the transcript from every viewer at exactly
@@ -325,6 +344,16 @@ impl DaemonRuntime {
             .map(|s| s.state())
             .unwrap_or_else(|| self.last.clone());
         let mut out = DaemonState::from_session(&s, self.opts.mode, self.opts.source_key.clone());
+
+        // A file job owns the status while it runs, so a viewer shows progress
+        // rather than an idle window with nothing happening.
+        if let Some(job) = &self.file_job {
+            let j = job.lock().expect("file job poisoned");
+            if !j.done {
+                out.status = crate::session::Status::Transcribing;
+                out.progress = j.progress;
+            }
+        }
         // Preview levels apply only when idle; a running session meters the
         // audio it is actually sending.
         if !self.running()
@@ -410,6 +439,79 @@ impl DaemonRuntime {
         if let Some(mut c) = self.overlay.take() {
             let _ = c.kill();
         }
+    }
+
+    /// Start transcribing a file on a background thread.
+    ///
+    /// Runs through the same streaming session a microphone uses: the model
+    /// consumes fixed chunks and emits as it goes, so a file is just chunks
+    /// arriving faster than real time.
+    fn transcribe_file(&mut self, path: &str) -> Result<()> {
+        if self.running() {
+            anyhow::bail!("stop the current session before transcribing a file");
+        }
+        if self.file_job.as_ref().is_some_and(|j| {
+            !j.lock().expect("file job poisoned").done
+        }) {
+            anyhow::bail!("already transcribing a file");
+        }
+
+        let samples = crate::bulk::decode(std::path::Path::new(path))?;
+        let job = Arc::new(Mutex::new(FileJob::default()));
+        self.file_job = Some(job.clone());
+        let (url, token) = (self.opts.config.url.clone(), self.opts.config.token.clone());
+
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let mut j = job.lock().expect("file job poisoned");
+                    j.error = Some(format!("building a runtime: {e}"));
+                    j.done = true;
+                    return;
+                }
+            };
+            let j2 = job.clone();
+            let result = rt.block_on(async move {
+                crate::bulk::transcribe(&url, &token, &samples, |p| {
+                    j2.lock().expect("file job poisoned").progress = p;
+                })
+                .await
+            });
+            let mut j = job.lock().expect("file job poisoned");
+            match result {
+                Ok(text) => j.text = text,
+                Err(e) => j.error = Some(format!("{e:#}")),
+            }
+            j.done = true;
+        });
+        Ok(())
+    }
+
+    /// Fold a finished file job into the retained transcript.
+    fn reap_file_job(&mut self) {
+        let Some(job) = &self.file_job else { return };
+        let (done, text, error) = {
+            let j = job.lock().expect("file job poisoned");
+            (j.done, j.text.clone(), j.error.clone())
+        };
+        if !done {
+            return;
+        }
+        if let Some(e) = error {
+            error!("file transcription failed: {e}");
+            self.last.error = Some(e);
+        } else {
+            self.last.transcript = text;
+            // No segments: a file is sent far faster than real time, so arrival
+            // order says nothing about position in the recording. Timestamped
+            // saving would produce times that are simply wrong.
+            self.last.segments.clear();
+        }
+        self.file_job = None;
     }
 
     /// Discard the retained transcript. Ignored while a session is running,
