@@ -26,6 +26,14 @@ use syrinx_client::{
 /// an idle window is not doing constant socket work.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How often the source list is re-scanned.
+///
+/// Applications only exist in the graph while they are playing, so a list read
+/// once at startup never shows an app that started afterwards -- which looks
+/// like per-application capture is missing rather than merely stale. Slower
+/// than the state poll because scanning shells out to `pw-dump`.
+const SOURCE_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -95,6 +103,7 @@ struct App {
     sources: Vec<Source>,
     save_format: save::Format,
     last_poll: Instant,
+    last_source_scan: Instant,
     /// Set when the socket drops, so the window can say so rather than showing
     /// stale state as if it were live.
     disconnected: bool,
@@ -114,6 +123,7 @@ impl App {
             sources: Vec::new(),
             save_format: save::Format::default(),
             last_poll: Instant::now() - POLL_INTERVAL,
+            last_source_scan: Instant::now(),
             disconnected: false,
             status_line: None,
             list_error: None,
@@ -126,6 +136,7 @@ impl App {
     }
 
     fn refresh_sources(&mut self) {
+        self.last_source_scan = Instant::now();
         match syrinx_client::list_sources() {
             Ok(list) => {
                 self.list_error = None;
@@ -174,6 +185,14 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         if self.last_poll.elapsed() >= POLL_INTERVAL {
             self.poll();
+        }
+        // Rescan while idle only: the list is frozen during a session anyway,
+        // and shelling out to pw-dump every couple of seconds for no reason is
+        // wasteful.
+        if !self.state.status.is_active()
+            && self.last_source_scan.elapsed() >= SOURCE_RESCAN_INTERVAL
+        {
+            self.refresh_sources();
         }
         let running = self.state.status.is_active();
 
@@ -316,6 +335,14 @@ impl App {
                             if ui.selectable_label(is, s.display()).clicked() {
                                 chosen = Some(s.stable_key());
                             }
+                        }
+                        // An application exists in the graph only while it is
+                        // playing, so an empty section means "nothing is
+                        // playing", not "unsupported".
+                        if !self.sources.iter().any(|s| s.kind == SourceKind::Application) {
+                            ui.separator();
+                            ui.weak(SourceKind::Application.label());
+                            ui.weak("  nothing is playing audio right now");
                         }
                     });
                 if ui.button("⟳").on_hover_text("Rescan sources").clicked() {

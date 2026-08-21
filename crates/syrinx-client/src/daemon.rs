@@ -76,6 +76,16 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         session: None,
         last: Default::default(),
     };
+
+    // Resolve the source up front so viewers show what would actually be used
+    // rather than the word "default". Enumerating is a subprocess call, so it
+    // happens once here rather than on every state poll.
+    if state.opts.source_key.is_none()
+        && let Ok(sources) = list_sources()
+        && let Ok(s) = choose_source(&sources, None)
+    {
+        state.opts.source_key = Some(s.stable_key());
+    }
     let mut quit = false;
 
     while !quit {

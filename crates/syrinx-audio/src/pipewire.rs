@@ -66,7 +66,10 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
                     .get("node.description")
                     .and_then(|d| d.as_str())
                     .unwrap_or_else(|| node_name.as_deref().unwrap_or("unknown"));
-                (SourceKind::Monitor, format!("Monitor of {desc}"))
+                // Named for what it captures, not how. "Monitor of X" is the
+                // PipeWire mechanism; "everything playing through X" is what
+                // the user is choosing.
+                (SourceKind::Monitor, format!("Everything playing on {desc}"))
             }
             // An application playing audio. Captured by linking its output
             // ports into a capture stream; see the `link` module for why
@@ -112,7 +115,27 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
 
 /// Enumerate capturable sources from the running PipeWire daemon.
 pub fn list_sources() -> Result<Vec<Source>> {
-    list_all_sources()
+    let mut sources = list_all_sources()?;
+    // Mark the default output, since a machine with several sinks otherwise
+    // offers three indistinguishable "everything playing" entries.
+    if let Some(default_sink) = default_sink_name() {
+        for s in &mut sources {
+            if s.kind == SourceKind::Monitor && s.stable_name.as_deref() == Some(&default_sink) {
+                s.name = format!("{} (default output)", s.name);
+            }
+        }
+    }
+    Ok(sources)
+}
+
+/// The current default sink's `node.name`.
+fn default_sink_name() -> Option<String> {
+    let out = std::process::Command::new("pactl")
+        .arg("get-default-sink")
+        .output()
+        .ok()?;
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 /// Alias kept for the diagnostics example.
@@ -367,7 +390,7 @@ mod tests {
         let s = parse_sources(json).unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].kind, SourceKind::Monitor);
-        assert_eq!(s[0].name, "Monitor of Starship Analog Stereo");
+        assert_eq!(s[0].name, "Everything playing on Starship Analog Stereo");
     }
 
     #[test]
