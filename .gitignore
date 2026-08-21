@@ -10,9 +10,13 @@ Cargo.lock.bak
 *.bin
 tokenizer.model
 
-# Audio fixtures can be large; golden test fixtures are added explicitly
+# Audio fixtures can be large; golden test fixtures are kept.
+# The negation needs `**` -- the fixtures live under crates/<name>/tests/, and
+# a leading path without it only matches at the repository root, so the golden
+# fixture was silently untracked and `cargo test --test golden` could not run
+# from a fresh clone.
 *.wav
-!tests/fixtures/golden/*.wav
+!**/tests/fixtures/golden/*.wav
 
 # Local config containing the shared auth token
 config.local.toml
