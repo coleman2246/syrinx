@@ -1535,6 +1535,7 @@ name = "parakeet-audio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cpal",
  "parakeet-proto",
  "serde",
  "serde_json",

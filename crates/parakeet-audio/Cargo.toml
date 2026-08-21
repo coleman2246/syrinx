@@ -12,3 +12,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# Used on Windows for WASAPI loopback; compiled everywhere so the backend
+# type-checks during Linux development.
+cpal = "0.18"

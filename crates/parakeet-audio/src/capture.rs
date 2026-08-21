@@ -1,111 +1,109 @@
-//! Capturing from any PipeWire node via `pw-record`.
-//!
-//! `pw-record` is used as a subprocess rather than binding libpipewire because
-//! it already handles graph negotiation, format conversion and resampling, and
-//! can target any node -- microphone, monitor, or a single application's stream.
-//! It writes raw PCM to stdout, which is exactly the shape needed here.
-//!
-//! Capturing an application's stream is a **tap**: the application keeps playing
-//! to its normal output. Nothing is rerouted, so transcribing a video does not
-//! silence it.
+//! Starting a capture, dispatched to whichever backend the source came from.
 
+use crate::source::{Source, SourceTarget};
 use anyhow::{Context, Result};
-use std::process::Stdio;
-use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
-
-/// Bytes read per poll. 16 kHz mono s16 is 32 kB/s, so this is ~0.1s of audio:
-/// small enough to stay responsive, large enough to avoid syscall churn.
-const READ_CHUNK: usize = 4096;
+use tracing::info;
 
 /// A running capture. Dropping it stops the capture.
-pub struct Capture {
-    child: Child,
+pub enum Capture {
+    #[cfg(target_os = "linux")]
+    PipeWire(crate::pipewire::PwCapture),
+    Cpal(CpalCapture),
 }
 
 impl Capture {
-    /// Start capturing 16 kHz mono f32 samples from a PipeWire node.
-    ///
-    /// `pw-record` handles the rate conversion, so whatever the node runs at
-    /// natively, samples arrive at the rate the model expects.
-    pub fn start(node_id: u32, tx: mpsc::Sender<Vec<f32>>) -> Result<Self> {
-        let mut child = Command::new("pw-record")
-            .args([
-                "--target",
-                &node_id.to_string(),
-                "--rate",
-                &parakeet_proto::SAMPLE_RATE.to_string(),
-                "--channels",
-                "1",
-                "--format",
-                "s16",
-                // "-" writes raw PCM to stdout, with no WAV header to skip.
-                "-",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawning pw-record (is PipeWire installed?)")?;
-
-        let mut stdout = child.stdout.take().context("pw-record stdout missing")?;
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(log_stderr(stderr));
-        }
-
-        tokio::spawn(async move {
-            // s16 samples can straddle reads, so carry the odd byte over rather
-            // than decoding it as half a sample.
-            let mut carry: Vec<u8> = Vec::new();
-            let mut buf = vec![0u8; READ_CHUNK];
-            loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) => {
-                        debug!("pw-record closed its output");
-                        break;
-                    }
-                    Ok(n) => {
-                        carry.extend_from_slice(&buf[..n]);
-                        let usable = carry.len() - (carry.len() % 2);
-                        let samples = parakeet_proto::pcm_s16le_to_f32(&carry[..usable]);
-                        carry.drain(..usable);
-                        // try_send: if the consumer is behind, dropping audio
-                        // beats growing a backlog and drifting off real time.
-                        if tx.try_send(samples).is_err() && tx.is_closed() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("reading from pw-record: {e}");
-                        break;
-                    }
-                }
+    /// Begin capturing 16 kHz mono f32 samples from `source`.
+    pub fn start(source: &Source, tx: mpsc::Sender<Vec<f32>>) -> Result<Self> {
+        info!("capturing {:?} ({})", source.kind, source.display());
+        match &source.target {
+            #[cfg(target_os = "linux")]
+            SourceTarget::PipeWireNode(id) => {
+                Ok(Capture::PipeWire(crate::pipewire::PwCapture::start(*id, tx)?))
             }
+            #[cfg(not(target_os = "linux"))]
+            SourceTarget::PipeWireNode(_) => {
+                anyhow::bail!("this source came from PipeWire, which is only available on Linux")
+            }
+            SourceTarget::CpalDevice { name, loopback } => {
+                Ok(Capture::Cpal(CpalCapture::start(name, *loopback, tx)?))
+            }
+        }
+    }
+}
+
+/// cpal capture. The stream is not `Send`, so it lives on its own thread and is
+/// stopped by dropping the handle.
+pub struct CpalCapture {
+    _stop: std::sync::mpsc::Sender<()>,
+}
+
+impl CpalCapture {
+    fn start(name: &str, loopback: bool, tx: mpsc::Sender<Vec<f32>>) -> Result<Self> {
+        use cpal::traits::{DeviceTrait, StreamTrait};
+        use parakeet_proto::{downmix_to_mono, resample_to_16k};
+
+        let device = crate::cpal_backend::find_device(name, loopback)?;
+        let supported = device
+            .default_input_config()
+            .context("querying input config")?;
+        let channels = supported.channels();
+        let rate = supported.sample_rate();
+        let format = supported.sample_format();
+        let config: cpal::StreamConfig = supported.into();
+
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+        // cpal::Stream is !Send, so it cannot be moved into a tokio task; it
+        // gets a dedicated thread that holds it alive until asked to stop.
+        std::thread::spawn(move || {
+            let err_fn = |e| tracing::warn!("audio stream error: {e}");
+            let stream = match format {
+                cpal::SampleFormat::F32 => device.build_input_stream(
+                    config,
+                    move |d: &[f32], _| {
+                        let _ = tx.try_send(resample_to_16k(&downmix_to_mono(d, channels), rate));
+                    },
+                    err_fn,
+                    None,
+                ),
+                cpal::SampleFormat::I16 => device.build_input_stream(
+                    config,
+                    move |d: &[i16], _| {
+                        let f: Vec<f32> = d.iter().map(|s| *s as f32 / 32768.0).collect();
+                        let _ = tx.try_send(resample_to_16k(&downmix_to_mono(&f, channels), rate));
+                    },
+                    err_fn,
+                    None,
+                ),
+                cpal::SampleFormat::U8 => device.build_input_stream(
+                    config,
+                    move |d: &[u8], _| {
+                        // U8 is unsigned with 128 as silence.
+                        let f: Vec<f32> =
+                            d.iter().map(|s| (*s as f32 - 128.0) / 128.0).collect();
+                        let _ = tx.try_send(resample_to_16k(&downmix_to_mono(&f, channels), rate));
+                    },
+                    err_fn,
+                    None,
+                ),
+                other => {
+                    tracing::error!("unsupported sample format {other:?}");
+                    return;
+                }
+            };
+            let Ok(stream) = stream else {
+                tracing::error!("failed to build the input stream");
+                return;
+            };
+            if stream.play().is_err() {
+                tracing::error!("failed to start the input stream");
+                return;
+            }
+            // Block until the handle is dropped; the stream stops with us.
+            let _ = stop_rx.recv();
         });
 
-        info!("capturing from PipeWire node {node_id}");
-        Ok(Self { child })
-    }
-
-    /// Stop capture. Also happens on drop; this just allows awaiting it.
-    pub async fn stop(mut self) {
-        let _ = self.child.kill().await;
-    }
-}
-
-impl Drop for Capture {
-    fn drop(&mut self) {
-        // start_kill rather than kill().await: Drop cannot be async, and
-        // leaking a pw-record process would hold the mic open indefinitely.
-        let _ = self.child.start_kill();
-    }
-}
-
-async fn log_stderr(stderr: tokio::process::ChildStderr) {
-    let mut s = String::new();
-    let mut r = tokio::io::BufReader::new(stderr);
-    if r.read_to_string(&mut s).await.is_ok() && !s.trim().is_empty() {
-        warn!("pw-record: {}", s.trim());
+        Ok(Self { _stop: stop_tx })
     }
 }
