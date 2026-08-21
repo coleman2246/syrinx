@@ -4,9 +4,9 @@
 //! is what waybar consumes, and it avoids running a GTK main loop alongside
 //! eframe's winit loop.
 //!
-//! Linux only. Windows has a tray, but reaching it means a different crate and
-//! a different event-loop integration, so it is not wired up yet -- the GUI
-//! simply runs without a tray there.
+//! Linux uses ksni here. Windows needs a different crate and a message loop of
+//! its own, which lives in `windows_ui`; both feed the same [`TrayCommand`]
+//! channel, so nothing downstream knows which one is running.
 
 use std::sync::Mutex;
 use crate::{OutputMode, Status};
@@ -51,6 +51,10 @@ pub struct TrayHandle {
     /// provides. The blocking API owns its threading and avoids the question.
     #[cfg(target_os = "linux")]
     handle: ksni::blocking::Handle<SyrinxTray>,
+    /// The Windows tray lives on its own message-loop thread and is not `Send`,
+    /// so it is updated by message rather than by call.
+    #[cfg(windows)]
+    updates: std::sync::mpsc::Sender<TrayState>,
     /// Last state sent, so an unchanged frame does not spam D-Bus at the
     /// repaint rate.
     last: Mutex<Option<TrayState>>,
@@ -67,6 +71,10 @@ impl TrayHandle {
         #[cfg(target_os = "linux")]
         {
             self.handle.update(move |t: &mut SyrinxTray| t.state = state);
+        }
+        #[cfg(windows)]
+        {
+            let _ = self.updates.send(state);
         }
     }
 }
@@ -238,13 +246,16 @@ fn truncate(s: &str, max: usize) -> String {
 /// Returns `None` where no tray is available -- no SNI host running, or a
 /// platform without an implementation. A missing tray must never stop the GUI
 /// starting.
-pub fn start() -> Option<(TrayHandle, mpsc::UnboundedReceiver<TrayCommand>)> {
+pub fn start(hotkey: Option<crate::hotkey::HotKey>) -> Option<(TrayHandle, mpsc::UnboundedReceiver<TrayCommand>)> {
     // Annotated: on platforms without a tray, nothing else pins the element
     // type and inference has nowhere to look.
     let (tx, rx) = mpsc::unbounded_channel::<TrayCommand>();
 
     #[cfg(target_os = "linux")]
     {
+        // Linux hotkeys are registered separately: ksni has no message loop to
+        // share, and on Wayland there is nothing to register at all.
+        let _ = hotkey;
         use ksni::blocking::TrayMethods;
         let tray = SyrinxTray {
             state: TrayState::default(),
@@ -266,11 +277,26 @@ pub fn start() -> Option<(TrayHandle, mpsc::UnboundedReceiver<TrayCommand>)> {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        // The Windows tray makes its own channel, because its thread has to
+        // own both ends of the message loop.
+        let _ = (tx, rx);
+        let (updates, cmds) = crate::windows_ui::start(hotkey)?;
+        Some((
+            TrayHandle {
+                updates,
+                last: Mutex::new(None),
+            },
+            cmds,
+        ))
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         // Both halves are dropped: without a tray there is nothing to send on
         // and nothing to receive from.
-        let _ = (tx, rx);
+        let _ = (tx, rx, hotkey);
         tracing::info!("system tray is not implemented on this platform");
         None
     }
