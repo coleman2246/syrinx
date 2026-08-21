@@ -68,8 +68,18 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
                     .unwrap_or_else(|| node_name.as_deref().unwrap_or("unknown"));
                 (SourceKind::Monitor, format!("Monitor of {desc}"))
             }
-            // An application playing audio. Capturing this taps the stream
-            // without interrupting playback.
+            // An application playing audio.
+            //
+            // NOT CURRENTLY CAPTURABLE. `pw-record --target <stream node>`
+            // establishes a link but no audio flows: measured against a
+            // controlled 440 Hz tone, the app stream yields rms 26 while the
+            // sink monitor carrying the same audio yields rms 341. A null sink
+            // plus `pactl move-sink-input` was also tried and gave rms 19.
+            //
+            // Still enumerated because identifying what is playing is useful
+            // and the right mechanism is likely a variation on the above, but
+            // `list_sources` filters them out so a picker never offers an
+            // option that returns silence.
             "Stream/Output/Audio" => {
                 let app = props
                     .get("application.name")
@@ -109,8 +119,21 @@ pub fn parse_sources(pw_dump_json: &str) -> Result<Vec<Source>> {
     Ok(out)
 }
 
-/// Enumerate sources from the running PipeWire daemon.
+/// Enumerate capturable sources from the running PipeWire daemon.
+///
+/// Application streams are omitted: capturing them does not currently work
+/// (see the note in [`parse_sources`]), and offering a source that returns
+/// silence is worse than not offering it at all.
 pub fn list_sources() -> Result<Vec<Source>> {
+    Ok(list_all_sources()?
+        .into_iter()
+        .filter(|s| s.kind != SourceKind::Application)
+        .collect())
+}
+
+/// Everything, including application streams that cannot yet be captured.
+/// For diagnostics.
+pub fn list_all_sources() -> Result<Vec<Source>> {
     let out = std::process::Command::new("pw-dump")
         .output()
         .context("running pw-dump (is PipeWire running?)")?;
