@@ -1,0 +1,50 @@
+# syrinx behind an existing nginx.
+#
+# For a host that already terminates TLS -- if nothing is on 80/443 yet, the
+# Caddy overlay in compose.tls.yaml is less work. Paste this beside the other
+# server blocks and reload.
+#
+# Assumes, as an existing certbot setup will already have:
+#   - `map $http_upgrade $connection_upgrade` in the http block
+#   - an ACME challenge location on port 80
+#
+# Get the certificate first, or nginx will not start:
+#   sudo certbot certonly --webroot -w /var/www/certbot -d dictate.example.com
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name dictate.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/dictate.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/dictate.example.com/privkey.pem;
+
+    location / {
+        # The container, published on loopback. Nothing but nginx should be
+        # able to reach the plaintext port.
+        proxy_pass http://127.0.0.1:8770;
+
+        # WebSockets need HTTP/1.1 and an explicit upgrade. Without these three
+        # lines nginx answers the handshake with a plain 200 and the client
+        # reports a protocol error, which reads like a syrinx bug.
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Dictation is a long silence punctuated by speech. The default 60s
+        # read timeout would drop a session whenever someone stopped talking
+        # to think.
+        proxy_read_timeout  1h;
+        proxy_send_timeout  1h;
+
+        # Transcripts come back a fragment at a time. Buffering would hold them
+        # until nginx decided it had enough, which is the one thing a live
+        # transcript cannot afford.
+        proxy_buffering off;
+    }
+}

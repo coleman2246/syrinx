@@ -1,5 +1,10 @@
 # TLS termination, for reaching syrinx from outside the LAN.
 #
+# **Only for a host with nothing already on 80 and 443.** Where a reverse proxy
+# already terminates TLS -- nginx, Traefik, another Caddy -- this will fail to
+# bind and there is no reason to run a second one. Use nginx-syrinx.conf.example
+# instead.
+#
 #   docker compose -f docker/compose.yaml -f docker/compose.tls.yaml up -d
 #
 # A separate file rather than a compose profile: compose interpolates every

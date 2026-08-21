@@ -76,7 +76,25 @@ bearer token travels in the clear on every connection, and so does the audio
 and every transcript coming back. Anyone on the path reads the token once and
 has permanent access to a microphone service.
 
-For anything beyond the LAN, terminate TLS:
+You do not visit a certificate authority to fix this. Let's Encrypt *is* one,
+it is free, and both options below talk to it for you — request, prove control
+of the domain, install, renew.
+
+**If a reverse proxy already terminates TLS on the host** (nginx, Traefik), add
+a server block for syrinx rather than running a second one: see
+`docker/nginx-syrinx.conf.example`. Get the certificate with the setup you
+already have, e.g.
+
+```bash
+sudo certbot certonly --webroot -w /var/www/certbot -d dictate.example.com
+```
+
+The only part that needs care is the WebSocket upgrade. nginx will not proxy a
+WebSocket without `proxy_http_version 1.1` and explicit `Upgrade`/`Connection`
+headers; without them the handshake gets a plain 200 back and the client
+reports a protocol error that looks like a syrinx bug.
+
+**If nothing is on 80 and 443 yet**, the Caddy overlay is less work:
 
 ```bash
 # in docker/.env
