@@ -13,7 +13,7 @@
 //!   other session;
 //! - the socket writer, draining emitted messages back to the client.
 
-use crate::asr::AsrBackend;
+use crate::asr::lifecycle::ModelHandle;
 use crate::auth::check_bearer;
 use crate::config::Config;
 use crate::session::Session;
@@ -34,7 +34,8 @@ const AUDIO_QUEUE_DEPTH: usize = 8;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub backend: Arc<dyn AsrBackend>,
+    /// Lazily loaded. The server holds zero VRAM until a session arrives.
+    pub model: Arc<ModelHandle>,
     pub config: Arc<Config>,
     /// Admission control. Sessions beyond the limit are refused outright rather
     /// than accepted into a pool that degrades everyone.
@@ -42,10 +43,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(backend: Arc<dyn AsrBackend>, config: Arc<Config>) -> Self {
+    pub fn new(model: Arc<ModelHandle>, config: Arc<Config>) -> Self {
         let slots = Arc::new(Semaphore::new(config.max_sessions));
         Self {
-            backend,
+            model,
             config,
             slots,
         }
@@ -87,14 +88,45 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         None => return,
     };
 
+    // Load the model now, not at startup. Loading is blocking and can take a
+    // couple of seconds, so it must not run on the async runtime.
+    let handle = state.model.clone();
+    let backend = match tokio::task::spawn_blocking(move || handle.get_or_load()).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            // Most likely the VRAM guard refusing because a neighbour is busy.
+            // Transient, so the client may retry.
+            warn!("model unavailable: {e:#}");
+            let _ = tx
+                .send(json_msg(&ServerMessage::Error {
+                    code: ErrorCode::Capacity,
+                    message: e.to_string(),
+                    retryable: true,
+                }))
+                .await;
+            return;
+        }
+        Err(e) => {
+            warn!("model load task failed: {e}");
+            let _ = tx
+                .send(json_msg(&ServerMessage::Error {
+                    code: ErrorCode::Internal,
+                    message: "model load failed".into(),
+                    retryable: false,
+                }))
+                .await;
+            return;
+        }
+    };
+
     let session_id = uuid::Uuid::new_v4().to_string();
     info!(%session_id, ?mode, "session started");
 
     let _ = tx
         .send(json_msg(&ServerMessage::SessionReady {
             session_id: session_id.clone(),
-            chunk_ms: state.backend.chunk_ms(),
-            model: state.backend.model_name().to_string(),
+            chunk_ms: backend.chunk_ms(),
+            model: backend.model_name().to_string(),
         }))
         .await;
 
@@ -102,7 +134,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (msg_tx, mut msg_rx) = mpsc::channel::<ServerMessage>(32);
 
     // Inference on the blocking pool: it is synchronous and GPU-bound.
-    let backend = state.backend.clone();
     let sid = session_id.clone();
     let infer = tokio::task::spawn_blocking(move || {
         let mut session = Session::new(mode, backend.as_ref(), sid);

@@ -92,9 +92,12 @@ The governing rule: **this server is the lowest-priority GPU tenant on the host
 and must actively yield.** It must never be the process that wins an allocation
 race against the cameras or a film.
 
-- **Zero footprint when idle.** Models are lazy-loaded on first use and
-  **unloaded after an idle timeout**. The server holds no VRAM for most of the
-  day. A keep-warm window prevents reload thrash during a dictation session.
+- **Near-zero footprint when idle.** Models are lazy-loaded on first use and
+  **unloaded after an idle timeout**. Measured: 0 MiB before the first session,
+  3398 MiB while serving, **164 MiB once unloaded** -- a 95% reduction. The
+  residual is the CUDA context, which cannot be released without exiting the
+  process, so "zero when idle" is not literally achievable. A keep-warm window
+  prevents reload thrash during a dictation session.
 - **Pre-load free-VRAM check.** Query free VRAM before loading. If there is not
   room for the model plus a safety margin, do not load — refuse the session with
   `error{code:"capacity"}`. Refusing is correct behaviour here, not a failure.

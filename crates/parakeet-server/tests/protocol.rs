@@ -7,9 +7,11 @@ use futures_util::{SinkExt, StreamExt};
 use parakeet_proto::{ClientMessage, Encoding, ErrorCode, Mode, ServerMessage};
 use parakeet_server::app::build_router;
 use parakeet_server::asr::AsrBackend;
+use parakeet_server::asr::lifecycle::{FixedVramProbe, ModelHandle, VramGuard};
 use parakeet_server::asr::mock::MockBackend;
 use parakeet_server::config::Config;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as TMessage;
 
@@ -28,9 +30,19 @@ async fn spawn_server(max_sessions: usize) -> String {
         .unwrap(),
     );
     // Small chunks keep the tests fast: 4 samples per inference chunk.
-    let backend: Arc<dyn AsrBackend> =
-        Arc::new(MockBackend::new(&["alpha", "beta", "gamma"]).with_chunk_samples(4));
-    let app = build_router(backend, config);
+    // FixedVramProbe(None) means "no GPU", so the VRAM guard is skipped -- these
+    // tests exercise the protocol, not the tenancy policy.
+    let model = Arc::new(ModelHandle::new(
+        Arc::new(|| {
+            Ok(Arc::new(MockBackend::new(&["alpha", "beta", "gamma"]).with_chunk_samples(4))
+                as Arc<dyn AsrBackend>)
+        }),
+        VramGuard::new(1536),
+        Arc::new(FixedVramProbe(None)),
+        3400,
+        Duration::from_secs(600),
+    ));
+    let app = build_router(model, config);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
