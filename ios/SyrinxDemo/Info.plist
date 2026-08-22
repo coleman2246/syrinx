@@ -9,6 +9,20 @@
     <key>CFBundlePackageType</key>                <string>APPL</string>
     <key>CFBundleShortVersionString</key>         <string>0.1</string>
     <key>CFBundleVersion</key>                    <string>1</string>
+    <!-- Loose icon files rather than an asset catalogue. actool refuses to
+         run without a simulator runtime installed -- "No available simulator
+         runtimes for platform iphonesimulator" -- which is a strange thing to
+         need in order to compile a PNG for a device build, and the build
+         machine has none. CFBundleIconFiles predates catalogues and iOS still
+         honours it. -->
+    <key>CFBundleIcons</key>
+    <dict>
+        <key>CFBundlePrimaryIcon</key>
+        <dict>
+            <key>CFBundleIconFiles</key>
+            <array><string>AppIcon60x60</string></array>
+        </dict>
+    </dict>
     <key>LSRequiresIPhoneOS</key>                 <true/>
     <key>UILaunchScreen</key>                     <dict/>
     <!-- Without this the app is killed the moment it touches the microphone. -->
