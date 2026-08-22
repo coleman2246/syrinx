@@ -15,6 +15,16 @@ xcodebuild -project SyrinxDemo.xcodeproj -target SyrinxDemo \
     CONFIGURATION_BUILD_DIR="$BUILD" \
     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
+# Check the entitlements parse before handing them to codesign.
+#
+# codesign reports a malformed plist as "AMFIUnserializeXML: syntax error"
+# with a line number and no hint as to what is wrong with that line. plutil
+# names the actual fault. Worth the two seconds: XML rejects "--" inside a
+# comment, which is easy to write by accident and invisible on inspection.
+for e in SyrinxDemo/SyrinxDemo.entitlements SyrinxKeyboard/SyrinxKeyboard.entitlements; do
+    plutil -lint "$e" >/dev/null || { echo "malformed entitlements: $e" >&2; exit 1; }
+done
+
 # Ad-hoc sign so the entitlements are actually embedded in the binaries.
 #
 # With CODE_SIGNING_ALLOWED=NO, Xcode never writes the entitlements blob at

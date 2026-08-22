@@ -3,8 +3,8 @@
 <plist version="1.0">
 <dict>
     <!-- The channel the keyboard reads transcript text from. Without this
-         declared, a signer has nothing to grant and the shared container
-         simply does not exist -- which looks identical to the entitlement
+         declared, a signer has nothing to grant, so the shared container
+         simply does not exist, which looks identical to the entitlement
          being refused. -->
     <key>com.apple.security.application-groups</key>
     <array>
