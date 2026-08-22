@@ -32,15 +32,16 @@ enum AudioSession {
     /// does not throw, so this makes no attempt to remember whether it has
     /// been called. It used to, and a cached "yes" that iOS had already
     /// invalidated meant skipping the one call that would have fixed it.
-    static func ensureActive() throws {
+    static func ensureActive(mode: AVAudioSession.Mode = .measurement) throws {
         observe()
         let s = AVAudioSession.sharedInstance()
-        if s.category != .playAndRecord || !s.categoryOptions.contains(.mixWithOthers) {
+        if s.category != .playAndRecord || s.mode != mode
+            || !s.categoryOptions.contains(.mixWithOthers) {
             // .measurement disables the input processing that would fight the
             // recogniser. .mixWithOthers is not accepted on .record, which is
             // why the category is .playAndRecord despite nothing being played.
             try labelled("setting the audio category") {
-                try s.setCategory(.playAndRecord, mode: .measurement,
+                try s.setCategory(.playAndRecord, mode: mode,
                                   options: [.mixWithOthers, .allowBluetooth])
             }
         }
@@ -131,6 +132,9 @@ enum AudioSession {
         }
     }
 
+    /// Record something worth knowing about later. Visible in Settings.
+    static func note(_ what: String) { record(what) }
+
     private static func record(_ what: String) {
         lastEvent = what
         eventCount += 1
@@ -145,7 +149,7 @@ enum AudioSession {
             permission = "\(s.recordPermission)"
         }
         return """
-        category: \(s.category.rawValue.replacingOccurrences(of: "AVAudioSessionCategory", with: ""))
+        category: \(s.category.rawValue.replacingOccurrences(of: "AVAudioSessionCategory", with: "")) / \(s.mode.rawValue.replacingOccurrences(of: "AVAudioSessionMode", with: ""))
         options: \(s.categoryOptions.rawValue)
         mic permission: \(permission)
         other audio: \(s.isOtherAudioPlaying)

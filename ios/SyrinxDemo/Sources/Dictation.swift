@@ -139,9 +139,15 @@ final class Dictation: ObservableObject {
             return
         }
 
+        // Silence stops before the engine starts. The session stays active --
+        // that is the part that must never be given up in the background --
+        // but a player running on it while the engine opens an input is a
+        // conflict the engine reports only as 'what'.
+        KeepAwake.shared.stop()
         do {
             try c.start()
         } catch {
+            if keepAwake { KeepAwake.shared.start() }
             self.error = "Microphone: \(AudioCapture.describe(error))"
             session = nil
             capture = nil
@@ -178,7 +184,7 @@ final class Dictation: ObservableObject {
         session?.stop(); session = nil
         // The session stays up so the keyboard can start the next one; giving
         // it back would mean reclaiming it from the background, which fails.
-        if !keepAwake { AudioSession.deactivate() }
+        if keepAwake { KeepAwake.shared.start() } else { AudioSession.deactivate() }
         running = false
         status = "Idle"
     }

@@ -30,10 +30,25 @@ final class AudioCapture {
     }
 
     func start() throws {
+        do {
+            try attempt(mode: .measurement)
+        } catch {
+            // .measurement suppresses the input processing that would fight
+            // the recogniser, which is why it is tried first. It also pins the
+            // route hard, and a route the engine cannot open fails with 'what'
+            // and nothing further. The plain mode transcribes slightly worse
+            // than not transcribing at all.
+            AudioSession.note("measurement mode failed: \(AudioSession.describe(error))")
+            teardown()
+            try attempt(mode: .default)
+        }
+    }
+
+    private func attempt(mode: AVAudioSession.Mode) throws {
         // Already active since launch in the normal case. Activating here is
         // the call iOS refuses in the background, so it must not be the first
         // time it happens.
-        try AudioSession.ensureActive()
+        try AudioSession.ensureActive(mode: mode)
 
         let input = engine.inputNode
         let hardware = input.outputFormat(forBus: 0)
@@ -85,6 +100,15 @@ final class AudioCapture {
                 NSLocalizedDescriptionKey: "starting the audio engine: \(AudioSession.describe(error))"
             ])
         }
+    }
+
+    /// Undo a failed attempt, so the next one starts from a clean engine
+    /// rather than one carrying a tap and a half-built graph.
+    private func teardown() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        engine.reset()
+        converter = nil
     }
 
     func stop() {
