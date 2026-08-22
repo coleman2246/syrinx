@@ -21,6 +21,11 @@ tokenizer.model
 # Local config containing the shared auth token
 config.local.toml
 .env
+# Baked into the iOS app at build time; holds the server token.
+ios/Local.xcconfig
+# Generated from ios/project.yml by xcodegen -- machine-managed UUIDs.
+ios/*.xcodeproj/
+ios/build/
 
 # Editor / OS
 .vscode/

@@ -6,6 +6,16 @@ import SwiftUI
 /// Deliberately thin. Anything that could live in Rust does — this holds no
 /// protocol knowledge, no reconnection policy and no transcript assembly
 /// beyond appending what the core hands over.
+extension Bundle {
+    /// A build-time value from Info.plist, or nil when it was left empty --
+    /// which is what a clean checkout without Local.xcconfig produces.
+    static func baked(_ key: String) -> String? {
+        guard let v = main.object(forInfoDictionaryKey: key) as? String,
+              !v.isEmpty else { return nil }
+        return v
+    }
+}
+
 @MainActor
 final class Dictation: ObservableObject {
     @Published var transcript = ""
@@ -13,8 +23,12 @@ final class Dictation: ObservableObject {
     @Published var error: String?
     @Published var running = false
 
-    @AppStorage("serverURL") var serverURL = "wss://dictate.example.com/v1/stream"
-    @AppStorage("token") var token = ""
+    // Defaults come from the build, so the app works on first launch without
+    // anyone typing a 40-character token on a phone keyboard. Whatever the
+    // user sets in Settings wins from then on.
+    @AppStorage("serverURL") var serverURL = Bundle.baked("SyrinxURL")
+        ?? "wss://dictate.example.com/v1/stream"
+    @AppStorage("token") var token = Bundle.baked("SyrinxToken") ?? ""
 
     private var session: SyrinxCoreSession?
     private var capture: AudioCapture?

@@ -16,10 +16,19 @@ targets:
       - path: SyrinxDemo/Sources
     info:
       path: SyrinxDemo/Info.plist
+      properties:
+        # Populated from Local.xcconfig, which is gitignored. Empty in a clean
+        # checkout, so the app falls back to its placeholder and the token is
+        # never in the repository.
+        SyrinxURL: $(SYRINX_URL)
+        SyrinxToken: $(SYRINX_TOKEN)
     dependencies:
       # Built by crates/syrinx-ios/build-xcframework.sh.
       - framework: ../target/SyrinxCore.xcframework
         embed: false        # a static library is linked in, never embedded
+    configFiles:
+      Debug: Local.xcconfig
+      Release: Local.xcconfig
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: space.aragonite.SyrinxDemo
