@@ -1,0 +1,17 @@
+[package]
+name = "syrinx-ios"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# staticlib, not cdylib: iOS forbids loading unsigned dynamic libraries, so
+# everything must be linked into the app binary.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+syrinx-client.workspace = true
+syrinx-proto.workspace = true
+tokio.workspace = true
+tracing.workspace = true

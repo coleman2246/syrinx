@@ -552,6 +552,7 @@ impl DaemonRuntime {
                         label: None,
                         inject,
                         stream,
+                        external_audio: None,
                     },
                     || {},
                 ));
@@ -576,6 +577,7 @@ impl DaemonRuntime {
                             label,
                             inject,
                             stream: stream.clone(),
+                            external_audio: None,
                         },
                         || {},
                     ));

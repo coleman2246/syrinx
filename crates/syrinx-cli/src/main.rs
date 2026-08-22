@@ -371,6 +371,7 @@ fn run(
                 label: None,
                 inject: cfg.inject,
                 stream: stream_target.clone(),
+                external_audio: None,
             },
             // The CLI has nothing to repaint, so state changes need no callback.
             || {},
@@ -389,6 +390,7 @@ fn run(
                         label,
                         inject: cfg.inject,
                         stream: stream_target.clone(),
+                        external_audio: None,
                     },
                     || {},
                 )

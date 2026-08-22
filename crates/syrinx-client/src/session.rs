@@ -76,7 +76,7 @@ pub struct SessionState {
 }
 
 /// Parameters for a run.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionOptions {
     pub url: String,
     pub token: String,
@@ -90,6 +90,16 @@ pub struct SessionOptions {
     pub inject: crate::inject::Method,
     /// Append each committed fragment to this file as it arrives.
     pub stream: Option<(std::path::PathBuf, crate::save::Format)>,
+    /// Audio supplied by the caller rather than captured from a device.
+    ///
+    /// When set, `sources` is ignored and no capture is started. This is the
+    /// seam that lets the session run where syrinx cannot open a microphone
+    /// itself -- on iOS the audio comes from AVAudioEngine on the Swift side,
+    /// and everything downstream of this channel is unchanged.
+    ///
+    /// Samples must be 16 kHz mono f32, the same as a capture backend
+    /// produces.
+    pub external_audio: Option<mpsc::Receiver<Vec<f32>>>,
 }
 
 /// Handle to a running session. Dropping it stops the session.
@@ -171,7 +181,7 @@ fn fail(state: &Arc<Mutex<SessionState>>, msg: String) {
 }
 
 async fn run(
-    opts: SessionOptions,
+    mut opts: SessionOptions,
     state: Arc<Mutex<SessionState>>,
     mut stop_rx: oneshot::Receiver<()>,
     notify: Arc<impl Fn() + Send + Sync + 'static>,
@@ -242,17 +252,30 @@ async fn run(
     // model load time.
     let started = std::time::Instant::now();
 
-    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(32);
-    // One source opens directly; several are mixed. A single source through the
-    // mixer would work but adds a queue and a timer for nothing.
-    let _capture: Box<dyn std::any::Any + Send> = if opts.sources.len() == 1 {
-        Box::new(Capture::start(&opts.sources[0], audio_tx).context("starting audio capture")?)
-    } else {
-        Box::new(
-            syrinx_audio::mixer::MixedCapture::start(&opts.sources, audio_tx)
-                .context("starting the combined capture")?,
-        )
-    };
+    // Either the caller feeds us, or we open a device ourselves. The rest of
+    // the session cannot tell the difference: it only ever sees a receiver.
+    let (_capture, mut audio_rx): (Option<Box<dyn std::any::Any + Send>>, _) =
+        match opts.external_audio.take() {
+            Some(rx) => (None, rx),
+            None => {
+                let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(32);
+                // One source opens directly; several are mixed. A single source
+                // through the mixer would work but adds a queue and a timer for
+                // nothing.
+                let cap: Box<dyn std::any::Any + Send> = if opts.sources.len() == 1 {
+                    Box::new(
+                        Capture::start(&opts.sources[0], audio_tx)
+                            .context("starting audio capture")?,
+                    )
+                } else {
+                    Box::new(
+                        syrinx_audio::mixer::MixedCapture::start(&opts.sources, audio_tx)
+                            .context("starting the combined capture")?,
+                    )
+                };
+                (Some(cap), audio_rx)
+            }
+        };
     info!(
         "session running: {} -> {}",
         opts.sources

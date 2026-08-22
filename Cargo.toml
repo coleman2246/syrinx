@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/syrinx-audio", "crates/syrinx-proto", "crates/syrinx-server", "crates/syrinx-gui", "crates/syrinx-client", "crates/syrinx-cli"]
+members = ["crates/syrinx-audio", "crates/syrinx-proto", "crates/syrinx-server", "crates/syrinx-gui", "crates/syrinx-client", "crates/syrinx-cli", "crates/syrinx-ios"]
+# syrinx-ios is only useful when cross-compiled for iOS, and building a 35 MB
+# static library on every desktop build is waste. `cargo build` skips it;
+# `-p syrinx-ios` and `--workspace` still include it.
+default-members = ["crates/syrinx-audio", "crates/syrinx-proto", "crates/syrinx-server", "crates/syrinx-gui", "crates/syrinx-client", "crates/syrinx-cli"]
 
 [workspace.package]
 edition = "2024"
@@ -21,3 +25,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 syrinx-proto = { path = "crates/syrinx-proto" }
 syrinx-audio = { path = "crates/syrinx-audio" }
 syrinx-client = { path = "crates/syrinx-client" }
+syrinx-ios = { path = "crates/syrinx-ios" }
