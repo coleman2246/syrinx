@@ -58,6 +58,17 @@ final class SyrinxCoreSession {
         return String(cString: c)
     }
 
+    /// The current spectrum, as the desktop overlay draws it.
+    ///
+    /// Sized generously and trimmed to what Rust reports, so adding a band on
+    /// that side does not silently truncate here.
+    func levels() -> [Float] {
+        guard let h = handle else { return [] }
+        var buf = [Float](repeating: 0, count: 32)
+        let n = buf.withUnsafeMutableBufferPointer { syrinx_levels(h, $0.baseAddress, $0.count) }
+        return Array(buf.prefix(n))
+    }
+
     var status: Status {
         guard let h = handle else { return .idle }
         return Status(rawValue: syrinx_status(h)) ?? .idle

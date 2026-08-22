@@ -168,6 +168,37 @@ pub unsafe extern "C" fn syrinx_status(session: *mut SyrinxSession) -> i32 {
     }
 }
 
+/// Copy the current spectrum into `out`, returning how many bands were written.
+///
+/// The same bands the desktop overlay draws, computed by the session from the
+/// audio it is actually sending, so the phone's meter cannot disagree with
+/// what was transcribed. Recomputing them on the Swift side would be a second
+/// implementation of something that already exists and already runs.
+///
+/// Writes nothing and returns 0 when there is no session or no room, so a
+/// caller that ignores the result draws an empty meter rather than reading
+/// uninitialised memory.
+///
+/// # Safety
+/// `out` must point to `cap` floats.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn syrinx_levels(
+    session: *mut SyrinxSession,
+    out: *mut c_float,
+    cap: usize,
+) -> usize {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return 0;
+    };
+    if out.is_null() || cap == 0 {
+        return 0;
+    }
+    let levels = s.handle.state().levels;
+    let n = levels.len().min(cap);
+    unsafe { ptr::copy_nonoverlapping(levels.as_ptr(), out, n) };
+    n
+}
+
 /// The session's error, or null. Does not clear it.
 ///
 /// # Safety
@@ -288,5 +319,18 @@ mod tests {
     fn the_version_string_is_nul_terminated() {
         let v = unsafe { CStr::from_ptr(syrinx_version()) }.to_str().unwrap();
         assert!(!v.is_empty());
+    }
+
+    #[test]
+    fn levels_never_write_past_the_buffer() {
+        // A null session is the case a caller hits after stopping, and it has
+        // to leave the buffer alone rather than half-fill it.
+        let mut buf = [7.0f32; 4];
+        let n = unsafe { syrinx_levels(ptr::null_mut(), buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(n, 0);
+        assert_eq!(buf, [7.0; 4]);
+
+        let n = unsafe { syrinx_levels(ptr::null_mut(), ptr::null_mut(), 0) };
+        assert_eq!(n, 0);
     }
 }

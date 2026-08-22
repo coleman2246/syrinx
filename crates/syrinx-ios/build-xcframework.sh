@@ -46,6 +46,10 @@ char *syrinx_take_text(SyrinxSession *session);
 
 SyrinxStatus syrinx_status(SyrinxSession *session);
 
+// Copies up to cap spectrum bands into out, returning how many were written.
+// The same bands the desktop overlay draws.
+size_t syrinx_levels(SyrinxSession *session, float *out, size_t cap);
+
 // Error text or NULL. Free with syrinx_string_free.
 char *syrinx_take_error(SyrinxSession *session);
 

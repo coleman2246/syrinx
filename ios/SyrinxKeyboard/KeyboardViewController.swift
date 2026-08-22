@@ -16,7 +16,14 @@ final class KeyboardViewController: UIInputViewController {
     private let statusLabel = UILabel()
     private let nextKeyboard = UIButton(type: .system)
     private let infoButton = UIButton(type: .system)
+    private let meter = MeterView()
+    /// The last few words inserted, shown under the bars.
+    ///
+    /// Taken from what was typed rather than fetched separately: the keyboard
+    /// already knows, and a second source could disagree with the cursor.
+    private var recent: [String] = []
     private var poll: Timer?
+    private var tick = 0
     private var capturing = false
     /// Whether the last exchange reached the app. The app is only alive in the
     /// background while it holds an audio session, so "not running" is a
@@ -42,7 +49,10 @@ final class KeyboardViewController: UIInputViewController {
         // 5 Hz: text arrives in fragments and the keyboard is on screen while
         // someone is speaking, so this needs to feel immediate without
         // spinning.
-        poll = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+        // 10 Hz, matching the rate the app recomputes the spectrum at, so the
+        // bars move as smoothly as there is data to move them.
+        tick = 0
+        poll = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.drain()
         }
     }
@@ -55,22 +65,46 @@ final class KeyboardViewController: UIInputViewController {
 
     private func drain() {
         guard hasFullAccess, !inFlight else { return }
+        tick += 1
+        // Idle, there is nothing to draw and nothing to type, so polling ten
+        // times a second is ten times a second of nothing. Twice a second is
+        // enough to notice the app coming back.
+        guard capturing || tick % 5 == 0 else { return }
+
         inFlight = true
-        Handoff.take { [weak self] text in
+        Handoff.take { [weak self] frame in
             guard let self else { return }
             self.inFlight = false
             let was = self.reachable
-            self.reachable = text != nil
-            if let text, !text.isEmpty {
-                self.textDocumentProxy.insertText(text)
+            self.reachable = frame != nil
+            guard let frame else {
+                self.meter.clear()
+                if was { self.render() }
+                return
+            }
+            if !frame.text.isEmpty {
+                self.textDocumentProxy.insertText(frame.text)
+                self.remember(frame.text)
+            }
+            if self.capturing {
+                self.meter.show(levels: frame.levels, caption: self.recent.joined(separator: " "))
             }
             if was != self.reachable { self.render() }
         }
     }
 
+    /// Keep the tail of what was typed, for the caption.
+    private func remember(_ text: String) {
+        recent.append(contentsOf: text.split(separator: " ").map(String.init))
+        // Six words is what fits on one line at this size, and is enough to
+        // recognise your own sentence.
+        if recent.count > 6 { recent.removeFirst(recent.count - 6) }
+    }
+
     @objc private func toggleMic() {
         capturing.toggle()
         render()
+        if !capturing { meter.clear(); recent = [] }
         Handoff.setWantsCapture(capturing) { [weak self] delivered in
             guard let self else { return }
             self.reachable = delivered
@@ -159,12 +193,16 @@ final class KeyboardViewController: UIInputViewController {
         infoButton.setImage(UIImage(systemName: "info.circle"), for: .normal)
         infoButton.addTarget(self, action: #selector(typeDiagnostics), for: .touchUpInside)
 
-        let stack = UIStackView(arrangedSubviews: [nextKeyboard, micButton, statusLabel, infoButton])
-        stack.axis = .horizontal
-        stack.spacing = 16
-        stack.alignment = .center
-        stack.isLayoutMarginsRelativeArrangement = true
-        stack.directionalLayoutMargins = .init(top: 8, leading: 16, bottom: 8, trailing: 16)
+        let controls = UIStackView(arrangedSubviews: [nextKeyboard, micButton, statusLabel, infoButton])
+        controls.axis = .horizontal
+        controls.spacing = 16
+        controls.alignment = .center
+        controls.isLayoutMarginsRelativeArrangement = true
+        controls.directionalLayoutMargins = .init(top: 6, leading: 16, bottom: 0, trailing: 16)
+
+        let stack = UIStackView(arrangedSubviews: [controls, meter])
+        stack.axis = .vertical
+        stack.spacing = 2
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
 
@@ -172,8 +210,9 @@ final class KeyboardViewController: UIInputViewController {
             stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             stack.topAnchor.constraint(equalTo: view.topAnchor),
+            controls.heightAnchor.constraint(equalToConstant: 44),
             // A keyboard has no intrinsic height; without this it collapses.
-            view.heightAnchor.constraint(equalToConstant: 88),
+            view.heightAnchor.constraint(equalToConstant: 132),
         ])
     }
 }

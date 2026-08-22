@@ -30,8 +30,24 @@ enum Handoff {
     /// `nil` means the app could not be reached, which the keyboard reports
     /// differently from "reached, nothing new": the first needs the user to
     /// open the app, the second needs them to keep talking.
-    static func take(_ completion: @escaping (String?) -> Void) {
-        LocalLinkClient.send("TAKE", then: completion)
+    static func take(_ completion: @escaping (Frame?) -> Void) {
+        LocalLinkClient.send("TAKE") { reply in
+            guard let reply else {
+                completion(nil)
+                return
+            }
+            completion(Frame(
+                text: reply.first ?? "",
+                levels: (reply.count > 1 ? reply[1] : "")
+                    .split(separator: ",").compactMap { Float($0) }))
+        }
+    }
+
+    /// One poll's worth of state: what to type, and what the microphone is
+    /// hearing. Together because the keyboard wants both at the same instant.
+    struct Frame {
+        let text: String
+        let levels: [Float]
     }
 
     /// Ask the app to start or stop capturing. Reports whether it was heard.
@@ -41,7 +57,7 @@ enum Handoff {
 
     /// Whether the app is capturing, or nil if it cannot be reached.
     static func captureState(_ completion: @escaping (Bool?) -> Void) {
-        LocalLinkClient.send("STATE") { completion($0.map { $0 == "1" }) }
+        LocalLinkClient.send("STATE") { completion($0.map { $0.first == "1" }) }
     }
 
     /// What the entitlement files ask for. Nothing depends on it being granted

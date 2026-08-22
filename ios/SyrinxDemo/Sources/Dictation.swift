@@ -179,6 +179,7 @@ final class Dictation: ObservableObject {
             Handoff.publish(fresh)
         }
         status = s.status.label
+        LocalLink.shared.setLevels(s.levels())
         if let e = s.takeError() {
             error = e
             stop()

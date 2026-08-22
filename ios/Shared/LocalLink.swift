@@ -19,10 +19,14 @@ import Network
 /// array holding one string, because a bare JSON string is a fragment and not
 /// every decoder accepts one at the top level.
 ///
-///     TAKE <secret>   -> ["text not yet inserted"]
+///     TAKE <secret>   -> ["text not yet inserted", "0.1,0.4,..." spectrum]
 ///     START <secret>  -> ["1"]
 ///     STOP <secret>   -> ["0"]
 ///     STATE <secret>  -> ["1"] while capturing, ["0"] otherwise
+///
+/// The meter rides along with TAKE rather than having a verb of its own: the
+/// keyboard wants both at the same moment and at the same rate, and a second
+/// round trip per frame would double the traffic to say nothing new.
 ///
 /// The secret only stops unrelated software on the device from stumbling into
 /// the port. It is a constant in a public repository and protects nothing from
@@ -34,12 +38,12 @@ enum LocalLinkProtocol {
     static let port = NWEndpoint.Port(rawValue: 47632)!
     static let secret = "syrinx-loopback-1"
 
-    static func encode(_ s: String) -> Data {
-        (try? JSONEncoder().encode([s])) ?? Data("[\"\"]".utf8)
+    static func encode(_ items: String...) -> Data {
+        (try? JSONEncoder().encode(items)) ?? Data("[\"\"]".utf8)
     }
 
-    static func decode(_ d: Data) -> String? {
-        try? JSONDecoder().decode([String].self, from: d).first
+    static func decode(_ d: Data) -> [String]? {
+        try? JSONDecoder().decode([String].self, from: d)
     }
 }
 
@@ -52,6 +56,7 @@ final class LocalLink {
     private var listener: NWListener?
     private var pending = ""
     private var capturing = false
+    private var levels: [Float] = []
 
     /// Whether the listener came up, and what went wrong if not.
     ///
@@ -107,7 +112,17 @@ final class LocalLink {
 
     /// Called by the app so STATE reports the truth.
     func setCapturing(_ on: Bool) {
-        lock.lock(); capturing = on; lock.unlock()
+        lock.lock()
+        capturing = on
+        // A meter left at its last value would keep bouncing after the
+        // microphone closed, which reads as "still listening".
+        if !on { levels = [] }
+        lock.unlock()
+    }
+
+    /// Called by the app as the spectrum changes.
+    func setLevels(_ l: [Float]) {
+        lock.lock(); levels = l; lock.unlock()
     }
 
     private func serve(_ c: NWConnection) {
@@ -147,8 +162,9 @@ final class LocalLink {
             lock.lock()
             let text = pending
             pending = ""
+            let meter = levels.map { String(format: "%.3f", $0) }.joined(separator: ",")
             lock.unlock()
-            return LocalLinkProtocol.encode(text)
+            return LocalLinkProtocol.encode(text, meter)
         case "START", "STOP":
             let wanted = parts[0] == "START"
             DispatchQueue.main.async { self.onCapture?(wanted) }
@@ -168,7 +184,7 @@ enum LocalLinkClient {
 
     /// `nil` means the app is not listening, which is a different state from
     /// "listening, nothing to say" and the keyboard reports it differently.
-    static func send(_ verb: String, then completion: @escaping (String?) -> Void) {
+    static func send(_ verb: String, then completion: @escaping ([String]?) -> Void) {
         let c = NWConnection(host: "127.0.0.1", port: LocalLinkProtocol.port, using: .tcp)
         let queue = DispatchQueue(label: "space.aragonite.syrinx.link.client")
         // Guards against calling back twice: a timeout racing a reply, or a

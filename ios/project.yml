@@ -14,6 +14,7 @@ targets:
     platform: iOS
     sources:
       - path: SyrinxDemo/Sources
+      - path: SyrinxDemo/Assets.xcassets
       # The handoff is a contract between the two targets, so it is one file
       # compiled into both rather than a copy in each that can drift.
       - path: Shared
@@ -32,6 +33,7 @@ targets:
         # path -- which silently dropped NSMicrophoneUsageDescription and left
         # an app that dies the moment it opens the microphone.
         INFOPLIST_FILE: SyrinxDemo/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: SyrinxDemo/SyrinxDemo.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: space.aragonite.SyrinxDemo
         SWIFT_VERSION: "5.0"
