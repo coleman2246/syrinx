@@ -33,6 +33,8 @@ final class AudioCapture {
         let session = AVAudioSession.sharedInstance()
         // .record rather than .playAndRecord: we never play anything, and
         // asking for playback would duck other audio for no reason.
+        // .record with the audio background mode keeps capture alive while the
+        // user is in another app typing -- which is the entire point.
         try session.setCategory(.record, mode: .measurement, options: [.duckOthers])
         try session.setActive(true, options: [])
 

@@ -36,6 +36,15 @@ final class Dictation: ObservableObject {
 
     func toggle() { running ? stop() : start() }
 
+    /// Follow the keyboard's mic button. The keyboard cannot open the
+    /// microphone, so it sets a flag and this side acts on it.
+    func syncWithKeyboard() {
+        guard Handoff.usingSharedContainer else { return }
+        let wanted = Handoff.wantsCapture
+        if wanted && !running { start() }
+        if !wanted && running { stop() }
+    }
+
     func start() {
         error = nil
         AudioCapture.requestPermission { [weak self] granted in
@@ -86,7 +95,12 @@ final class Dictation: ObservableObject {
 
     private func drain() {
         guard let s = session else { return }
-        if let fresh = s.takeText() { transcript += fresh }
+        if let fresh = s.takeText() {
+            transcript += fresh
+            // Hand it to the keyboard extension, which cannot record but can
+            // type. Published as it arrives so insertion tracks speech.
+            Handoff.publish(fresh)
+        }
         status = s.status.label
         if let e = s.takeError() {
             error = e

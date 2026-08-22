@@ -18,6 +18,11 @@
          checkout, and the app falls back to its placeholder. -->
     <key>SyrinxURL</key>                          <string>$(SYRINX_URL)</string>
     <key>SyrinxToken</key>                        <string>$(SYRINX_TOKEN)</string>
+    <!-- The whole point is dictating into other apps, so capture has to
+         survive leaving this one. Without this the session dies on
+         backgrounding and the keyboard goes quiet. -->
+    <key>UIBackgroundModes</key>
+    <array><string>audio</string></array>
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationPortrait</string>

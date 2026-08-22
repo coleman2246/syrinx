@@ -18,6 +18,7 @@ targets:
       # Built by crates/syrinx-ios/build-xcframework.sh.
       - framework: ../target/SyrinxCore.xcframework
         embed: false        # a static library is linked in, never embedded
+      - target: SyrinxKeyboard
     configFiles:
       Debug: Local.xcconfig
       Release: Local.xcconfig
@@ -33,6 +34,21 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         # Signed later by SideStore with your own Apple ID, so the build
         # itself needs no certificate and CI never holds credentials.
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+
+  SyrinxKeyboard:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: SyrinxKeyboard
+    settings:
+      base:
+        INFOPLIST_FILE: SyrinxKeyboard/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: space.aragonite.SyrinxDemo.Keyboard
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGN_IDENTITY: ""
