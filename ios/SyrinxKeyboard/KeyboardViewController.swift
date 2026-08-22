@@ -86,10 +86,16 @@ final class KeyboardViewController: UIInputViewController {
                 self.textDocumentProxy.insertText(frame.text)
                 self.remember(frame.text)
             }
-            if self.capturing {
+            // The app is the authority on whether anything is being captured.
+            let changed = self.capturing != frame.capturing
+            self.capturing = frame.capturing
+            if frame.capturing {
                 self.meter.show(levels: frame.levels, caption: self.recent.joined(separator: " "))
+            } else {
+                self.meter.clear()
+                self.recent = []
             }
-            if was != self.reachable { self.render() }
+            if changed || was != self.reachable { self.render() }
         }
     }
 
@@ -211,6 +217,10 @@ final class KeyboardViewController: UIInputViewController {
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             stack.topAnchor.constraint(equalTo: view.topAnchor),
             controls.heightAnchor.constraint(equalToConstant: 44),
+            // A plain UIView has no intrinsic height, and this stack is not
+            // pinned to the bottom, so without this the meter is laid out at
+            // zero points tall and simply never appears.
+            meter.heightAnchor.constraint(equalToConstant: 84),
             // A keyboard has no intrinsic height; without this it collapses.
             view.heightAnchor.constraint(equalToConstant: 132),
         ])

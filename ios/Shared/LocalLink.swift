@@ -19,7 +19,7 @@ import Network
 /// array holding one string, because a bare JSON string is a fragment and not
 /// every decoder accepts one at the top level.
 ///
-///     TAKE <secret>   -> ["text not yet inserted", "0.1,0.4,..." spectrum]
+///     TAKE <secret>   -> ["text", "0.1,0.4,..." spectrum, "1" if capturing]
 ///     START <secret>  -> ["1"]
 ///     STOP <secret>   -> ["0"]
 ///     STATE <secret>  -> ["1"] while capturing, ["0"] otherwise
@@ -163,8 +163,13 @@ final class LocalLink {
             let text = pending
             pending = ""
             let meter = levels.map { String(format: "%.3f", $0) }.joined(separator: ",")
+            let on = capturing
             lock.unlock()
-            return LocalLinkProtocol.encode(text, meter)
+            // Whether capture is running belongs in every frame, not only in
+            // the reply to STATE. The keyboard cannot know that dictation was
+            // started from the app otherwise, and would sit with a dead meter
+            // and an unlit button while text arrived.
+            return LocalLinkProtocol.encode(text, meter, on ? "1" : "0")
         case "START", "STOP":
             let wanted = parts[0] == "START"
             DispatchQueue.main.async { self.onCapture?(wanted) }

@@ -39,7 +39,8 @@ enum Handoff {
             completion(Frame(
                 text: reply.first ?? "",
                 levels: (reply.count > 1 ? reply[1] : "")
-                    .split(separator: ",").compactMap { Float($0) }))
+                    .split(separator: ",").compactMap { Float($0) },
+                capturing: reply.count > 2 && reply[2] == "1"))
         }
     }
 
@@ -48,6 +49,9 @@ enum Handoff {
     struct Frame {
         let text: String
         let levels: [Float]
+        /// What the app is actually doing, which is not always what the
+        /// keyboard last asked for -- dictation can be started from the app.
+        let capturing: Bool
     }
 
     /// Ask the app to start or stop capturing. Reports whether it was heard.

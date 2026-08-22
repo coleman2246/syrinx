@@ -11,7 +11,11 @@ import UIKit
 /// prove -- a meter can bounce happily while the transcript stays empty.
 final class MeterView: UIView {
     /// Smoothed bar heights, so the display eases rather than flickers.
-    private var shown: [Float] = []
+    ///
+    /// Starts at a full row of zeroes rather than empty: a meter that draws
+    /// nothing until the first sample arrives looks like a missing feature
+    /// rather than a quiet one.
+    private var shown = [Float](repeating: 0, count: 10)
     private var caption = ""
 
     /// How quickly a falling bar drops, as a fraction of the gap per frame.
@@ -50,7 +54,7 @@ final class MeterView: UIView {
     /// Drop every bar to nothing. A meter frozen at its last frame after the
     /// microphone closes reads as though it were still listening.
     func clear() {
-        shown = shown.map { _ in 0 }
+        shown = [Float](repeating: 0, count: max(shown.count, 10))
         caption = ""
         setNeedsDisplay()
     }
