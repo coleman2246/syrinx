@@ -41,7 +41,7 @@ enum Handoff {
         } else {
             // Clipboard fallback. Visible and it clobbers whatever was there,
             // which is why it is the second choice rather than the first.
-            UIPasteboard.general.string = text
+            UIPasteboard.general.string = marker + text
         }
     }
 
@@ -55,8 +55,31 @@ enum Handoff {
             try? "".write(to: f, atomically: true, encoding: .utf8)
             return s
         }
-        return nil
+        return takeFromPasteboard()
     }
+
+    /// Clipboard fallback, for when the App Group entitlement is not granted.
+    ///
+    /// Keyed on `changeCount` rather than on the text: comparing strings would
+    /// refuse to insert the same word twice in a row, which is a thing people
+    /// say. The counter changes on every write even when the contents match.
+    ///
+    /// The extension's own defaults are used, because by definition there is
+    /// no shared container in this path.
+    private static func takeFromPasteboard() -> String? {
+        let pb = UIPasteboard.general
+        let seen = UserDefaults.standard.integer(forKey: "pbSeen")
+        guard pb.changeCount != seen else { return nil }
+        UserDefaults.standard.set(pb.changeCount, forKey: "pbSeen")
+        // Only take what this app put there. Anything else is the user's own
+        // clipboard and must not be typed into their document.
+        guard let s = pb.string, s.hasPrefix(marker) else { return nil }
+        return String(s.dropFirst(marker.count))
+    }
+
+    /// Tags clipboard writes as ours. Without it the keyboard would insert
+    /// whatever the user last copied, which would be alarming.
+    private static let marker = "\u{200B}"  // zero-width space, invisible if pasted
 
     /// Whether the app should be capturing. The keyboard sets this; the app
     /// watches it, so the mic button can live on the keyboard even though the

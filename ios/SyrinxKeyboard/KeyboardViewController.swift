@@ -52,10 +52,10 @@ final class KeyboardViewController: UIInputViewController {
         render()
 
         if !Handoff.usingSharedContainer {
-            // Without a shared container the app cannot see the flag, so the
-            // user has to start capture in the app themselves. Saying so beats
-            // a button that appears to do nothing.
-            statusLabel.text = "Open Syrinx to start dictating"
+            // Without a shared container the app cannot see the flag, so
+            // capture has to be started in the app. Text still arrives, via
+            // the clipboard.
+            statusLabel.text = "Start in the Syrinx app (clipboard mode)"
         }
     }
 
