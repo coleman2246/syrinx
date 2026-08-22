@@ -101,8 +101,6 @@ struct SettingsView: View {
                     Text(diagnostics)
                         .font(.caption.monospaced())
                         .textSelection(.enabled)
-                    Text("granted group: \(Handoff.appGroup ?? "none")")
-                        .font(.caption).foregroundStyle(.secondary)
                     Toggle("Hold the microphone", isOn: Binding(
                         get: { dictation.holdMicrophone },
                         set: { dictation.setHoldMicrophone($0) }))

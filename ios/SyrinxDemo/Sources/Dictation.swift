@@ -46,10 +46,9 @@ final class Dictation: ObservableObject {
 
     /// Serve the keyboard.
     ///
-    /// Always, not only when some entitlement is missing: the extension has
-    /// exactly one way to reach this process, and a listener that is
-    /// conditional on anything is a listener that is sometimes absent for a
-    /// reason nobody can see from the other end.
+    /// The listener is unconditional: the extension has exactly one way to
+    /// reach this process, and a listener that depends on anything is one that
+    /// is sometimes absent for a reason nobody can see from the other end.
     init() {
         LocalLink.shared.onCapture = { [weak self] wanted in
             Task { @MainActor in self?.followKeyboard(wanted) }

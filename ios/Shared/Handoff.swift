@@ -14,9 +14,9 @@ import Foundation
 ///
 /// The container earned that risk only if it worked where loopback does not,
 /// and it does not: a keyboard needs Full Access to reach a shared container
-/// just as it does to open a socket. So loopback is the only channel, the
-/// entitlement no longer matters, and the two ends cannot disagree about
-/// something they no longer decide.
+/// just as it does to open a socket. So loopback is the only channel and the
+/// two ends cannot disagree about something they no longer decide. The App
+/// Groups entitlement went with it -- see docs/ios.md.
 enum Handoff {
     /// Called by the app when new text has been transcribed.
     static func publish(_ text: String) {
@@ -62,42 +62,6 @@ enum Handoff {
     /// Whether the app is capturing, or nil if it cannot be reached.
     static func captureState(_ completion: @escaping (Bool?) -> Void) {
         LocalLinkClient.send("STATE") { completion($0.map { $0.first == "1" }) }
-    }
-
-    /// What the entitlement files ask for. Nothing depends on it being granted
-    /// any more; it is reported by the diagnostics because a mismatch here was
-    /// the thing that cost a day.
-    static let declaredGroup = "group.space.aragonite.SyrinxDemo"
-
-    /// The group iOS actually granted, if any.
-    static let appGroup: String? = {
-        for id in [declaredGroup] + provisionedGroups() {
-            if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: id) != nil {
-                return id
-            }
-        }
-        return nil
-    }()
-
-    /// The groups named in this bundle's provisioning profile.
-    ///
-    /// The profile is a CMS signature wrapping a plist. Verifying the
-    /// signature is the system's job; this only reads a value out of a file
-    /// inside our own bundle, so the plist is located by its delimiters rather
-    /// than by decoding the container.
-    static func provisionedGroups() -> [String] {
-        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
-              let data = try? Data(contentsOf: url),
-              let start = data.range(of: Data("<?xml".utf8)),
-              let end = data.range(of: Data("</plist>".utf8), options: .backwards)
-        else { return [] }
-        let plist = try? PropertyListSerialization.propertyList(
-            from: data[start.lowerBound..<end.upperBound], format: nil)
-        guard let root = plist as? [String: Any],
-              let entitlements = root["Entitlements"] as? [String: Any],
-              let groups = entitlements["com.apple.security.application-groups"] as? [String]
-        else { return [] }
-        return groups
     }
 
     static var channelDescription: String {

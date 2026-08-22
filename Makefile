@@ -10,7 +10,13 @@ ORT ?= /usr/lib/libonnxruntime.so
 MODEL ?= $(HOME)/.local/share/parakeet-dictation/nemotron
 CONFIG ?= config.toml
 
-.PHONY: test lint build-cuda serve dictate probe check
+# The iOS build runs on a macOS VM: Xcode will not run anywhere else, and the
+# ring crate compiles C and assembly that needs the iOS SDK, so Linux can
+# `cargo check` those targets but cannot link them. See docs/ios.md.
+MACVM ?= ssh -i $(HOME)/.ssh/macvm -o StrictHostKeyChecking=no -p 2222 cole@127.0.0.1
+IPA ?= $(HOME)/Downloads/SyrinxDemo.ipa
+
+.PHONY: test lint build-cuda serve dictate probe check ios ios-framework
 
 ## Run the full suite. No GPU needed -- the mock backend covers the protocol.
 test:
@@ -48,3 +54,22 @@ probe: build-cuda
 check: build-cuda
 	SYRINX_MODEL_DIR=$(MODEL) ORT_DYLIB_PATH=$(ORT) \
 		cargo test -p syrinx-server --features cuda --test golden -- --ignored --nocapture
+
+## Build the iPhone app on the macOS VM and copy the .ipa back.
+##
+## The VM builds from its own clone, so this pushes first -- otherwise it
+## cheerfully builds the last thing you committed and the change you are
+## testing is not in it.
+ios:
+	git push -q
+	$(MACVM) 'cd ~/syrinx && git pull -q && ./ios/generate.sh && ./ios/build-ipa.sh'
+	scp -i $(HOME)/.ssh/macvm -o StrictHostKeyChecking=no -P 2222 \
+		cole@127.0.0.1:syrinx/ios/build/SyrinxDemo.ipa $(IPA)
+	@echo "wrote $(IPA)"
+
+## Rebuild the Rust core for iOS. Needed whenever anything under crates/
+## changed: `make ios` links the existing static library and will otherwise
+## produce an app without your change, silently.
+ios-framework:
+	git push -q
+	$(MACVM) 'cd ~/syrinx && git pull -q && ./crates/syrinx-ios/build-xcframework.sh'

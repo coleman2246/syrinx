@@ -164,14 +164,11 @@ final class KeyboardViewController: UIInputViewController {
     /// the text field becomes the diagnostic channel. Tap it anywhere text can
     /// be entered and the answer is on screen, copyable.
     @objc private func typeDiagnostics() {
-        let groups = Handoff.provisionedGroups()
         textDocumentProxy.insertText("""
         — syrinx keyboard —
         full access: \(hasFullAccess)
         bundle: \(Bundle.main.bundleIdentifier ?? "?")
         ios: \(UIDevice.current.systemVersion)
-        granted group: \(Handoff.appGroup ?? "none")
-        profile groups: \(groups.isEmpty ? "none" : groups.joined(separator: ", "))
         channel: \(Handoff.channelDescription)
         probing app…
         """)

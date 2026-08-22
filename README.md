@@ -394,6 +394,30 @@ clipboard and sends Ctrl+V, restoring the previous clipboard afterwards — the
 most broadly compatible of the three, though terminals need Ctrl+Shift+V so it
 is a poor fit there.
 
+## iPhone
+
+An app and a custom keyboard, dictating into any app that takes text. The app
+captures and transcribes with the same Rust client the desktop uses; the
+keyboard types the result at the cursor. A keyboard extension cannot open a
+microphone on any iOS version, which is why it is two pieces rather than one.
+
+Building needs a Mac or a macOS VM:
+
+```sh
+make ios-framework   # only when anything under crates/ changed
+make ios             # builds on the VM and copies the .ipa back
+```
+
+The build is unsigned; a sideloader signs it with your Apple ID. After
+installing, turn on **Full Access** for the keyboard and open the app once —
+iOS will not let a background app claim a microphone it did not already have,
+so the app holds one from launch. That is also why the microphone indicator
+stays lit while it is resident.
+
+See [docs/ios.md](docs/ios.md) for the architecture, the build VM, and the
+platform constraints that shaped both — several of them are the opposite of
+what the error messages suggest.
+
 ## Licence
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
