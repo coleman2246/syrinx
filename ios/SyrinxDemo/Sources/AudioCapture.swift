@@ -113,6 +113,17 @@ final class AudioCapture {
         isOpen = true
     }
 
+    /// Rebuild for a different input.
+    ///
+    /// The tap is installed for one specific hardware format, and a new input
+    /// will not share it -- so a route change is not something the engine can
+    /// ride out. The sink survives deliberately: whoever was listening before
+    /// the AirPods connected is still listening afterwards.
+    func reopen() throws {
+        close()
+        try open()
+    }
+
     /// Release the microphone, which also clears the indicator.
     func close() {
         guard isOpen else { return }

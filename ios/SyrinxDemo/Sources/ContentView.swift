@@ -56,6 +56,9 @@ struct SettingsView: View {
     @ObservedObject var dictation: Dictation
     @Environment(\.dismiss) private var dismiss
     @State private var diagnostics = SettingsView.report()
+    /// Snapshotted rather than read during layout: the list changes when a
+    /// device connects, and SwiftUI must be told rather than asked.
+    @State private var inputs = AudioSession.inputs
 
     /// Both halves of what decides whether dictation can start: the channel
     /// the keyboard uses, and the audio session it depends on.
@@ -74,6 +77,21 @@ struct SettingsView: View {
                         .autocorrectionDisabled()
                     SecureField("token", text: $dictation.token)
                 }
+                Section("Microphone") {
+                    Picker("Input", selection: Binding(
+                        get: { dictation.microphoneUID },
+                        set: { dictation.setMicrophone(uid: $0.isEmpty ? nil : $0) })) {
+                        Text("Automatic").tag("")
+                        ForEach(inputs, id: \.uid) { p in
+                            Text(AudioSession.label(p)).tag(p.uid)
+                        }
+                    }
+                    Text("Automatic prefers AirPods, then a wired headset, then the built-in microphone. A car kit is never chosen on its own — iOS reports it the same way it reports AirPods, so the two are told apart by name, and a car's microphone is worse than the phone's.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("in use: \(AudioSession.currentInput.map(AudioSession.label) ?? "none")")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
                 Section("Keyboard") {
                     Text("The keyboard reaches this app over \(Handoff.channelDescription). Full Access must be on, or the extension has no network at all.")
                         .font(.footnote)
@@ -101,6 +119,10 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .toolbar { Button("Done") { dismiss() } }
+            .onReceive(NotificationCenter.default.publisher(for: .syrinxRouteChanged)) { _ in
+                inputs = AudioSession.inputs
+                diagnostics = SettingsView.report()
+            }
         }
     }
 }

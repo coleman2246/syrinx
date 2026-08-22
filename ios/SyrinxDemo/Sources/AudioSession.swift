@@ -54,6 +54,69 @@ enum AudioSession {
         }
     }
 
+    /// The inputs iOS is currently offering, best first.
+    static var inputs: [AVAudioSessionPortDescription] {
+        (AVAudioSession.sharedInstance().availableInputs ?? [])
+            .sorted { rank($0) > rank($1) }
+    }
+
+    /// The input in use right now.
+    static var currentInput: AVAudioSessionPortDescription? {
+        AVAudioSession.sharedInstance().currentRoute.inputs.first
+    }
+
+    /// Choose an input: the one with `uid`, or the best available.
+    ///
+    /// Reapplied on every route change, because a preference expressed once
+    /// is not a preference iOS remembers -- plugging in headphones or getting
+    /// into a car re-picks the input, and the pick is often wrong.
+    static func selectInput(uid: String?) {
+        let available = inputs
+        let wanted = uid.flatMap { u in available.first { $0.uid == u } } ?? available.first
+        guard let wanted else { return }
+        do {
+            try AVAudioSession.sharedInstance().setPreferredInput(wanted)
+        } catch {
+            note("could not select \(wanted.portName): \(describe(error))")
+        }
+    }
+
+    /// How much we want each input, highest first.
+    ///
+    /// A car kit and a pair of AirPods are both `.bluetoothHFP`, and iOS
+    /// offers nothing but the name to tell them apart. That makes this a
+    /// heuristic, which is worth saying plainly -- but the alternative is
+    /// ranking them equally, and a hands-free car microphone is markedly
+    /// worse than the phone's own, so getting it wrong in that direction is
+    /// the more costly mistake. An unrecognised Bluetooth device therefore
+    /// loses to the built-in microphone rather than beating it, and anything
+    /// can still be pinned by hand.
+    private static func rank(_ p: AVAudioSessionPortDescription) -> Int {
+        switch p.portType {
+        case .headsetMic:    return 40   // wired, predictable, close to the mouth
+        case .bluetoothHFP:  return isAppleEarbuds(p.portName) ? 50 : 5
+        case .builtInMic:    return 30
+        case .carAudio:      return 0    // never automatically
+        default:             return 10
+        }
+    }
+
+    private static func isAppleEarbuds(_ name: String) -> Bool {
+        let n = name.lowercased()
+        return n.contains("airpods") || n.contains("beats")
+    }
+
+    /// A human name for an input, for the picker and the diagnostics.
+    static func label(_ p: AVAudioSessionPortDescription) -> String {
+        switch p.portType {
+        case .builtInMic:   return "\(p.portName) (built in)"
+        case .carAudio:     return "\(p.portName) (car)"
+        case .bluetoothHFP: return "\(p.portName) (bluetooth)"
+        case .headsetMic:   return "\(p.portName) (wired)"
+        default:            return p.portName
+        }
+    }
+
     /// Give the session up, which also clears the microphone indicator.
     static func deactivate() {
         try? AVAudioSession.sharedInstance()
@@ -134,8 +197,13 @@ enum AudioSession {
             NotificationCenter.default.post(name: .syrinxAudioReset, object: nil)
         }
         centre.addObserver(forName: AVAudioSession.routeChangeNotification,
-                           object: nil, queue: .main) { _ in
-            record("route change")
+                           object: nil, queue: .main) { note in
+            let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
+            let reason = AVAudioSession.RouteChangeReason(rawValue: raw)
+            record("route change (\(reason.map(String.init(describing:)) ?? "?"))")
+            // The engine holds a tap built for the old input's format, which
+            // the new one will not match. Whoever owns it has to rebuild.
+            NotificationCenter.default.post(name: .syrinxRouteChanged, object: nil)
         }
     }
 
@@ -160,7 +228,8 @@ enum AudioSession {
         options: \(s.categoryOptions.rawValue)
         mic permission: \(permission)
         other audio: \(s.isOtherAudioPlaying)
-        inputs: \(s.currentRoute.inputs.map(\.portType.rawValue).joined(separator: ",")) 
+        input: \(currentInput.map(label) ?? "none")
+        available: \(inputs.map(\.portName).joined(separator: ", "))
         configured: \(configured)
         last event: \(lastEvent) (\(eventCount) total)
         """
@@ -170,4 +239,6 @@ enum AudioSession {
 extension Notification.Name {
     /// Everything audio has to be rebuilt.
     static let syrinxAudioReset = Notification.Name("space.aragonite.syrinx.audioReset")
+    /// The input changed; the engine's tap no longer matches it.
+    static let syrinxRouteChanged = Notification.Name("space.aragonite.syrinx.routeChanged")
 }

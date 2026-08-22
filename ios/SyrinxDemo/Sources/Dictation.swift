@@ -33,6 +33,9 @@ final class Dictation: ObservableObject {
     /// dictation without the app being opened first. On by default: that is
     /// the whole point of the keyboard. The cost is the microphone indicator.
     @AppStorage("keepAwake") var holdMicrophone = true
+    /// Which input to use, by UID. Empty means automatic, which prefers
+    /// AirPods and avoids car microphones.
+    @AppStorage("microphoneUID") var microphoneUID = ""
 
     private var session: SyrinxCoreSession?
     /// Opened once and kept, rather than built per dictation. Nothing in the
@@ -63,6 +66,14 @@ final class Dictation: ObservableObject {
             }
         }
 
+        // AirPods connecting, or getting into a car, re-picks the input --
+        // usually badly -- and leaves the tap built for the old one.
+        NotificationCenter.default.addObserver(
+            forName: .syrinxRouteChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.rebuildForNewInput() }
+        }
+
         // A media services reset invalidates every audio object in the
         // process. Anything still running is running on rubble.
         NotificationCenter.default.addObserver(
@@ -86,9 +97,32 @@ final class Dictation: ObservableObject {
             error = "Could not build the audio pipeline."
             return
         }
+        AudioSession.selectInput(uid: microphoneUID.isEmpty ? nil : microphoneUID)
         do {
             try c.open()
         } catch {
+            self.error = "Microphone: \(AudioCapture.describe(error))"
+        }
+    }
+
+    /// Pin an input, or pass nil for automatic.
+    func setMicrophone(uid: String?) {
+        microphoneUID = uid ?? ""
+        rebuildForNewInput()
+    }
+
+    /// Follow the input to wherever it went.
+    private func rebuildForNewInput() {
+        guard let c = capture, c.isOpen else {
+            AudioSession.selectInput(uid: microphoneUID.isEmpty ? nil : microphoneUID)
+            return
+        }
+        AudioSession.selectInput(uid: microphoneUID.isEmpty ? nil : microphoneUID)
+        do {
+            try c.reopen()
+        } catch {
+            // Worth surfacing: capture is now dead, and silently dead audio is
+            // exactly the failure that is impossible to diagnose from outside.
             self.error = "Microphone: \(AudioCapture.describe(error))"
         }
     }
