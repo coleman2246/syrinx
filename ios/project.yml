@@ -29,6 +29,7 @@ targets:
         # path -- which silently dropped NSMicrophoneUsageDescription and left
         # an app that dies the moment it opens the microphone.
         INFOPLIST_FILE: SyrinxDemo/Info.plist
+        CODE_SIGN_ENTITLEMENTS: SyrinxDemo/SyrinxDemo.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: space.aragonite.SyrinxDemo
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
@@ -46,6 +47,7 @@ targets:
     settings:
       base:
         INFOPLIST_FILE: SyrinxKeyboard/Info.plist
+        CODE_SIGN_ENTITLEMENTS: SyrinxKeyboard/SyrinxKeyboard.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: space.aragonite.SyrinxDemo.Keyboard
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
