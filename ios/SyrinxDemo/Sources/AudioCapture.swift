@@ -63,7 +63,11 @@ final class AudioCapture {
         converter = AVAudioConverter(from: hardware, to: target)
 
         let ratio = target.sampleRate / hardware.sampleRate
-        input.installTap(onBus: 0, bufferSize: 4096, format: hardware) { [weak self] buf, _ in
+        // 2048 frames is about 43 ms at 48 kHz. The session recomputes the
+        // spectrum once per buffer, so this is also the meter's sample rate:
+        // 4096 put it at twelve a second, which no amount of interpolation
+        // downstream can make responsive.
+        input.installTap(onBus: 0, bufferSize: 2048, format: hardware) { [weak self] buf, _ in
             guard let self else { return }
             // Cheapest possible check first: most of the time the microphone
             // is open and nothing is being dictated, and that path should cost

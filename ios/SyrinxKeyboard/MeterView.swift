@@ -16,7 +16,19 @@ final class MeterView: UIView {
     /// nothing until the first sample arrives looks like a missing feature
     /// rather than a quiet one.
     private var shown = [Float](repeating: 0, count: 10)
+    /// Where the bars are heading. Set by the network, approached by the
+    /// display link.
+    private var target = [Float](repeating: 0, count: 10)
     private var caption = ""
+
+    /// Redraws are driven by the screen, not by the socket.
+    ///
+    /// Levels arrive about twenty times a second, and easing once per arrival
+    /// means the animation itself runs at twenty frames -- visibly stepped,
+    /// however good the data is. Separating the two lets the bars move every
+    /// frame between samples, which is what the desktop overlay does by
+    /// repainting on a timer rather than on new audio.
+    private var link: CADisplayLink?
 
     /// How quickly a falling bar drops, as a fraction of the gap per frame.
     ///
@@ -24,7 +36,12 @@ final class MeterView: UIView {
     /// because bars that snap to zero between words read as dropouts rather
     /// than as speech. Larger than the overlay's 0.28 because this updates at
     /// 10 Hz rather than 30, and the same fraction per frame would crawl.
-    private let fall: Float = 0.45
+    /// Per frame at 60 Hz, so slower per step than the overlay's 0.28 at 30.
+    private let fall: Float = 0.15
+    /// Rising is quick rather than instant. Instant is right when the redraw
+    /// is tied to the data; here it would step at the sample rate and undo
+    /// the point of interpolating at all. Five frames to full is 80 ms.
+    private let rise: Float = 0.5
 
     // The GUI's palette, so the phone and the desktop are recognisably one
     // application rather than two things that both draw bars.
@@ -40,21 +57,58 @@ final class MeterView: UIView {
 
     required init?(coder: NSCoder) { nil }
 
-    func show(levels: [Float], caption: String) {
-        if shown.count != levels.count { shown = Array(repeating: 0, count: levels.count) }
-        for i in shown.indices {
-            let t = min(max(levels[i], 0), 1)
-            // Rise immediately, fall gently.
-            shown[i] = t >= shown[i] ? t : shown[i] + (t - shown[i]) * fall
+    /// Run the display link only while on screen. A keyboard is dismissed far
+    /// more often than it is used, and a timer ticking sixty times a second
+    /// behind a hidden view is pure drain.
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            link?.invalidate()
+            link = nil
+        } else if link == nil {
+            let l = CADisplayLink(target: self, selector: #selector(step))
+            // .common, or the bars freeze the moment anything is being
+            // touched -- which on a keyboard is most of the time.
+            l.add(to: .main, forMode: .common)
+            link = l
         }
-        self.caption = caption
-        setNeedsDisplay()
+    }
+
+    func show(levels: [Float], caption: String) {
+        guard !levels.isEmpty else { return }
+        if target.count != levels.count {
+            target = Array(repeating: 0, count: levels.count)
+            shown = Array(repeating: 0, count: levels.count)
+        }
+        for i in target.indices { target[i] = min(max(levels[i], 0), 1) }
+        if caption != self.caption {
+            self.caption = caption
+            setNeedsDisplay()
+        }
+    }
+
+    @objc private func step() {
+        var moved = false
+        for i in shown.indices {
+            let t = target[i]
+            let next = shown[i] + (t - shown[i]) * (t >= shown[i] ? rise : fall)
+            if abs(next - shown[i]) > 0.001 {
+                shown[i] = next
+                moved = true
+            } else if shown[i] != t, abs(t - shown[i]) < 0.002 {
+                // Settle exactly, so a bar does not creep for ever towards a
+                // value it never reaches.
+                shown[i] = t
+                moved = true
+            }
+        }
+        if moved { setNeedsDisplay() }
     }
 
     /// Drop every bar to nothing. A meter frozen at its last frame after the
     /// microphone closes reads as though it were still listening.
     func clear() {
-        shown = [Float](repeating: 0, count: max(shown.count, 10))
+        target = [Float](repeating: 0, count: max(target.count, 10))
         caption = ""
         setNeedsDisplay()
     }

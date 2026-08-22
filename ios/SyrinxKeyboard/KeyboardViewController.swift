@@ -49,12 +49,16 @@ final class KeyboardViewController: UIInputViewController {
         // 5 Hz: text arrives in fragments and the keyboard is on screen while
         // someone is speaking, so this needs to feel immediate without
         // spinning.
-        // 10 Hz, matching the rate the app recomputes the spectrum at, so the
-        // bars move as smoothly as there is data to move them.
+        // 20 Hz, matching the rate the app collects the spectrum at. Drawing
+        // is not tied to this -- the meter interpolates between arrivals -- so
+        // this only sets how current the numbers are, not how smooth they look.
         tick = 0
-        poll = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             self?.drain()
         }
+        // .common, or polling stops while the user is touching the keyboard.
+        RunLoop.main.add(t, forMode: .common)
+        poll = t
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -69,7 +73,7 @@ final class KeyboardViewController: UIInputViewController {
         // Idle, there is nothing to draw and nothing to type, so polling ten
         // times a second is ten times a second of nothing. Twice a second is
         // enough to notice the app coming back.
-        guard capturing || tick % 5 == 0 else { return }
+        guard capturing || tick % 10 == 0 else { return }
 
         inFlight = true
         Handoff.take { [weak self] frame in

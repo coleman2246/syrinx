@@ -197,9 +197,9 @@ final class Dictation: ObservableObject {
         }
 
         running = true
-        // 10 Hz is well under the rate fragments arrive at, so text appears
-        // promptly without spinning the main thread.
-        poll = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        // 20 Hz. Text does not arrive nearly this fast, but the spectrum does,
+        // and the keyboard cannot show a level this side has not collected.
+        poll = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.drain() }
         }
     }
