@@ -31,19 +31,20 @@ final class AudioCapture {
 
     func start() throws {
         let session = AVAudioSession.sharedInstance()
-        // .record rather than .playAndRecord: we never play anything, and
-        // asking for playback would duck other audio for no reason.
-        // .record with the audio background mode keeps capture alive while the
-        // user is in another app typing -- which is the entire point.
+        // .playAndRecord even though nothing is ever played.
         //
-        // .mixWithOthers is not a preference, it is what makes starting from
-        // the keyboard possible at all. A non-mixable session cannot be
-        // activated from the background: iOS returns '!int', which surfaces as
-        // "OSStatus error 560557684" and says nothing. .duckOthers used to be
-        // set here and is exactly such a request -- ducking is interrupting.
-        // Mixing costs a little bleed from whatever else is playing, which is
-        // a far better trade than only being able to start from the app.
-        try session.setCategory(.record, mode: .measurement, options: [.mixWithOthers])
+        // The category has to be mixable, because iOS will not let a
+        // background app activate a non-mixable session -- it returns '!int',
+        // which is what the keyboard's start button kept hitting. And
+        // .mixWithOthers is only valid on .playback, .playAndRecord and
+        // .multiRoute: setting it on .record, which is what this used to do,
+        // is silently ignored and leaves the session non-mixable.
+        //
+        // So the category is chosen for the option it admits rather than for
+        // the direction audio travels. .measurement still disables the input
+        // processing that would otherwise fight the recogniser.
+        try session.setCategory(.playAndRecord, mode: .measurement,
+                                options: [.mixWithOthers, .allowBluetooth])
         try session.setActive(true, options: [])
 
         let input = engine.inputNode
