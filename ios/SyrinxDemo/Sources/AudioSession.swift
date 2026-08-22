@@ -32,18 +32,22 @@ enum AudioSession {
     /// does not throw, so this makes no attempt to remember whether it has
     /// been called. It used to, and a cached "yes" that iOS had already
     /// invalidated meant skipping the one call that would have fixed it.
-    static func ensureActive(mode: AVAudioSession.Mode = .measurement) throws {
+    static func ensureActive() throws {
         observe()
         let s = AVAudioSession.sharedInstance()
-        if s.category != .playAndRecord || s.mode != mode
-            || !s.categoryOptions.contains(.mixWithOthers) {
+        // Once. Re-setting the category in the background counts as claiming
+        // the session afresh and is refused with '!int' -- which is how a
+        // mode fallback, added to work around a different failure, turned
+        // into this one.
+        if !configured {
             // .measurement disables the input processing that would fight the
             // recogniser. .mixWithOthers is not accepted on .record, which is
             // why the category is .playAndRecord despite nothing being played.
             try labelled("setting the audio category") {
-                try s.setCategory(.playAndRecord, mode: mode,
+                try s.setCategory(.playAndRecord, mode: .measurement,
                                   options: [.mixWithOthers, .allowBluetooth])
             }
+            configured = true
         }
         try labelled("activating the audio session") {
             try s.setActive(true, options: [])
@@ -100,6 +104,7 @@ enum AudioSession {
         return String(bytes: bytes, encoding: .ascii)
     }
 
+    private static var configured = false
     private static var observing = false
 
     /// Watch for the session being taken away.
@@ -123,6 +128,8 @@ enum AudioSession {
         centre.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
                            object: nil, queue: .main) { _ in
             record("media services reset")
+            // Everything is gone, including the category.
+            configured = false
             try? ensureActive()
             NotificationCenter.default.post(name: .syrinxAudioReset, object: nil)
         }
@@ -154,6 +161,7 @@ enum AudioSession {
         mic permission: \(permission)
         other audio: \(s.isOtherAudioPlaying)
         inputs: \(s.currentRoute.inputs.map(\.portType.rawValue).joined(separator: ",")) 
+        configured: \(configured)
         last event: \(lastEvent) (\(eventCount) total)
         """
     }

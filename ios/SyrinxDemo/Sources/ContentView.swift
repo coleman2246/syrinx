@@ -61,7 +61,7 @@ struct SettingsView: View {
     /// the keyboard uses, and the audio session it depends on.
     static func report() -> String {
         LocalLink.shared.diagnostics
-            + "\nkeep-awake: \(KeepAwake.shared.isRunning)\n"
+            + "\n"
             + AudioSession.diagnostics
     }
 
@@ -85,10 +85,10 @@ struct SettingsView: View {
                         .textSelection(.enabled)
                     Text("granted group: \(Handoff.appGroup ?? "none")")
                         .font(.caption).foregroundStyle(.secondary)
-                    Toggle("Keep Syrinx awake", isOn: Binding(
-                        get: { dictation.keepAwake },
-                        set: { dictation.setKeepAwake($0) }))
-                    Text("Holds the audio session so iOS neither suspends the app nor refuses the microphone to the keyboard. It will not interrupt music, but the microphone indicator stays lit while Syrinx is resident — iOS will not hand a background app a microphone it did not already have.")
+                    Toggle("Hold the microphone", isOn: Binding(
+                        get: { dictation.holdMicrophone },
+                        set: { dictation.setHoldMicrophone($0) }))
+                    Text("Keeps the microphone open so the keyboard can start dictation without opening this app. iOS will not let a background app claim a microphone it did not already have, so the alternative is opening Syrinx each time. The indicator stays lit because the microphone really is open; nothing is sent anywhere until you start dictating.")
                         .font(.caption).foregroundStyle(.secondary)
                     Button("Refresh") { diagnostics = Self.report() }
                 }

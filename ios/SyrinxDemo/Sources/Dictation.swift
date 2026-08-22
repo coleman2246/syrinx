@@ -29,13 +29,16 @@ final class Dictation: ObservableObject {
     @AppStorage("serverURL") var serverURL = Bundle.baked("SyrinxURL")
         ?? "wss://dictate.example.com/v1/stream"
     @AppStorage("token") var token = Bundle.baked("SyrinxToken") ?? ""
-    /// Whether to stay resident so the keyboard can start dictation without
-    /// the app being opened first. On by default: that is the whole point of
-    /// the keyboard, and the cost is a track of silence.
-    @AppStorage("keepAwake") var keepAwake = true
+    /// Whether to hold the microphone open so the keyboard can start
+    /// dictation without the app being opened first. On by default: that is
+    /// the whole point of the keyboard. The cost is the microphone indicator.
+    @AppStorage("keepAwake") var holdMicrophone = true
 
     private var session: SyrinxCoreSession?
-    private var capture: AudioCapture?
+    /// Opened once and kept, rather than built per dictation. Nothing in the
+    /// start path may touch the audio system, because the start path runs in
+    /// the background and that is precisely what iOS refuses.
+    private let capture = AudioCapture()
     private var poll: Timer?
 
     /// Serve the keyboard.
@@ -50,14 +53,13 @@ final class Dictation: ObservableObject {
         }
         LocalLink.shared.startServing()
 
-        // Permission first. A .playAndRecord session cannot be held without
-        // it, and holding it from launch is the only thing that lets the
-        // keyboard start dictation later -- so asking at the first Start,
-        // which is what used to happen, was already too late.
-        AudioCapture.requestPermission { [weak self] _ in
+        // Permission, then the microphone, both while the app is still on
+        // screen. Everything that iOS will not let a background app do has to
+        // happen here or not at all.
+        AudioCapture.requestPermission { [weak self] granted in
             Task { @MainActor in
-                guard let self, self.keepAwake, !self.running else { return }
-                KeepAwake.shared.start()
+                guard let self, granted, self.holdMicrophone else { return }
+                self.openMicrophone()
             }
         }
 
@@ -72,20 +74,32 @@ final class Dictation: ObservableObject {
                     self.stop()
                     self.error = "The audio system restarted. Start again."
                 }
-                if self.keepAwake { KeepAwake.shared.restartAfterReset() }
+                self.capture?.close()
+                if self.holdMicrophone { self.openMicrophone() }
             }
         }
     }
 
-    func setKeepAwake(_ on: Bool) {
-        keepAwake = on
-        // Never while recording: capture holds the session itself, and the
-        // app cannot be playing and recording under one category.
-        if on && !running {
-            KeepAwake.shared.start()
-        } else if !on {
-            KeepAwake.shared.stop()
-            if !running { AudioSession.deactivate() }
+    /// Open the microphone, reporting rather than swallowing a refusal.
+    private func openMicrophone() {
+        guard let c = capture else {
+            error = "Could not build the audio pipeline."
+            return
+        }
+        do {
+            try c.open()
+        } catch {
+            self.error = "Microphone: \(AudioCapture.describe(error))"
+        }
+    }
+
+    func setHoldMicrophone(_ on: Bool) {
+        holdMicrophone = on
+        if on {
+            openMicrophone()
+        } else if !running {
+            capture?.close()
+            AudioSession.deactivate()
         }
     }
 
@@ -119,6 +133,21 @@ final class Dictation: ObservableObject {
     }
 
     private func begin() {
+        guard let c = capture, c.isOpen else {
+            // Only reachable with the microphone released: held open, this
+            // path cannot fail, which is the entire point of holding it.
+            openMicrophone()
+            guard let c = capture, c.isOpen else {
+                publishState()
+                return
+            }
+            begin(with: c)
+            return
+        }
+        begin(with: c)
+    }
+
+    private func begin(with c: AudioCapture) {
         guard let s = SyrinxCoreSession(url: serverURL, token: token) else {
             error = "Could not start a session — check the server address."
             publishState()
@@ -126,33 +155,11 @@ final class Dictation: ObservableObject {
         }
         session = s
 
-        // The capture callback runs on the audio thread and hands straight to
-        // Rust. No hop to the main actor: that would add latency to every
-        // buffer and risk dropping audio under UI load.
-        capture = AudioCapture { [weak s] samples, count in
+        // Runs on the audio thread and hands straight to Rust. No hop to the
+        // main actor: that would add latency to every buffer and risk dropping
+        // audio under UI load.
+        c.deliver { [weak s] samples, count in
             s?.push(samples, count: count)
-        }
-        guard let c = capture else {
-            error = "Could not build the audio pipeline."
-            session = nil
-            publishState()
-            return
-        }
-
-        // Silence stops before the engine starts. The session stays active --
-        // that is the part that must never be given up in the background --
-        // but a player running on it while the engine opens an input is a
-        // conflict the engine reports only as 'what'.
-        KeepAwake.shared.stop()
-        do {
-            try c.start()
-        } catch {
-            if keepAwake { KeepAwake.shared.start() }
-            self.error = "Microphone: \(AudioCapture.describe(error))"
-            session = nil
-            capture = nil
-            publishState()
-            return
         }
 
         running = true
@@ -180,11 +187,15 @@ final class Dictation: ObservableObject {
 
     func stop() {
         poll?.invalidate(); poll = nil
-        capture?.stop(); capture = nil
+        capture?.deliver(to: nil)
         session?.stop(); session = nil
-        // The session stays up so the keyboard can start the next one; giving
-        // it back would mean reclaiming it from the background, which fails.
-        if keepAwake { KeepAwake.shared.start() } else { AudioSession.deactivate() }
+        // The microphone stays open so the keyboard can start the next one;
+        // reopening it would mean claiming it from the background, which is
+        // the thing iOS refuses.
+        if !holdMicrophone {
+            capture?.close()
+            AudioSession.deactivate()
+        }
         running = false
         status = "Idle"
     }

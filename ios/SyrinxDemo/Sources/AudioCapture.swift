@@ -1,13 +1,27 @@
 import AVFoundation
 
-/// Microphone capture, resampled to what the core wants.
+/// The microphone, opened once and left open.
 ///
-/// This is the part that genuinely has to be native. Everything downstream of
-/// the callback is Rust.
+/// iOS does not forbid a background app from recording. It forbids it from
+/// *beginning* to: activating a session, setting a category, starting an
+/// engine. Every failure the keyboard hit was one of those, and no amount of
+/// choosing better categories changes it, because the refusal is about when
+/// the call happens rather than what it asks for.
 ///
-/// The hardware format is not negotiable — the input node reports whatever the
-/// device is doing, typically 48 kHz stereo — so a converter sits between it
-/// and the 16 kHz mono the model expects. Getting this wrong does not fail
+/// So nothing begins in the background. The session, the engine and the tap
+/// are all brought up at launch, while the app is on screen and permitted to,
+/// and then left running for the life of the process. Starting dictation
+/// afterwards sets a closure; stopping it clears one. There is no audio call
+/// left in that path for iOS to refuse.
+///
+/// A running engine is also its own keep-alive, so the silent-playback trick
+/// that used to hold the app resident is gone. What remains is the honest
+/// version of the same bargain: the microphone indicator stays lit for as long
+/// as Syrinx is resident, because the microphone is genuinely open.
+///
+/// The hardware format is not negotiable -- the input node reports whatever
+/// the device is doing, typically 48 kHz stereo -- so a converter sits between
+/// it and the 16 kHz mono the model expects. Getting this wrong does not fail
 /// loudly; it transcribes gibberish, which is much harder to diagnose than a
 /// crash.
 final class AudioCapture {
@@ -15,10 +29,15 @@ final class AudioCapture {
     private var converter: AVAudioConverter?
     private let target: AVAudioFormat
 
-    /// Called on the audio thread with 16 kHz mono samples. Must not block.
-    private let onSamples: (UnsafePointer<Float>, Int) -> Void
+    /// Where samples go right now, or nil when the microphone is open and
+    /// nobody is listening. Swapping this is the whole of starting and
+    /// stopping dictation.
+    private let lock = NSLock()
+    private var sink: ((UnsafePointer<Float>, Int) -> Void)?
 
-    init?(onSamples: @escaping (UnsafePointer<Float>, Int) -> Void) {
+    private(set) var isOpen = false
+
+    init?() {
         guard let fmt = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: SyrinxCoreSession.sampleRate,
@@ -26,29 +45,12 @@ final class AudioCapture {
             interleaved: false
         ) else { return nil }
         self.target = fmt
-        self.onSamples = onSamples
     }
 
-    func start() throws {
-        do {
-            try attempt(mode: .measurement)
-        } catch {
-            // .measurement suppresses the input processing that would fight
-            // the recogniser, which is why it is tried first. It also pins the
-            // route hard, and a route the engine cannot open fails with 'what'
-            // and nothing further. The plain mode transcribes slightly worse
-            // than not transcribing at all.
-            AudioSession.note("measurement mode failed: \(AudioSession.describe(error))")
-            teardown()
-            try attempt(mode: .default)
-        }
-    }
-
-    private func attempt(mode: AVAudioSession.Mode) throws {
-        // Already active since launch in the normal case. Activating here is
-        // the call iOS refuses in the background, so it must not be the first
-        // time it happens.
-        try AudioSession.ensureActive(mode: mode)
+    /// Open the microphone. Must be called while the app is in the foreground.
+    func open() throws {
+        guard !isOpen else { return }
+        try AudioSession.ensureActive()
 
         let input = engine.inputNode
         let hardware = input.outputFormat(forBus: 0)
@@ -62,7 +64,14 @@ final class AudioCapture {
 
         let ratio = target.sampleRate / hardware.sampleRate
         input.installTap(onBus: 0, bufferSize: 4096, format: hardware) { [weak self] buf, _ in
-            guard let self, let converter = self.converter else { return }
+            guard let self else { return }
+            // Cheapest possible check first: most of the time the microphone
+            // is open and nothing is being dictated, and that path should cost
+            // nothing but a lock and a nil test.
+            self.lock.lock()
+            let sink = self.sink
+            self.lock.unlock()
+            guard let sink, let converter = self.converter else { return }
 
             // Capacity must be computed from the ratio, rounded up: too small
             // and the converter silently truncates.
@@ -86,24 +95,31 @@ final class AudioCapture {
             if err != nil { return }
 
             guard out.frameLength > 0, let ch = out.floatChannelData?[0] else { return }
-            self.onSamples(ch, Int(out.frameLength))
+            sink(ch, Int(out.frameLength))
         }
 
         engine.prepare()
         do {
             try engine.start()
         } catch {
-            // Distinct from the session failing: the session can be perfectly
-            // healthy and the engine still refuse, and the two need different
-            // answers.
+            // Distinct from the session failing: the session can be healthy
+            // and the engine still refuse, and the two need different answers.
+            teardown()
             throw NSError(domain: "Syrinx.audio", code: (error as NSError).code, userInfo: [
-                NSLocalizedDescriptionKey: "starting the audio engine: \(AudioSession.describe(error))"
+                NSLocalizedDescriptionKey:
+                    "starting the audio engine: \(AudioSession.describe(error))"
             ])
         }
+        isOpen = true
     }
 
-    /// Undo a failed attempt, so the next one starts from a clean engine
-    /// rather than one carrying a tap and a half-built graph.
+    /// Release the microphone, which also clears the indicator.
+    func close() {
+        guard isOpen else { return }
+        teardown()
+        isOpen = false
+    }
+
     private func teardown() {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
@@ -111,12 +127,11 @@ final class AudioCapture {
         converter = nil
     }
 
-    func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        converter = nil
-        // The session outlives capture: dropping it would mean activating
-        // again for the next one, from the background, which cannot be done.
+    /// Start or stop delivering. The only thing dictation does to audio.
+    func deliver(to sink: ((UnsafePointer<Float>, Int) -> Void)?) {
+        lock.lock()
+        self.sink = sink
+        lock.unlock()
     }
 
     /// Decoding lives with the session, which is where most of these come
