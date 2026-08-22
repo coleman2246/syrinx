@@ -80,7 +80,7 @@ struct SettingsView: View {
                     Toggle("Keep Syrinx awake", isOn: Binding(
                         get: { dictation.keepAwake },
                         set: { dictation.setKeepAwake($0) }))
-                    Text("Plays silence so iOS does not suspend the app, letting the keyboard start dictation without opening it. No microphone indicator, and it will not interrupt music.")
+                    Text("Holds the audio session so iOS neither suspends the app nor refuses the microphone to the keyboard. It will not interrupt music, but the microphone indicator stays lit while Syrinx is resident — iOS will not hand a background app a microphone it did not already have.")
                         .font(.caption).foregroundStyle(.secondary)
                     Button("Refresh") { diagnostics = LocalLink.shared.diagnostics }
                 }

@@ -60,6 +60,7 @@ final class Dictation: ObservableObject {
             KeepAwake.shared.start()
         } else if !on {
             KeepAwake.shared.stop()
+            if !running { AudioSession.deactivate() }
         }
     }
 
@@ -113,11 +114,9 @@ final class Dictation: ObservableObject {
             return
         }
 
-        KeepAwake.shared.stop()
         do {
             try c.start()
         } catch {
-            if keepAwake { KeepAwake.shared.start() }
             self.error = "Microphone: \(AudioCapture.describe(error))"
             session = nil
             capture = nil
@@ -152,8 +151,9 @@ final class Dictation: ObservableObject {
         poll?.invalidate(); poll = nil
         capture?.stop(); capture = nil
         session?.stop(); session = nil
-        // Back to silence, so the keyboard can start the next one unaided.
-        if keepAwake { KeepAwake.shared.start() }
+        // The session stays up so the keyboard can start the next one; giving
+        // it back would mean reclaiming it from the background, which fails.
+        if !keepAwake { AudioSession.deactivate() }
         running = false
         status = "Idle"
     }

@@ -30,22 +30,10 @@ final class AudioCapture {
     }
 
     func start() throws {
-        let session = AVAudioSession.sharedInstance()
-        // .playAndRecord even though nothing is ever played.
-        //
-        // The category has to be mixable, because iOS will not let a
-        // background app activate a non-mixable session -- it returns '!int',
-        // which is what the keyboard's start button kept hitting. And
-        // .mixWithOthers is only valid on .playback, .playAndRecord and
-        // .multiRoute: setting it on .record, which is what this used to do,
-        // is silently ignored and leaves the session non-mixable.
-        //
-        // So the category is chosen for the option it admits rather than for
-        // the direction audio travels. .measurement still disables the input
-        // processing that would otherwise fight the recogniser.
-        try session.setCategory(.playAndRecord, mode: .measurement,
-                                options: [.mixWithOthers, .allowBluetooth])
-        try session.setActive(true, options: [])
+        // Already active since launch in the normal case. Activating here is
+        // the call iOS refuses in the background, so it must not be the first
+        // time it happens.
+        try AudioSession.ensureActive()
 
         let input = engine.inputNode
         let hardware = input.outputFormat(forBus: 0)
@@ -94,7 +82,8 @@ final class AudioCapture {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         converter = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        // The session outlives capture: dropping it would mean activating
+        // again for the next one, from the background, which cannot be done.
     }
 
     /// Turn an audio error into something a person can act on.
@@ -108,8 +97,9 @@ final class AudioCapture {
         guard let code = fourCharCode(ns.code) else { return error.localizedDescription }
         switch code {
         case "!int":
-            return "iOS would not start the microphone while Syrinx was in the "
-                + "background (\'!int\'). Open the app and start from there."
+            return "iOS would not start the microphone from the background "
+                + "(\'!int\'). Open Syrinx once, with \"Keep Syrinx awake\" on, so the "
+                + "session is held rather than started while backgrounded."
         case "!pri":
             return "Another app is holding the microphone (\'!pri\')."
         case "!ini":

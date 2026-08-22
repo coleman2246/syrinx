@@ -28,9 +28,9 @@ final class KeepAwake {
     func start() {
         guard player == nil else { return }
         do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            try session.setActive(true)
+            // The same session capture will use. Brought up here, at launch,
+            // because here the app is still in the foreground and allowed to.
+            try AudioSession.ensureActive()
             let p = try AVAudioPlayer(data: Self.silence())
             p.numberOfLoops = -1
             p.volume = 0
