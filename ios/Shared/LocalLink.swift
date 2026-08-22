@@ -190,7 +190,7 @@ enum LocalLinkClient {
         // Guards against calling back twice: a timeout racing a reply, or a
         // connection that fails after it has already answered.
         let done = Atomic(false)
-        func finish(_ value: String?) {
+        func finish(_ value: [String]?) {
             guard done.swap(true) == false else { return }
             c.cancel()
             DispatchQueue.main.async { completion(value) }

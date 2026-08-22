@@ -168,7 +168,7 @@ final class KeyboardViewController: UIInputViewController {
         let began = Date()
         LocalLinkClient.send("STATE") { [weak self] reply in
             let ms = Int(Date().timeIntervalSince(began) * 1000)
-            let outcome = reply.map { "reached, capturing=\($0 == "1")" } ?? "UNREACHABLE"
+            let outcome = reply.map { "reached, capturing=\($0.first == "1")" } ?? "UNREACHABLE"
             self?.textDocumentProxy.insertText("\napp: \(outcome) (\(ms) ms)\n— end —\n")
         }
     }
