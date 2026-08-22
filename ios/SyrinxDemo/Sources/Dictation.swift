@@ -29,6 +29,10 @@ final class Dictation: ObservableObject {
     @AppStorage("serverURL") var serverURL = Bundle.baked("SyrinxURL")
         ?? "wss://dictate.example.com/v1/stream"
     @AppStorage("token") var token = Bundle.baked("SyrinxToken") ?? ""
+    /// Whether to stay resident so the keyboard can start dictation without
+    /// the app being opened first. On by default: that is the whole point of
+    /// the keyboard, and the cost is a track of silence.
+    @AppStorage("keepAwake") var keepAwake = true
 
     private var session: SyrinxCoreSession?
     private var capture: AudioCapture?
@@ -45,6 +49,18 @@ final class Dictation: ObservableObject {
             Task { @MainActor in self?.followKeyboard(wanted) }
         }
         LocalLink.shared.startServing()
+        if keepAwake { KeepAwake.shared.start() }
+    }
+
+    func setKeepAwake(_ on: Bool) {
+        keepAwake = on
+        // Never while recording: capture holds the session itself, and the
+        // app cannot be playing and recording under one category.
+        if on && !running {
+            KeepAwake.shared.start()
+        } else if !on {
+            KeepAwake.shared.stop()
+        }
     }
 
     func toggle() { running ? stop() : start() }
@@ -97,9 +113,11 @@ final class Dictation: ObservableObject {
             return
         }
 
+        KeepAwake.shared.stop()
         do {
             try c.start()
         } catch {
+            if keepAwake { KeepAwake.shared.start() }
             self.error = "Microphone: \(error.localizedDescription)"
             session = nil
             capture = nil
@@ -134,6 +152,8 @@ final class Dictation: ObservableObject {
         poll?.invalidate(); poll = nil
         capture?.stop(); capture = nil
         session?.stop(); session = nil
+        // Back to silence, so the keyboard can start the next one unaided.
+        if keepAwake { KeepAwake.shared.start() }
         running = false
         status = "Idle"
     }

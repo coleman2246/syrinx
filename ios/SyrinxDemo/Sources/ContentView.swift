@@ -77,6 +77,11 @@ struct SettingsView: View {
                         .textSelection(.enabled)
                     Text("granted group: \(Handoff.appGroup ?? "none")")
                         .font(.caption).foregroundStyle(.secondary)
+                    Toggle("Keep Syrinx awake", isOn: Binding(
+                        get: { dictation.keepAwake },
+                        set: { dictation.setKeepAwake($0) }))
+                    Text("Plays silence so iOS does not suspend the app, letting the keyboard start dictation without opening it. No microphone indicator, and it will not interrupt music.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Button("Refresh") { diagnostics = LocalLink.shared.diagnostics }
                 }
                 Section {
