@@ -53,6 +53,16 @@ final class LocalLink {
     private var pending = ""
     private var capturing = false
 
+    /// Whether the listener came up, and what went wrong if not.
+    ///
+    /// A listener that fails to bind is silent -- the keyboard just sees an
+    /// unreachable app, which looks the same as an app that is not running.
+    /// Reported so the two can be told apart without a debugger.
+    private(set) var listenerState = "not started"
+    /// Requests served, so the diagnostics can distinguish "the keyboard never
+    /// reached us" from "it reached us and there was nothing to send".
+    private(set) var served = 0
+
     /// Set by the app. Called when the keyboard asks capture to start or stop.
     var onCapture: ((Bool) -> Void)?
 
@@ -64,7 +74,22 @@ final class LocalLink {
         params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1",
                                                  port: LocalLinkProtocol.port)
         params.allowLocalEndpointReuse = true
-        guard let l = try? NWListener(using: params) else { return }
+        let l: NWListener
+        do {
+            l = try NWListener(using: params)
+        } catch {
+            listenerState = "bind failed: \(error)"
+            return
+        }
+        l.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:          self?.listenerState = "listening"
+            case .failed(let e):  self?.listenerState = "failed: \(e)"
+            case .cancelled:      self?.listenerState = "cancelled"
+            case .waiting(let e): self?.listenerState = "waiting: \(e)"
+            default:              break
+            }
+        }
         l.newConnectionHandler = { [weak self] c in self?.serve(c) }
         l.start(queue: queue)
         listener = l
@@ -91,9 +116,25 @@ final class LocalLink {
             guard let self, let data else { c.cancel(); return }
             let line = String(decoding: data, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            self.served += 1
             let reply = self.handle(line)
             c.send(content: reply, completion: .contentProcessed { _ in c.cancel() })
         }
+    }
+
+    /// A line-by-line report of everything that decides whether this works.
+    var diagnostics: String {
+        lock.lock()
+        let queued = pending.count
+        let on = capturing
+        lock.unlock()
+        return """
+        listener: \(listenerState)
+        port: \(LocalLinkProtocol.port.rawValue)
+        requests served: \(served)
+        queued chars: \(queued)
+        capturing: \(on)
+        """
     }
 
     private func handle(_ line: String) -> Data {

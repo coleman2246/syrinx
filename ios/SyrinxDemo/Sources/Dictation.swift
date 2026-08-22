@@ -33,66 +33,33 @@ final class Dictation: ObservableObject {
     private var session: SyrinxCoreSession?
     private var capture: AudioCapture?
     private var poll: Timer?
-    private var keyboardWatch: Timer?
-    /// The last value the watcher acted on.
-    ///
-    /// The shared flag says what should be happening, not what changed, and
-    /// it defaults to false. Acting on the value rather than on a change to
-    /// it means a session started here is stopped half a second later by a
-    /// flag nobody set -- which looks like the session silently failing,
-    /// since stopping cleanly reports no error.
-    private var lastWant = false
 
-    /// Wire up whichever channel the keyboard will use.
+    /// Serve the keyboard.
     ///
-    /// Both directions matter. Text has to reach the keyboard, and the
-    /// keyboard's mic button has to reach the microphone -- which lives here,
-    /// because an extension cannot open one.
+    /// Always, not only when some entitlement is missing: the extension has
+    /// exactly one way to reach this process, and a listener that is
+    /// conditional on anything is a listener that is sometimes absent for a
+    /// reason nobody can see from the other end.
     init() {
-        if Handoff.usingSharedContainer {
-            lastWant = Handoff.wantsCapture
-            // A file-backed flag has no way to announce itself, so it is
-            // polled. Twice a second: this is a button press, not speech.
-            keyboardWatch = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) {
-                [weak self] _ in
-                Task { @MainActor in self?.checkKeyboardFlag() }
-            }
-        } else {
-            LocalLink.shared.onCapture = { [weak self] wanted in
-                Task { @MainActor in self?.followKeyboard(wanted) }
-            }
-            LocalLink.shared.startServing()
+        LocalLink.shared.onCapture = { [weak self] wanted in
+            Task { @MainActor in self?.followKeyboard(wanted) }
         }
-        // A launch means nothing is capturing, whatever the flag survived the
-        // last run saying. Left stale, a true from a killed session shows the
-        // keyboard a live mic that is not recording anything.
-        publishState()
+        LocalLink.shared.startServing()
     }
 
     func toggle() { running ? stop() : start() }
 
-    /// Act only when the keyboard has actually changed the flag.
-    private func checkKeyboardFlag() {
-        let want = Handoff.wantsCapture
-        guard want != lastWant else { return }
-        lastWant = want
-        followKeyboard(want)
-    }
-
-    /// Act on the keyboard's mic button.
+    /// Act on the keyboard's mic button. It cannot open a microphone, so this
+    /// side does it.
     private func followKeyboard(_ wanted: Bool) {
         if wanted && !running { start() }
         if !wanted && running { stop() }
     }
 
-    /// Tell the keyboard what is actually happening.
-    ///
-    /// The flag is written from both ends: the keyboard sets it to ask, and
-    /// this sets it to answer. Without the answer its mic button reports a
-    /// request rather than a state, and a start that failed still looks live.
+    /// Tell the keyboard what is actually happening, including when a start
+    /// failed -- otherwise its mic button reports a request rather than a
+    /// state, and a session that never began still looks live.
     private func publishState() {
-        lastWant = running
-        Handoff.wantsCapture = running
         LocalLink.shared.setCapturing(running)
     }
 

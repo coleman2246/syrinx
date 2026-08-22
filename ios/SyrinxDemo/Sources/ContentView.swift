@@ -55,6 +55,7 @@ struct ContentView: View {
 struct SettingsView: View {
     @ObservedObject var dictation: Dictation
     @Environment(\.dismiss) private var dismiss
+    @State private var diagnostics = LocalLink.shared.diagnostics
 
     var body: some View {
         NavigationStack {
@@ -66,17 +67,17 @@ struct SettingsView: View {
                     SecureField("token", text: $dictation.token)
                 }
                 Section("Keyboard") {
-                    // Which channel is live decides how the keyboard behaves:
-                    // with a shared container its mic button can start
-                    // capture, without one dictation must be started here.
-                    // The difference is otherwise invisible until it fails.
-                    Text(Handoff.usingSharedContainer
-                         ? "Shared container. The keyboard can start dictation itself."
-                         : "Clipboard mode. Start dictation here; the keyboard inserts what arrives.")
+                    Text("The keyboard reaches this app over \(Handoff.channelDescription). Full Access must be on, or the extension has no network at all.")
                         .font(.footnote)
-                    Text(Handoff.channelDescription)
-                        .font(.caption).foregroundStyle(.secondary)
+                    // Live state rather than a claim about it. "requests
+                    // served" is the one that matters: zero means the keyboard
+                    // has never once reached this process.
+                    Text(diagnostics)
+                        .font(.caption.monospaced())
                         .textSelection(.enabled)
+                    Text("granted group: \(Handoff.appGroup ?? "none")")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Refresh") { diagnostics = LocalLink.shared.diagnostics }
                 }
                 Section {
                     // The address is used exactly as written, same as the

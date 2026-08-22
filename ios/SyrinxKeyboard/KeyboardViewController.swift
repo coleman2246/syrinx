@@ -15,6 +15,7 @@ final class KeyboardViewController: UIInputViewController {
     private let micButton = UIButton(type: .system)
     private let statusLabel = UILabel()
     private let nextKeyboard = UIButton(type: .system)
+    private let infoButton = UIButton(type: .system)
     private var poll: Timer?
     private var capturing = false
     /// Whether the last exchange reached the app. The app is only alive in the
@@ -98,7 +99,7 @@ final class KeyboardViewController: UIInputViewController {
         // The app is only resident while it holds an audio session, so before
         // the first dictation it has to be opened by hand. Saying so beats
         // letting the user tap a mic that cannot reach anything.
-        guard reachable || Handoff.usingSharedContainer else {
+        guard reachable else {
             statusLabel.text = "Open Syrinx once to start — it keeps running in the background"
             statusLabel.numberOfLines = 2
             micButton.isEnabled = true
@@ -109,6 +110,33 @@ final class KeyboardViewController: UIInputViewController {
         micButton.isEnabled = true
         micButton.tintColor = capturing ? .systemRed : .label
         statusLabel.text = capturing ? "Listening — speak" : "Tap the mic to dictate"
+    }
+
+    /// Type a report of everything that decides whether this works.
+    ///
+    /// A sideloaded keyboard extension has no console anyone can get at, no
+    /// debugger attached, and one line of its own UI to say anything in. What
+    /// it does have is the ability to type into whatever field has focus, so
+    /// the text field becomes the diagnostic channel. Tap it anywhere text can
+    /// be entered and the answer is on screen, copyable.
+    @objc private func typeDiagnostics() {
+        let groups = Handoff.provisionedGroups()
+        textDocumentProxy.insertText("""
+        — syrinx keyboard —
+        full access: \(hasFullAccess)
+        bundle: \(Bundle.main.bundleIdentifier ?? "?")
+        ios: \(UIDevice.current.systemVersion)
+        granted group: \(Handoff.appGroup ?? "none")
+        profile groups: \(groups.isEmpty ? "none" : groups.joined(separator: ", "))
+        channel: \(Handoff.channelDescription)
+        probing app…
+        """)
+        let began = Date()
+        LocalLinkClient.send("STATE") { [weak self] reply in
+            let ms = Int(Date().timeIntervalSince(began) * 1000)
+            let outcome = reply.map { "reached, capturing=\($0 == "1")" } ?? "UNREACHABLE"
+            self?.textDocumentProxy.insertText("\napp: \(outcome) (\(ms) ms)\n— end —\n")
+        }
     }
 
     private func buildUI() {
@@ -128,7 +156,10 @@ final class KeyboardViewController: UIInputViewController {
                                action: #selector(handleInputModeList(from:with:)),
                                for: .allTouchEvents)
 
-        let stack = UIStackView(arrangedSubviews: [nextKeyboard, micButton, statusLabel])
+        infoButton.setImage(UIImage(systemName: "info.circle"), for: .normal)
+        infoButton.addTarget(self, action: #selector(typeDiagnostics), for: .touchUpInside)
+
+        let stack = UIStackView(arrangedSubviews: [nextKeyboard, micButton, statusLabel, infoButton])
         stack.axis = .horizontal
         stack.spacing = 16
         stack.alignment = .center
