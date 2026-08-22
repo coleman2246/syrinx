@@ -33,14 +33,33 @@ final class Dictation: ObservableObject {
     private var session: SyrinxCoreSession?
     private var capture: AudioCapture?
     private var poll: Timer?
+    private var keyboardWatch: Timer?
+
+    /// Wire up whichever channel the keyboard will use.
+    ///
+    /// Both directions matter. Text has to reach the keyboard, and the
+    /// keyboard's mic button has to reach the microphone -- which lives here,
+    /// because an extension cannot open one.
+    init() {
+        if Handoff.usingSharedContainer {
+            // A file-backed flag has no way to announce itself, so it is
+            // polled. Twice a second: this is a button press, not speech.
+            keyboardWatch = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) {
+                [weak self] _ in
+                Task { @MainActor in self?.followKeyboard(Handoff.wantsCapture) }
+            }
+        } else {
+            LocalLink.shared.onCapture = { [weak self] wanted in
+                Task { @MainActor in self?.followKeyboard(wanted) }
+            }
+            LocalLink.shared.startServing()
+        }
+    }
 
     func toggle() { running ? stop() : start() }
 
-    /// Follow the keyboard's mic button. The keyboard cannot open the
-    /// microphone, so it sets a flag and this side acts on it.
-    func syncWithKeyboard() {
-        guard Handoff.usingSharedContainer else { return }
-        let wanted = Handoff.wantsCapture
+    /// Act on the keyboard's mic button.
+    private func followKeyboard(_ wanted: Bool) {
         if wanted && !running { start() }
         if !wanted && running { stop() }
     }
@@ -86,6 +105,7 @@ final class Dictation: ObservableObject {
         }
 
         running = true
+        LocalLink.shared.setCapturing(true)
         // 10 Hz is well under the rate fragments arrive at, so text appears
         // promptly without spinning the main thread.
         poll = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -113,6 +133,7 @@ final class Dictation: ObservableObject {
         capture?.stop(); capture = nil
         session?.stop(); session = nil
         running = false
+        LocalLink.shared.setCapturing(false)
         status = "Idle"
     }
 

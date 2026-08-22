@@ -14,6 +14,9 @@ targets:
     platform: iOS
     sources:
       - path: SyrinxDemo/Sources
+      # The handoff is a contract between the two targets, so it is one file
+      # compiled into both rather than a copy in each that can drift.
+      - path: Shared
     dependencies:
       # Built by crates/syrinx-ios/build-xcframework.sh.
       - framework: ../target/SyrinxCore.xcframework
@@ -44,6 +47,7 @@ targets:
     platform: iOS
     sources:
       - path: SyrinxKeyboard
+      - path: Shared
     settings:
       base:
         INFOPLIST_FILE: SyrinxKeyboard/Info.plist

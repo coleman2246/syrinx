@@ -78,7 +78,7 @@ enum Handoff {
     /// it should never have to be inferred from behaviour.
     static var channelDescription: String {
         if let g = appGroup { return "shared container (\(g))" }
-        return "clipboard (no App Group granted)"
+        return "loopback 127.0.0.1:\(LocalLinkProtocol.port.rawValue) (no App Group granted)"
     }
 
     private static var file: URL? {
@@ -94,47 +94,51 @@ enum Handoff {
             let existing = (try? String(contentsOf: f, encoding: .utf8)) ?? ""
             try? (existing + text).write(to: f, atomically: true, encoding: .utf8)
         } else {
-            // Clipboard fallback. Visible and it clobbers whatever was there,
-            // which is why it is the second choice rather than the first.
-            UIPasteboard.general.string = marker + text
+            LocalLink.shared.publish(text)
         }
     }
 
-    /// Called by the keyboard. Returns text not yet inserted, and clears it so
+    /// Called by the keyboard. Yields text not yet inserted, and clears it so
     /// the same words are never typed twice.
-    static func take() -> String? {
+    ///
+    /// Asynchronous because one of the two channels is a socket. `nil` means
+    /// the app could not be reached at all, which the keyboard reports
+    /// differently from "reached, nothing new": the first needs the user to
+    /// open the app, the second needs them to keep talking.
+    static func take(_ completion: @escaping (String?) -> Void) {
         if let f = file {
             guard let s = try? String(contentsOf: f, encoding: .utf8), !s.isEmpty else {
-                return nil
+                completion("")
+                return
             }
             try? "".write(to: f, atomically: true, encoding: .utf8)
-            return s
+            completion(s)
+            return
         }
-        return takeFromPasteboard()
+        LocalLinkClient.send("TAKE", then: completion)
     }
 
-    /// Clipboard fallback, for when the App Group entitlement is not granted.
+    /// Ask the app to start or stop capturing.
     ///
-    /// Keyed on `changeCount` rather than on the text: comparing strings would
-    /// refuse to insert the same word twice in a row, which is a thing people
-    /// say. The counter changes on every write even when the contents match.
-    ///
-    /// The extension's own defaults are used, because by definition there is
-    /// no shared container in this path.
-    private static func takeFromPasteboard() -> String? {
-        let pb = UIPasteboard.general
-        let seen = UserDefaults.standard.integer(forKey: "pbSeen")
-        guard pb.changeCount != seen else { return nil }
-        UserDefaults.standard.set(pb.changeCount, forKey: "pbSeen")
-        // Only take what this app put there. Anything else is the user's own
-        // clipboard and must not be typed into their document.
-        guard let s = pb.string, s.hasPrefix(marker) else { return nil }
-        return String(s.dropFirst(marker.count))
+    /// The keyboard cannot open the microphone, so this is how its mic button
+    /// does anything at all. Reports whether the app was there to hear it.
+    static func setWantsCapture(_ on: Bool, then completion: @escaping (Bool) -> Void) {
+        if usingSharedContainer {
+            wantsCapture = on
+            completion(true)
+            return
+        }
+        LocalLinkClient.send(on ? "START" : "STOP") { completion($0 != nil) }
     }
 
-    /// Tags clipboard writes as ours. Without it the keyboard would insert
-    /// whatever the user last copied, which would be alarming.
-    private static let marker = "\u{200B}"  // zero-width space, invisible if pasted
+    /// Whether the app is capturing right now, or nil if it cannot be reached.
+    static func captureState(_ completion: @escaping (Bool?) -> Void) {
+        if usingSharedContainer {
+            completion(wantsCapture)
+            return
+        }
+        LocalLinkClient.send("STATE") { completion($0.map { $0 == "1" }) }
+    }
 
     /// Whether the app should be capturing. The keyboard sets this; the app
     /// watches it, so the mic button can live on the keyboard even though the

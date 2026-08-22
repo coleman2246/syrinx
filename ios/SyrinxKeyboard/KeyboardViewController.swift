@@ -17,12 +17,23 @@ final class KeyboardViewController: UIInputViewController {
     private let nextKeyboard = UIButton(type: .system)
     private var poll: Timer?
     private var capturing = false
+    /// Whether the last exchange reached the app. The app is only alive in the
+    /// background while it holds an audio session, so "not running" is a
+    /// normal state the user has to be told about rather than an error.
+    private var reachable = false
+    /// One request at a time. The poll fires faster than a dead app times out,
+    /// and overlapping requests would queue up behind each other.
+    private var inFlight = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
         buildUI()
-        capturing = Handoff.wantsCapture
         render()
+        Handoff.captureState { [weak self] state in
+            self?.capturing = state ?? false
+            self?.reachable = state != nil
+            self?.render()
+        }
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -42,30 +53,61 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func drain() {
-        guard let text = Handoff.take(), !text.isEmpty else { return }
-        textDocumentProxy.insertText(text)
+        guard hasFullAccess, !inFlight else { return }
+        inFlight = true
+        Handoff.take { [weak self] text in
+            guard let self else { return }
+            self.inFlight = false
+            let was = self.reachable
+            self.reachable = text != nil
+            if let text, !text.isEmpty {
+                self.textDocumentProxy.insertText(text)
+            }
+            if was != self.reachable { self.render() }
+        }
     }
 
     @objc private func toggleMic() {
         capturing.toggle()
-        Handoff.wantsCapture = capturing
         render()
+        Handoff.setWantsCapture(capturing) { [weak self] delivered in
+            guard let self else { return }
+            self.reachable = delivered
+            // The app was not there to hear it, so nothing is capturing
+            // whatever the button now looks like.
+            if !delivered { self.capturing = false }
+            self.render()
+        }
     }
 
     private func render() {
         let name = capturing ? "mic.fill" : "mic"
         micButton.setImage(UIImage(systemName: name), for: .normal)
-        micButton.tintColor = capturing ? .systemRed : .label
-        guard Handoff.usingSharedContainer else {
-            // Without a shared container the app never sees the flag, so
-            // capture has to be started over there. Saying so up front beats
-            // letting the user tap a mic that cannot do anything. Text still
-            // arrives, via the clipboard.
-            statusLabel.text = "Clipboard mode — start dictation in the Syrinx app"
+
+        // Full Access is what gives an extension a network, and without one
+        // there is no way to reach the app at all. Worth naming the exact
+        // setting: it is four levels deep and easy to miss.
+        guard hasFullAccess else {
+            statusLabel.text = "Turn on Full Access: Settings › General › Keyboard › Keyboards › Syrinx"
+            statusLabel.numberOfLines = 2
             micButton.isEnabled = false
             micButton.tintColor = .tertiaryLabel
             return
         }
+
+        // The app is only resident while it holds an audio session, so before
+        // the first dictation it has to be opened by hand. Saying so beats
+        // letting the user tap a mic that cannot reach anything.
+        guard reachable || Handoff.usingSharedContainer else {
+            statusLabel.text = "Open Syrinx once to start — it keeps running in the background"
+            statusLabel.numberOfLines = 2
+            micButton.isEnabled = true
+            micButton.tintColor = .tertiaryLabel
+            return
+        }
+
+        micButton.isEnabled = true
+        micButton.tintColor = capturing ? .systemRed : .label
         statusLabel.text = capturing ? "Listening — speak" : "Tap the mic to dictate"
     }
 
