@@ -1,8 +1,11 @@
 // Copy to Local.xcconfig and fill in. That file is gitignored: this
 // repository is public and the token must not be committed.
 //
-// Both may be left empty -- the app then starts with a placeholder address
-// and you set the real one in Settings.
-
-SYRINX_URL =
+// Note the SLASH indirection. xcconfig treats // as the start of a comment
+// even in the middle of a value, so writing wss://host/v1/stream directly
+// gives you "wss:" and a baffling connection error -- and defining
+// "SLASHES = //" does not help, because that value is itself a comment.
+// One slash at a time is the way out. Do not simplify this.
+SLASH = /
+SYRINX_URL = wss:$(SLASH)$(SLASH)dictate.example.com/v1/stream
 SYRINX_TOKEN =
