@@ -35,7 +35,15 @@ final class AudioCapture {
         // asking for playback would duck other audio for no reason.
         // .record with the audio background mode keeps capture alive while the
         // user is in another app typing -- which is the entire point.
-        try session.setCategory(.record, mode: .measurement, options: [.duckOthers])
+        //
+        // .mixWithOthers is not a preference, it is what makes starting from
+        // the keyboard possible at all. A non-mixable session cannot be
+        // activated from the background: iOS returns '!int', which surfaces as
+        // "OSStatus error 560557684" and says nothing. .duckOthers used to be
+        // set here and is exactly such a request -- ducking is interrupting.
+        // Mixing costs a little bleed from whatever else is playing, which is
+        // a far better trade than only being able to start from the app.
+        try session.setCategory(.record, mode: .measurement, options: [.mixWithOthers])
         try session.setActive(true, options: [])
 
         let input = engine.inputNode
@@ -86,6 +94,39 @@ final class AudioCapture {
         engine.stop()
         converter = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+    }
+
+    /// Turn an audio error into something a person can act on.
+    ///
+    /// CoreAudio reports failures as four-character codes rendered in decimal,
+    /// so a user sees "OSStatus error 560557684" where the code actually reads
+    /// '!int'. The number is unsearchable and the message that wraps it says
+    /// only that the operation could not be completed.
+    static func describe(_ error: Error) -> String {
+        let ns = error as NSError
+        guard let code = fourCharCode(ns.code) else { return error.localizedDescription }
+        switch code {
+        case "!int":
+            return "iOS would not start the microphone while Syrinx was in the "
+                + "background (\'!int\'). Open the app and start from there."
+        case "!pri":
+            return "Another app is holding the microphone (\'!pri\')."
+        case "!ini":
+            return "The audio session was not ready (\'!ini\'). Try again."
+        case "!dev":
+            return "No microphone is available (\'!dev\')."
+        default:
+            return "\(error.localizedDescription) (\'\(code)\')"
+        }
+    }
+
+    /// The printable four-character code inside an OSStatus, if it is one.
+    private static func fourCharCode(_ code: Int) -> String? {
+        let v = UInt32(bitPattern: Int32(truncatingIfNeeded: code))
+        let bytes = [UInt8(truncatingIfNeeded: v >> 24), UInt8(truncatingIfNeeded: v >> 16),
+                     UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v)]
+        guard bytes.allSatisfy({ (0x20...0x7e).contains($0) }) else { return nil }
+        return String(bytes: bytes, encoding: .ascii)
     }
 
     /// Ask for microphone permission. Without this the tap delivers silence

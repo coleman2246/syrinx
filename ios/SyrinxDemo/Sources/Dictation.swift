@@ -118,7 +118,7 @@ final class Dictation: ObservableObject {
             try c.start()
         } catch {
             if keepAwake { KeepAwake.shared.start() }
-            self.error = "Microphone: \(error.localizedDescription)"
+            self.error = "Microphone: \(AudioCapture.describe(error))"
             session = nil
             capture = nil
             publishState()
