@@ -33,7 +33,7 @@ final class SyrinxCoreSession {
         guard let h = url.withCString({ u in
             token.withCString { t in syrinx_start(u, t) }
         }) else { return nil }
-        handle = OpaquePointer(h)
+        handle = h
     }
 
     /// Push 16 kHz mono samples. Returns false when the core cannot take them,
@@ -42,25 +42,25 @@ final class SyrinxCoreSession {
     @discardableResult
     func push(_ samples: UnsafePointer<Float>, count: Int) -> Bool {
         guard let h = handle else { return false }
-        return syrinx_push_audio(.init(h), samples, count)
+        return syrinx_push_audio(h, samples, count)
     }
 
     /// Transcript text not yet seen. Never repeats, so the caller appends.
     func takeText() -> String? {
-        guard let h = handle, let c = syrinx_take_text(.init(h)) else { return nil }
+        guard let h = handle, let c = syrinx_take_text(h) else { return nil }
         defer { syrinx_string_free(c) }
         return String(cString: c)
     }
 
     func takeError() -> String? {
-        guard let h = handle, let c = syrinx_take_error(.init(h)) else { return nil }
+        guard let h = handle, let c = syrinx_take_error(h) else { return nil }
         defer { syrinx_string_free(c) }
         return String(cString: c)
     }
 
     var status: Status {
         guard let h = handle else { return .idle }
-        return Status(rawValue: syrinx_status(.init(h))) ?? .idle
+        return Status(rawValue: syrinx_status(h)) ?? .idle
     }
 
     /// Idempotent: nulling the handle first means a second call, or a call
@@ -68,7 +68,7 @@ final class SyrinxCoreSession {
     func stop() {
         guard let h = handle else { return }
         handle = nil
-        syrinx_stop(.init(h))
+        syrinx_stop(h)
     }
 
     deinit { stop() }
