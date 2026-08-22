@@ -191,4 +191,18 @@ A macOS Sequoia guest under QEMU/KVM (OSX-KVM), on this machine:
   xcframework's simulator slice is `aarch64-apple-ios-sim` and would not run
   here regardless.
 
-Start it with the OSX-KVM launch script in that directory before building.
+Start it with `ios/macos-vm.sh` before building:
+
+```sh
+VM_DIR=/mnt/winssd/macos-vm ios/macos-vm.sh &
+```
+
+The script is in the repository; the images are not, because they are large
+and they are Apple's. Neither is the `isa-applesmc` OSK — it is a string from
+Apple's firmware, widely published and supplied by OSX-KVM, and it belongs in
+`$VM_DIR/.osk` or `APPLESMC_OSK` rather than in a public repository. Apple's
+licence also permits macOS only on Apple hardware, which is worth knowing
+before standing one of these up.
+
+Pass `WITH_INSTALLER=1` to attach `BaseSystem.img`; leave it off afterwards, or
+the boot picker gains a second entry that is easy to choose by accident.
