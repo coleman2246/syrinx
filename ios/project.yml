@@ -1,0 +1,32 @@
+# XcodeGen input. The .xcodeproj is generated rather than committed: a
+# pbxproj is thousands of lines of machine-managed UUIDs that no one can
+# review, and it conflicts on every branch.
+name: SyrinxDemo
+options:
+  bundleIdPrefix: space.aragonite
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+targets:
+  SyrinxDemo:
+    type: application
+    platform: iOS
+    sources:
+      - path: SyrinxDemo/Sources
+    info:
+      path: SyrinxDemo/Info.plist
+    dependencies:
+      # Built by crates/syrinx-ios/build-xcframework.sh.
+      - framework: ../target/SyrinxCore.xcframework
+        embed: false        # a static library is linked in, never embedded
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: space.aragonite.SyrinxDemo
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        # Signed later by SideStore with your own Apple ID, so the build
+        # itself needs no certificate and CI never holds credentials.
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
