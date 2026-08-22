@@ -1,0 +1,8 @@
+// Copy to Local.xcconfig and fill in. That file is gitignored: this
+// repository is public and the token must not be committed.
+//
+// Both may be left empty -- the app then starts with a placeholder address
+// and you set the real one in Settings.
+
+SYRINX_URL =
+SYRINX_TOKEN =
