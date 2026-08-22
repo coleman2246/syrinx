@@ -14,6 +14,10 @@
     <!-- Without this the app is killed the moment it touches the microphone. -->
     <key>NSMicrophoneUsageDescription</key>
     <string>Syrinx sends what you say to your own server to be transcribed.</string>
+    <!-- Substituted from Local.xcconfig at build time; empty in a clean
+         checkout, and the app falls back to its placeholder. -->
+    <key>SyrinxURL</key>                          <string>$(SYRINX_URL)</string>
+    <key>SyrinxToken</key>                        <string>$(SYRINX_TOKEN)</string>
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationPortrait</string>

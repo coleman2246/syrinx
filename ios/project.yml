@@ -14,14 +14,6 @@ targets:
     platform: iOS
     sources:
       - path: SyrinxDemo/Sources
-    info:
-      path: SyrinxDemo/Info.plist
-      properties:
-        # Populated from Local.xcconfig, which is gitignored. Empty in a clean
-        # checkout, so the app falls back to its placeholder and the token is
-        # never in the repository.
-        SyrinxURL: $(SYRINX_URL)
-        SyrinxToken: $(SYRINX_TOKEN)
     dependencies:
       # Built by crates/syrinx-ios/build-xcframework.sh.
       - framework: ../target/SyrinxCore.xcframework
@@ -31,6 +23,11 @@ targets:
       Release: Local.xcconfig
     settings:
       base:
+        # INFOPLIST_FILE, not XcodeGen's `info:` block. `info:` *generates* a
+        # plist from the properties given and overwrites whatever is at that
+        # path -- which silently dropped NSMicrophoneUsageDescription and left
+        # an app that dies the moment it opens the microphone.
+        INFOPLIST_FILE: SyrinxDemo/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: space.aragonite.SyrinxDemo
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
