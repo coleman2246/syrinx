@@ -7,6 +7,12 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd ../.. && pwd)"
+
+# rustup installs into ~/.cargo/bin and puts it on PATH from a shell profile,
+# which a non-interactive ssh does not read. Running this over ssh -- which is
+# how the macOS build machine is driven -- otherwise fails with "cargo: command
+# not found" while cargo works fine when you log in and try it by hand.
+command -v cargo >/dev/null || [ ! -f "$HOME/.cargo/env" ] || . "$HOME/.cargo/env"
 OUT="${1:-$ROOT/target/SyrinxCore.xcframework}"
 
 for t in aarch64-apple-ios aarch64-apple-ios-sim; do
