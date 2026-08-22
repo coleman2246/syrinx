@@ -401,12 +401,17 @@ captures and transcribes with the same Rust client the desktop uses; the
 keyboard types the result at the cursor. A keyboard extension cannot open a
 microphone on any iOS version, which is why it is two pieces rather than one.
 
-Building needs a Mac or a macOS VM:
+Building needs a Mac, since Xcode runs nowhere else:
 
 ```sh
 make ios-framework   # only when anything under crates/ changed
 make ios             # builds on the VM and copies the .ipa back
 ```
+
+Those targets drive a macOS VM over SSH; `ios/macos-vm.sh` launches one. Apple's
+licence permits macOS only on Apple hardware, so that route is a decision to
+make deliberately rather than a supported path — a Mac you own needs neither
+the VM nor the two `make` targets, just the three scripts in `ios/`.
 
 The build is unsigned; a sideloader signs it with your Apple ID. After
 installing, turn on **Full Access** for the keyboard and open the app once —
