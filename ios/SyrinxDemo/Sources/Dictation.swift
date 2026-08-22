@@ -49,7 +49,32 @@ final class Dictation: ObservableObject {
             Task { @MainActor in self?.followKeyboard(wanted) }
         }
         LocalLink.shared.startServing()
-        if keepAwake { KeepAwake.shared.start() }
+
+        // Permission first. A .playAndRecord session cannot be held without
+        // it, and holding it from launch is the only thing that lets the
+        // keyboard start dictation later -- so asking at the first Start,
+        // which is what used to happen, was already too late.
+        AudioCapture.requestPermission { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.keepAwake, !self.running else { return }
+                KeepAwake.shared.start()
+            }
+        }
+
+        // A media services reset invalidates every audio object in the
+        // process. Anything still running is running on rubble.
+        NotificationCenter.default.addObserver(
+            forName: .syrinxAudioReset, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if self.running {
+                    self.stop()
+                    self.error = "The audio system restarted. Start again."
+                }
+                if self.keepAwake { KeepAwake.shared.restartAfterReset() }
+            }
+        }
     }
 
     func setKeepAwake(_ on: Bool) {

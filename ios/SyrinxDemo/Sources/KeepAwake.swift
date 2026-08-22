@@ -70,6 +70,10 @@ final class KeepAwake {
         start()
     }
 
+    /// After a media services reset the old player refers to objects that no
+    /// longer exist, so it is discarded rather than resumed.
+    func restartAfterReset() { restart() }
+
     /// A one-second silent WAV, built rather than shipped.
     ///
     /// A file in the bundle would do the same job, but a binary asset nobody

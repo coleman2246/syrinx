@@ -75,7 +75,16 @@ final class AudioCapture {
         }
 
         engine.prepare()
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            // Distinct from the session failing: the session can be perfectly
+            // healthy and the engine still refuse, and the two need different
+            // answers.
+            throw NSError(domain: "Syrinx.audio", code: (error as NSError).code, userInfo: [
+                NSLocalizedDescriptionKey: "starting the audio engine: \(AudioSession.describe(error))"
+            ])
+        }
     }
 
     func stop() {
@@ -86,39 +95,9 @@ final class AudioCapture {
         // again for the next one, from the background, which cannot be done.
     }
 
-    /// Turn an audio error into something a person can act on.
-    ///
-    /// CoreAudio reports failures as four-character codes rendered in decimal,
-    /// so a user sees "OSStatus error 560557684" where the code actually reads
-    /// '!int'. The number is unsearchable and the message that wraps it says
-    /// only that the operation could not be completed.
-    static func describe(_ error: Error) -> String {
-        let ns = error as NSError
-        guard let code = fourCharCode(ns.code) else { return error.localizedDescription }
-        switch code {
-        case "!int":
-            return "iOS would not start the microphone from the background "
-                + "(\'!int\'). Open Syrinx once, with \"Keep Syrinx awake\" on, so the "
-                + "session is held rather than started while backgrounded."
-        case "!pri":
-            return "Another app is holding the microphone (\'!pri\')."
-        case "!ini":
-            return "The audio session was not ready (\'!ini\'). Try again."
-        case "!dev":
-            return "No microphone is available (\'!dev\')."
-        default:
-            return "\(error.localizedDescription) (\'\(code)\')"
-        }
-    }
-
-    /// The printable four-character code inside an OSStatus, if it is one.
-    private static func fourCharCode(_ code: Int) -> String? {
-        let v = UInt32(bitPattern: Int32(truncatingIfNeeded: code))
-        let bytes = [UInt8(truncatingIfNeeded: v >> 24), UInt8(truncatingIfNeeded: v >> 16),
-                     UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v)]
-        guard bytes.allSatisfy({ (0x20...0x7e).contains($0) }) else { return nil }
-        return String(bytes: bytes, encoding: .ascii)
-    }
+    /// Decoding lives with the session, which is where most of these come
+    /// from; this only forwards so callers have one place to ask.
+    static func describe(_ error: Error) -> String { AudioSession.describe(error) }
 
     /// Ask for microphone permission. Without this the tap delivers silence
     /// rather than failing, which looks exactly like a broken server.

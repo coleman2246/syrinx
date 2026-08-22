@@ -55,7 +55,15 @@ struct ContentView: View {
 struct SettingsView: View {
     @ObservedObject var dictation: Dictation
     @Environment(\.dismiss) private var dismiss
-    @State private var diagnostics = LocalLink.shared.diagnostics
+    @State private var diagnostics = SettingsView.report()
+
+    /// Both halves of what decides whether dictation can start: the channel
+    /// the keyboard uses, and the audio session it depends on.
+    static func report() -> String {
+        LocalLink.shared.diagnostics
+            + "\nkeep-awake: \(KeepAwake.shared.isRunning)\n"
+            + AudioSession.diagnostics
+    }
 
     var body: some View {
         NavigationStack {
@@ -82,7 +90,7 @@ struct SettingsView: View {
                         set: { dictation.setKeepAwake($0) }))
                     Text("Holds the audio session so iOS neither suspends the app nor refuses the microphone to the keyboard. It will not interrupt music, but the microphone indicator stays lit while Syrinx is resident — iOS will not hand a background app a microphone it did not already have.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Button("Refresh") { diagnostics = LocalLink.shared.diagnostics }
+                    Button("Refresh") { diagnostics = Self.report() }
                 }
                 Section {
                     // The address is used exactly as written, same as the
