@@ -3,28 +3,83 @@ import UIKit
 
 /// How the app passes transcript text to the keyboard extension.
 ///
-/// A keyboard extension cannot open the microphone — that is a security
+/// A keyboard extension cannot open the microphone. That is a security
 /// boundary, not an oversight, and it has not moved in iOS 26. So the app
 /// captures and transcribes, and the keyboard only inserts. This is the
 /// channel between them.
 ///
-/// Two channels, because the good one is not always available. Full Access
-/// grants a shared container, but the App Groups *entitlement* needs a
-/// provisioning profile that supports it, and free Apple ID provisioning
-/// often will not grant one. Rather than guess at install time, both paths
-/// are implemented and the right one is chosen at runtime by asking for the
-/// container and seeing whether iOS hands one over.
+/// Two channels, because the good one is not always available. A shared
+/// container needs the App Groups entitlement, and a sideloaded build gets
+/// whatever the signer chose to grant. Rather than guess at install time,
+/// both paths are implemented and the right one is chosen at runtime by
+/// asking for the container and seeing whether iOS hands one over.
 enum Handoff {
-    static let appGroup = "group.space.aragonite.SyrinxDemo"
+    /// What the entitlement files ask for. What is actually granted may
+    /// differ, which is why nothing reads this directly.
+    static let declaredGroup = "group.space.aragonite.SyrinxDemo"
+
+    /// The group iOS actually granted, resolved once at first use.
+    ///
+    /// Not a constant, because a re-signer is free to rename it. AltStore and
+    /// friends register groups under their own team and rewrite the
+    /// entitlement to match, so the ID in the installed app is often
+    /// `group.<TEAMID>.space.aragonite.SyrinxDemo` rather than what was asked
+    /// for. Hardcoding the declared name means asking for a container that
+    /// was never granted and silently falling back to the clipboard.
+    static let appGroup: String? = {
+        // The declared name first: if it survived signing, prefer it.
+        for id in [declaredGroup] + provisionedGroups() {
+            if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: id) != nil {
+                return id
+            }
+        }
+        return nil
+    }()
+
+    /// The groups named in this bundle's provisioning profile.
+    ///
+    /// The profile is a CMS signature wrapping a plist. Verifying the
+    /// signature is the system's job, and this only needs to read a value out
+    /// of a file already inside our own bundle, so the plist is located by
+    /// its delimiters rather than by decoding the container.
+    ///
+    /// `Bundle.main` is the extension's own bundle when this runs in the
+    /// keyboard, which is what is wanted: each target carries its own profile.
+    private static func provisionedGroups() -> [String] {
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+              let data = try? Data(contentsOf: url),
+              let start = data.range(of: Data("<?xml".utf8)),
+              let end = data.range(of: Data("</plist>".utf8), options: .backwards)
+        else { return [] }
+        let plist = try? PropertyListSerialization.propertyList(
+            from: data[start.lowerBound..<end.upperBound], format: nil)
+        guard let root = plist as? [String: Any],
+              let entitlements = root["Entitlements"] as? [String: Any],
+              let groups = entitlements["com.apple.security.application-groups"] as? [String]
+        else { return [] }
+        return groups
+    }
 
     /// Non-nil only when the App Groups entitlement was actually granted.
     /// `UserDefaults(suiteName:)` is no use for this: it returns an object
     /// either way and silently fails to share.
     static var containerURL: URL? {
-        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)
+        appGroup.flatMap {
+            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0)
+        }
     }
 
     static var usingSharedContainer: Bool { containerURL != nil }
+
+    /// One line naming the live channel, for the app and the keyboard to show.
+    ///
+    /// Which channel is in use decides what the user has to do -- the shared
+    /// container lets the keyboard start capture, the clipboard does not -- so
+    /// it should never have to be inferred from behaviour.
+    static var channelDescription: String {
+        if let g = appGroup { return "shared container (\(g))" }
+        return "clipboard (no App Group granted)"
+    }
 
     private static var file: URL? {
         containerURL?.appendingPathComponent("pending.txt")
@@ -90,6 +145,6 @@ enum Handoff {
     }
 
     private static var defaults: UserDefaults? {
-        usingSharedContainer ? UserDefaults(suiteName: appGroup) : nil
+        appGroup.flatMap { UserDefaults(suiteName: $0) }
     }
 }

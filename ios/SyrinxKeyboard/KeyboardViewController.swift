@@ -50,19 +50,22 @@ final class KeyboardViewController: UIInputViewController {
         capturing.toggle()
         Handoff.wantsCapture = capturing
         render()
-
-        if !Handoff.usingSharedContainer {
-            // Without a shared container the app cannot see the flag, so
-            // capture has to be started in the app. Text still arrives, via
-            // the clipboard.
-            statusLabel.text = "Start in the Syrinx app (clipboard mode)"
-        }
     }
 
     private func render() {
         let name = capturing ? "mic.fill" : "mic"
         micButton.setImage(UIImage(systemName: name), for: .normal)
         micButton.tintColor = capturing ? .systemRed : .label
+        guard Handoff.usingSharedContainer else {
+            // Without a shared container the app never sees the flag, so
+            // capture has to be started over there. Saying so up front beats
+            // letting the user tap a mic that cannot do anything. Text still
+            // arrives, via the clipboard.
+            statusLabel.text = "Clipboard mode — start dictation in the Syrinx app"
+            micButton.isEnabled = false
+            micButton.tintColor = .tertiaryLabel
+            return
+        }
         statusLabel.text = capturing ? "Listening — speak" : "Tap the mic to dictate"
     }
 

@@ -65,6 +65,19 @@ struct SettingsView: View {
                         .autocorrectionDisabled()
                     SecureField("token", text: $dictation.token)
                 }
+                Section("Keyboard") {
+                    // Which channel is live decides how the keyboard behaves:
+                    // with a shared container its mic button can start
+                    // capture, without one dictation must be started here.
+                    // The difference is otherwise invisible until it fails.
+                    Text(Handoff.usingSharedContainer
+                         ? "Shared container. The keyboard can start dictation itself."
+                         : "Clipboard mode. Start dictation here; the keyboard inserts what arrives.")
+                        .font(.footnote)
+                    Text(Handoff.channelDescription)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
                 Section {
                     // The address is used exactly as written, same as the
                     // desktop clients — no scheme or port is inferred.
