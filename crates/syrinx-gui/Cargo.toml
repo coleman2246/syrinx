@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-syrinx-proto.workspace = true
 syrinx-audio.workspace = true
 syrinx-client.workspace = true
 serde.workspace = true

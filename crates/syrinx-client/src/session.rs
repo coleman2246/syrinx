@@ -73,6 +73,12 @@ pub struct SessionState {
     /// What the handshake actually granted -- the client may have asked and
     /// still not received, e.g. no diarization models on the server.
     pub diarize: bool,
+    /// What `session.start` actually asked for -- computed once, in `run`,
+    /// from the same expression that builds the wire message, so this and
+    /// the request sent can never disagree. Separate mode runs one session
+    /// per source with a per-source mode, so this is per-session like
+    /// `diarize`, not read back from global options.
+    pub diarize_requested: bool,
     pub error: Option<String>,
     /// Live spectrum of the audio being sent, so a viewer can see the session
     /// is receiving sound rather than only that it is running.
@@ -222,6 +228,17 @@ async fn run(
         .with_context(|| format!("connecting to {}", opts.url))?;
     let (mut tx, mut rx) = ws.split();
 
+    // Never on a typing session, even if the caller asked: a typing mode runs
+    // the wire live and types every fragment as it lands, so "Speaker 2:"
+    // landing at the cursor would be destructive, not decorative.
+    // Mode::Transcript is exactly the modes that don't type -- guaranteed by
+    // OutputMode::wire_mode's own invariant test, so this holds by
+    // construction. Computed once and stamped onto state immediately, so a
+    // viewer's honest-handshake notice reads the same request this sends,
+    // never a second, possibly-diverging computation of it.
+    let diarize_requested = opts.diarize && opts.mode.wire_mode() == syrinx_proto::Mode::Transcript;
+    state.lock().expect("state lock poisoned").diarize_requested = diarize_requested;
+
     tx.send(Ws::Text(
         serde_json::to_string(&ClientMessage::SessionStart {
             // Typing forces the append-only wire mode; see OutputMode::wire_mode.
@@ -230,13 +247,7 @@ async fn run(
             encoding: Encoding::PcmS16le,
             language: None,
             vocabulary: None,
-            // Never on a typing session, even if the caller asked: a typing
-            // mode runs the wire live and types every fragment as it lands,
-            // so "Speaker 2:" landing at the cursor would be destructive, not
-            // decorative. Mode::Transcript is exactly the modes that don't
-            // type -- guaranteed by OutputMode::wire_mode's own invariant
-            // test, so this holds by construction.
-            diarize: opts.diarize && opts.mode.wire_mode() == syrinx_proto::Mode::Transcript,
+            diarize: diarize_requested,
         })?
         .into(),
     ))

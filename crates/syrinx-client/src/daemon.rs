@@ -475,13 +475,6 @@ impl DaemonRuntime {
         );
         out.source_keys = self.opts.source_keys.clone();
         out.source_mode = self.opts.source_mode;
-        // What this daemon actually asked the server for, mirroring the same
-        // check `session::run` makes when it builds `session.start` -- so the
-        // viewer judges the honest-handshake notice against the request that
-        // was really sent, not a second, possibly-stale read of the config.
-        let wire_mode = self.opts.mode.wire_mode();
-        out.diarize_requested =
-            self.opts.config.diarize && wire_mode == syrinx_proto::Mode::Transcript;
 
         // A file job owns the status while it runs, so a viewer shows progress
         // rather than an idle window with nothing happening.
@@ -825,6 +818,10 @@ fn merge_states(states: &[crate::session::SessionState]) -> crate::session::Sess
         // runs one session per source and only the non-typing ones request
         // diarization, so an all-false merge would wrongly blame the server.
         diarize: states.iter().any(|s| s.diarize),
+        // Likewise for the request itself: in separate mode the primary
+        // source keeps whatever mode the user picked while every other
+        // source is forced to Transcribe, so it alone can be the one asking.
+        diarize_requested: states.iter().any(|s| s.diarize_requested),
         error: states.iter().find_map(|s| s.error.clone()),
         // Levels come from the first source; a merged spectrum would say less
         // than one real one.
