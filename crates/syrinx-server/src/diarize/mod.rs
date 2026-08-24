@@ -4,6 +4,8 @@
 //! session's labelling semantics -- lag, majority, strike-out -- are testable
 //! in CI with [`MockDiarizer`], with no models anywhere near the tests.
 
+pub mod cluster;
+
 use anyhow::Result;
 
 /// One session's speaker-attribution state.
