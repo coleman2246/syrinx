@@ -84,9 +84,17 @@ pub struct DaemonState {
     pub status: Status,
     pub mode: OutputMode,
     pub transcript: String,
+    /// The same text as timed, sourced, and speaker-labelled fragments -- what
+    /// a viewer needs to render turns without recomputing what `save` already
+    /// knows.
+    #[serde(default)]
+    pub segments: Vec<crate::session::Segment>,
     pub last_fragment: String,
     pub model: Option<String>,
     pub chunk_ms: Option<u32>,
+    /// What the handshake actually granted; see `SessionState::diarize`.
+    #[serde(default)]
+    pub diarize: bool,
     pub error: Option<String>,
     /// Stable key of the first source, kept for viewers that show only one.
     pub source_key: Option<String>,
@@ -123,9 +131,11 @@ impl DaemonState {
             status: s.status,
             mode,
             transcript: s.transcript.clone(),
+            segments: s.segments.clone(),
             last_fragment: s.last_fragment.clone(),
             model: s.model.clone(),
             chunk_ms: s.chunk_ms,
+            diarize: s.diarize,
             error: s.error.clone(),
             source_key,
             source_keys: Vec::new(),

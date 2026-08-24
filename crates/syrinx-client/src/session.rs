@@ -46,7 +46,7 @@ impl Status {
 ///
 /// Kept alongside the flat string so a transcript can be saved with timestamps
 /// without the caller having to reconstruct timing it never saw.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Segment {
     /// Seconds since the session started.
     pub at: f64,

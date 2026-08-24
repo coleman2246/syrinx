@@ -405,6 +405,9 @@ impl eframe::App for App {
 
         ui.add_space(2.0);
         self.status_row(ui);
+        if self.labels_unavailable() {
+            ui.weak("Speaker labels unavailable on this server");
+        }
         ui.add_space(6.0);
         self.source_row(ui, running);
         self.mode_row(ui, running);
@@ -724,10 +727,33 @@ impl App {
                     } else {
                         ui.weak("Nothing transcribed yet.");
                     }
+                } else if self.state.segments.iter().any(|s| s.speaker.is_some()) {
+                    // A paragraph per turn, headed by its speaker. A leading
+                    // turn before the first label ever appears has nothing
+                    // honest to call itself, so it renders bare rather than
+                    // borrowing a number from the turn after it.
+                    for (speaker, text) in save::turn_texts(&self.state.segments) {
+                        if let Some(n) = speaker {
+                            ui.label(egui::RichText::new(format!("Speaker {n}")).strong());
+                        }
+                        ui.label(text);
+                    }
                 } else {
                     ui.label(&self.state.transcript);
                 }
             });
+    }
+
+    /// Whether to say the server did not honour a diarization request: asked
+    /// for by config, on a session whose wire mode actually requests labels,
+    /// yet the handshake granted none. `Both` types at the cursor and so runs
+    /// the wire live -- it never asks -- so it must not trigger this, which is
+    /// why this checks `wire_mode()` rather than `keeps_transcript()`.
+    fn labels_unavailable(&self) -> bool {
+        self.config.diarize
+            && self.state.mode.wire_mode() == syrinx_proto::Mode::Transcript
+            && !self.state.diarize
+            && self.state.status.is_active()
     }
 
     /// Keys handled by this window.

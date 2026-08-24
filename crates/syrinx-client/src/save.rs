@@ -100,6 +100,20 @@ pub fn turns(segments: &[Segment]) -> Vec<(Option<u32>, Vec<&Segment>)> {
     out
 }
 
+/// Turns as `(speaker, concatenated text)` pairs -- for a caller that wants
+/// each turn's prose and nothing else. `render` below needs the raw segments
+/// instead, to format stamps and sources per line; the GUI's paragraph view
+/// (Task 10) is the intended caller here.
+pub fn turn_texts(segments: &[Segment]) -> Vec<(Option<u32>, String)> {
+    turns(segments)
+        .into_iter()
+        .map(|(speaker, segs)| {
+            let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+            (speaker, text)
+        })
+        .collect()
+}
+
 /// Render segments in the requested format.
 pub fn render(segments: &[Segment], fallback: &str, format: Format) -> String {
     match format {
@@ -657,6 +671,42 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].0, None);
         assert_eq!(t[0].1.len(), 2);
+    }
+
+    #[test]
+    fn turn_texts_concatenates_each_turns_segments() {
+        let segs = [
+            seg_spk(0.0, "we ship Thursday", Some(1)),
+            seg_spk(0.6, " right", None),
+            seg_spk(1.0, "no we don't", Some(2)),
+        ];
+        assert_eq!(
+            turn_texts(&segs),
+            vec![
+                (Some(1), "we ship Thursday right".to_string()),
+                (Some(2), "no we don't".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn turn_texts_leaves_an_unlabelled_leading_turn_alone() {
+        // Before any speaker has appeared there is nothing honest to call the
+        // turn, so it stays unlabelled rather than borrowing the next one's.
+        let segs = [seg_spk(0.0, "hello ", None), seg_spk(0.6, "there", Some(1))];
+        assert_eq!(
+            turn_texts(&segs),
+            vec![
+                (None, "hello ".to_string()),
+                (Some(1), "there".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn turn_texts_without_any_label_is_one_turn() {
+        let segs = [seg(0.0, "a"), seg(1.0, "b")];
+        assert_eq!(turn_texts(&segs), vec![(None, "ab".to_string())]);
     }
 
     #[test]
