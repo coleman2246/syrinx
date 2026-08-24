@@ -98,10 +98,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     };
 
     // Honest handshake: a client can ask for labels and still not get them --
-    // no diarizer configured, or a mode with nowhere for a label to go. The
-    // client finds out here, once, rather than every commit staying silently
-    // unlabelled.
-    let labelling = diarize_requested && mode == Mode::Transcript && state.diarize.is_some();
+    // no diarizer configured, or a mode with nowhere for a label to go. `d`
+    // and `labelling` are derived from the same expression rather than two
+    // separate reads of `state.diarize`, so there is no gap in which they
+    // could say different things: no diarizer built means no diarizer
+    // promised, by construction.
+    let d = (diarize_requested && mode == Mode::Transcript)
+        .then(|| state.diarize.as_ref().map(|f| f.diarizer()))
+        .flatten();
+    let labelling = d.is_some();
 
     // Load the model now, not at startup. Loading is blocking and can take a
     // couple of seconds, so it must not run on the async runtime.
@@ -153,17 +158,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let (audio_tx, mut audio_rx) = mpsc::channel::<AudioEvent>(AUDIO_QUEUE_DEPTH);
     let (msg_tx, mut msg_rx) = mpsc::channel::<ServerMessage>(32);
-
-    // Spawned here, not carried through the handshake bool: a fresh
-    // `Diarizer` per session, sharing whatever models the factory loaded once
-    // at startup.
-    let d = labelling.then(|| {
-        state
-            .diarize
-            .as_ref()
-            .expect("labelling implies a factory")
-            .diarizer()
-    });
 
     // Inference on the blocking pool: it is synchronous and GPU-bound.
     let sid = session_id.clone();
