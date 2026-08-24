@@ -20,11 +20,16 @@ const WORDS: [&str; 8] = [
     "one", "two", "three", "four", "five", "six", "seven", "eight",
 ];
 
-/// A transcript-mode session: one scripted word per chunk from the backend,
-/// one scripted label per chunk from the diarizer.
-fn session(words: &[&str], diarizer: Option<Box<dyn Diarizer>>) -> Session {
-    let backend = MockBackend::new(words).with_chunk_samples(CHUNK);
+/// A transcript-mode session over a scripted backend.
+fn over(backend: MockBackend, diarizer: Option<Box<dyn Diarizer>>) -> Session {
+    let backend = backend.with_chunk_samples(CHUNK);
     Session::new(Mode::Transcript, &backend, "sid".into(), diarizer)
+}
+
+/// The common case: one scripted word per chunk from the backend, one scripted
+/// label per chunk from the diarizer, and no tail left in the model.
+fn session(words: &[&str], diarizer: Option<Box<dyn Diarizer>>) -> Session {
+    over(MockBackend::new(words), diarizer)
 }
 
 fn diarizer(labels: &[Option<u32>]) -> Option<Box<dyn Diarizer>> {
@@ -72,6 +77,32 @@ fn with_a_diarizer_a_commit_waits_out_the_lag() {
     );
     assert!(push(&mut s).is_empty(), "nor the second");
     assert_eq!(push(&mut s), vec![("alpha ".into(), Some(1))]);
+}
+
+#[test]
+fn one_oversized_push_labels_and_releases_chunk_by_chunk() {
+    // A client may send a frame holding several chunks. The diarizer must see
+    // them one at a time and in order -- a label per chunk, not per frame --
+    // and commits must ripen inside the call that completes their window
+    // rather than waiting for the next frame to arrive.
+    let mut s = session(&WORDS, diarizer(&[Some(1), Some(2), Some(2)]));
+
+    // Chunks 1-3. The first ripens on the third, and is outvoted within the
+    // same call: one label per frame would have left it Some(1).
+    let out = commits(s.push_audio(&[0.0; CHUNK * 3]).unwrap());
+    assert_eq!(out, vec![("one ".into(), Some(2))]);
+
+    // Chunks 4-6, past the diarizer's script, so its labels are unknown. Three
+    // more commits ripen inside this one call, each with its own window.
+    let out = commits(s.push_audio(&[0.0; CHUNK * 3]).unwrap());
+    assert_eq!(
+        out,
+        vec![
+            ("two ".into(), Some(2)),
+            ("three ".into(), Some(2)),
+            ("four ".into(), None),
+        ]
+    );
 }
 
 #[test]
@@ -126,6 +157,32 @@ fn finish_flushes_what_the_lag_buffer_still_holds() {
 }
 
 #[test]
+fn the_models_tail_is_labelled_from_the_last_window() {
+    // finish() drains whatever text the model was still holding. That text
+    // belongs to the last chunk that went in, so it is labelled from that
+    // chunk's window -- which means that chunk's label has to survive the
+    // pruning that follows the last release.
+    let mut s = over(
+        MockBackend::new(&["alpha"]).with_tail("tail "),
+        diarizer(&[Some(1), Some(1), Some(1)]),
+    );
+    let mut out = Vec::new();
+    for _ in 0..3 {
+        out.extend(push(&mut s));
+    }
+    assert_eq!(out, vec![("alpha ".into(), Some(1))]);
+    assert_eq!(finish(&mut s), vec![("tail ".into(), Some(1))]);
+
+    // A session that ends with a tail and no chunks at all: chunk indices
+    // start at zero, so the arithmetic has nowhere below to go.
+    let mut s = over(
+        MockBackend::new(&[]).with_tail("tail "),
+        diarizer(&[Some(1)]),
+    );
+    assert_eq!(finish(&mut s), vec![("tail ".into(), None)]);
+}
+
+#[test]
 fn a_diarizer_that_keeps_failing_is_dropped() {
     // Labels are decoration; the transcript is the work. Five consecutive
     // failures and the session stops asking -- and never asks again, so the
@@ -151,6 +208,22 @@ fn a_diarizer_that_keeps_failing_is_dropped() {
         out.iter().all(|(_, sp)| sp.is_none()),
         "a dropped diarizer labels nothing, ever again: {out:?}"
     );
+}
+
+#[test]
+fn a_dropped_diarizer_takes_the_lag_with_it() {
+    // Once the diarizer is gone there is no label coming, so there is nothing
+    // left to wait for. Holding text back would be pure added latency, and a
+    // session that has already lost its labels should not also feel slower.
+    let script: Vec<anyhow::Result<Option<u32>>> = (0..5).map(|_| Err(anyhow!("boom"))).collect();
+    let mut s = session(&WORDS, Some(Box::new(MockDiarizer::new(script))));
+    for _ in 0..5 {
+        let _ = push(&mut s);
+    }
+
+    // The sixth chunk arrives after the strike-out: its own text, in its own
+    // push, with nothing held over.
+    assert_eq!(push(&mut s), vec![("six ".into(), None)]);
 }
 
 #[test]
@@ -185,5 +258,35 @@ fn one_success_wipes_the_slate() {
         speakers.last(),
         Some(&Some(2)),
         "four more failures and the diarizer is still being asked: {speakers:?}"
+    );
+}
+
+#[test]
+fn seq_numbers_run_unbroken_through_the_lag_buffer() {
+    // seq is assigned where the message leaves, not where the text arrived, so
+    // holding commits back must not open a gap or swap an order. A client
+    // reassembles by seq, and cannot tell a delayed commit from a lost one.
+    let mut s = session(&WORDS, diarizer(&[Some(1); 8]));
+    let mut msgs = Vec::new();
+    for _ in 0..WORDS.len() {
+        msgs.extend(s.push_audio(&[0.0; CHUNK]).unwrap());
+    }
+    msgs.extend(s.finish().unwrap());
+
+    let seqs: Vec<u64> = msgs
+        .iter()
+        .map(|m| match m {
+            ServerMessage::TranscriptCommit { seq, .. } => *seq,
+            other => panic!("expected a commit, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(seqs, (1..=WORDS.len() as u64).collect::<Vec<_>>());
+    assert_eq!(
+        commits(msgs)
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect::<Vec<_>>(),
+        WORDS.map(|w| format!("{w} ")),
+        "and the text is still in the order it was spoken"
     );
 }

@@ -40,7 +40,7 @@ fn load_fixture(name: &str) -> Vec<f32> {
 #[ignore = "requires a GPU and the model on disk"]
 fn transcribes_golden_audio() {
     let backend = ParakeetBackend::load_cuda(&model_dir()).expect("load model on CUDA");
-    let mut session = Session::new(Mode::Live, &backend, "golden".into());
+    let mut session = Session::new(Mode::Live, &backend, "golden".into(), None);
 
     let audio = load_fixture("fox.wav");
     let mut text = String::new();
@@ -84,8 +84,8 @@ fn streams_share_one_model_and_decode_independently() {
     let backend = ParakeetBackend::load_cuda(&model_dir()).expect("load model on CUDA");
     let audio = load_fixture("fox.wav");
 
-    let mut a = Session::new(Mode::Live, &backend, "a".into());
-    let mut b = Session::new(Mode::Live, &backend, "b".into());
+    let mut a = Session::new(Mode::Live, &backend, "a".into(), None);
+    let mut b = Session::new(Mode::Live, &backend, "b".into(), None);
 
     let collect = |s: &mut Session, audio: &[f32]| -> String {
         let mut out = String::new();

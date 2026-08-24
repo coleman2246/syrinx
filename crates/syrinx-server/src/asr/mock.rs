@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub struct MockBackend {
     script: Arc<Vec<String>>,
     chunk_samples: usize,
+    tail: Option<String>,
 }
 
 impl MockBackend {
@@ -18,12 +19,21 @@ impl MockBackend {
         Self {
             script: Arc::new(words.iter().map(|s| s.to_string()).collect()),
             chunk_samples: 8960,
+            tail: None,
         }
     }
 
     /// Smaller chunks keep tests fast and readable.
     pub fn with_chunk_samples(mut self, n: usize) -> Self {
         self.chunk_samples = n;
+        self
+    }
+
+    /// Text the model is still holding when the stream ends, drained once by
+    /// [`AsrStream::finish`]. The real transducer can emit on that flush, so
+    /// anything the session does with a tail needs a way to provoke one.
+    pub fn with_tail(mut self, text: &str) -> Self {
+        self.tail = Some(text.to_string());
         self
     }
 }
@@ -33,6 +43,7 @@ impl AsrBackend for MockBackend {
         Box::new(MockStream {
             script: self.script.clone(),
             idx: 0,
+            tail: self.tail.clone(),
         })
     }
     fn chunk_samples(&self) -> usize {
@@ -46,6 +57,7 @@ impl AsrBackend for MockBackend {
 pub struct MockStream {
     script: Arc<Vec<String>>,
     idx: usize,
+    tail: Option<String>,
 }
 
 impl AsrStream for MockStream {
@@ -60,7 +72,8 @@ impl AsrStream for MockStream {
     }
 
     fn finish(&mut self) -> Result<String> {
-        Ok(String::new())
+        // Once: a second finish drains nothing, as the real stream would.
+        Ok(self.tail.take().unwrap_or_default())
     }
 }
 
@@ -93,6 +106,20 @@ mod tests {
         let (mut a, mut c) = (b.stream(), b.stream());
         assert_eq!(a.push(&[0.0; 8960]).unwrap(), "alpha ");
         assert_eq!(c.push(&[0.0; 8960]).unwrap(), "alpha ");
+    }
+
+    #[test]
+    fn a_scripted_tail_is_drained_once() {
+        let b = MockBackend::new(&["only"]).with_tail("tail ");
+        let mut s = b.stream();
+        assert_eq!(s.finish().unwrap(), "tail ");
+        assert_eq!(s.finish().unwrap(), "", "the tail is not re-emitted");
+    }
+
+    #[test]
+    fn without_a_scripted_tail_finish_drains_nothing() {
+        let mut s = MockBackend::new(&["only"]).stream();
+        assert_eq!(s.finish().unwrap(), "");
     }
 
     #[test]
