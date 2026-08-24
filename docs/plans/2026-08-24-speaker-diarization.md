@@ -787,15 +787,20 @@ Port the spike's clusterer properly, TDD'd from scratch. Complete skeleton:
 //! someone is Speaker 2 they stay Speaker 2. The accepted failure mode is an
 //! occasional split, never churn.
 
-/// Cosine similarity above which an embedding joins its nearest centroid. (spike)
-const T_ASSIGN: f32 = 0.6;
-/// Consecutive mutually-agreeing orphan windows before a new speaker is minted. (spike)
+/// Cosine similarity above which an embedding joins its nearest centroid.
+/// 0.45, not the 0.6 this plan first guessed: the spike measured same-speaker
+/// windows at a median cosine of 0.52, so 0.6 rejects most true matches.
+const T_ASSIGN: f32 = 0.45;
+/// Consecutive mutually-agreeing orphan windows before a new speaker is minted.
+/// Not a free parameter: at 2 the spike minted 20 labels for a 4-speaker
+/// meeting, and 3 still failed an 87-minute one.
 const MIN_POOL: usize = 4;
 /// How much one window moves a centroid. Small: a centroid is its history,
-/// not its last sentence. (spike)
+/// not its last sentence. Insensitive across 0.02-0.20 in the spike.
 const EMA_ALPHA: f32 = 0.05;
-/// Centroids closer than this are duplicates; the newer retires. (spike)
-const T_RETIRE: f32 = 0.85;
+/// Centroids closer than this are duplicates; the newer retires. Below 0.65
+/// this retires genuinely different speakers into one.
+const T_RETIRE: f32 = 0.80;
 
 pub struct OnlineClusterer {
     centroids: Vec<Centroid>,
@@ -816,10 +821,13 @@ struct Centroid {
 
 `observe(&mut self, embedding: &[f32]) -> Option<u32>` implements: L2-normalise → best live centroid ≥ `T_ASSIGN` → assign, EMA-update, clear pool, return label (following `retired_into` if set) → else pool it; if the pool reaches `MIN_POOL` mutually-agreeing vectors (pairwise similarity ≥ `T_ASSIGN`), mint `next_label` from their mean; a non-agreeing arrival evicts the pool's oldest. After any EMA update, check `T_RETIRE` against every other live centroid; retire the **newer** of a too-close pair.
 
+One guard the prose above does not imply, and which the spike found necessary: **an agreeing pool must still be checked against the live centroids before it mints.** A run of windows from a speaker who already has a label can individually fall just under `T_ASSIGN` while agreeing with each other perfectly; their *mean* is much less noisy and usually lands back inside that speaker's territory. Minting there splits someone who already has a label, which is the one failure the design is built to avoid. So: if the pooled mean is within `T_ASSIGN` of any live centroid, clear the pool and return `None` rather than minting.
+
 - [ ] **Step 1: Failing tests** (synthetic embeddings: orthogonal unit vectors per "speaker" plus small noise):
   - two well-separated voices get labels 1 and 2 in first-appearance order
   - a single noisy voice never splits across 100 windows
   - one outlier window mints nothing; `MIN_POOL` agreeing ones mint exactly one
+  - `MIN_POOL` windows that agree with each other but whose mean lands within `T_ASSIGN` of an existing centroid mint **nothing** — an established speaker is never split by a borderline run
   - an assignment clears the pool (a real turn change resets the evidence)
   - EMA: 100 windows of speaker 1 then one borderline window does not move the centroid past recognising speaker 1 again
   - retire: two centroids driven together → older label survives, newer forwards, no third label appears

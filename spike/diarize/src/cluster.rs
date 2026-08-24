@@ -24,10 +24,13 @@ pub struct Params {
 }
 
 impl Default for Params {
+    /// What the spike settled on, not what it started from. The design's
+    /// original guess of 0.6/0.85 is the configuration the sweep disproved:
+    /// at 0.6 this clusterer finds two speakers in a four-speaker meeting.
     fn default() -> Self {
         Self {
-            t_assign: 0.6,
-            t_retire: 0.85,
+            t_assign: 0.45,
+            t_retire: 0.80,
             alpha: 0.05,
             min_pool: 4,
         }

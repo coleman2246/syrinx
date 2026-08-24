@@ -343,12 +343,21 @@ Measured over windows the reference marks as a single clean speaker
 TitaNet separates 3× worse than the other two and was dropped after this
 measurement rather than carried through a full sweep.
 
-The important calibration finding: **the spec's `T_assign ≈ 0.6` guess was
+The important calibration finding: **the design's `T_assign ≈ 0.6` guess was
 wrong for these models on this audio.** Same-speaker pairs sit at a median
-of 0.52, so 0.6 rejects most true matches — at 0.6 the clusterer pooled
-almost everything, found 2 speakers in a 4-speaker meeting, and left 38% of
-speech unlabelled. The sweep range was extended down to 0.20 and the usable
-plateau is 0.40–0.50.
+of 0.52, so 0.6 rejects most true matches. The sweep covers the 0.40–0.70
+the plan asked for and extends down to 0.20, which is where the answer
+turned out to live; the usable plateau is 0.40–0.50.
+
+The high end fails quietly rather than loudly, which is worth recording
+because splits and merges alone will not reveal it. At the chosen model,
+window, and pool, raising `T_assign` from 0.45 to 0.60 leaves splits and
+merges at zero — but only because the clusterer stops speaking: miss climbs
+from 26% to 37% on ES2002a and from 31% to 58% on IS1000a, and ES2002a
+collapses to 2 labels for its 4 speakers. By 0.70 the miss rate is 51–82%
+and every meeting is down to 2 or 3 labels. A configuration that says
+almost nothing scores perfectly on stability, so coverage has to be read
+alongside it.
 
 ### Chosen model and constants
 
@@ -365,14 +374,24 @@ plateau is 0.40–0.50.
 | `T_assign` | 0.45 | middle of the 0.40–0.50 plateau |
 | `T_retire` | 0.80 | ≤0.60 merges real speakers; see below |
 | EMA alpha | 0.05 | insensitive: 0.02–0.20 moves nothing by more than 1.5% |
-| `MIN_POOL` | 4 | 2 is catastrophic; 3 works but has no margin |
+| `MIN_POOL` | 4 | 2 is catastrophic; 3 fails the long meeting |
 | `LAG_CHUNKS` | 2 | ≈1.12 s, covers the p90 label delay |
 
 `MIN_POOL` deserves emphasis, because it is the design's "reluctant create"
-rule earning its keep. At 2, the clusterer mints 29 and 42 labels for
-4-speaker meetings. At 3 it is correct but one step from that cliff. At 4 it
-is correct on every recording. The spec's instinct here was right and the
-setting is not a free parameter.
+rule earning its keep. All figures here are at the chosen model, window
+(1.5 s), `T_assign` (0.45) and `T_retire` (0.80):
+
+| `MIN_POOL` | ES2002a (4) | IS1000a (4) | EN2001a (5) |
+|---|---|---|---|
+| 2 | 6 labels, 1 merge | 20 labels, 1 split, 6 merges | 15 labels, 5 merges |
+| 3 | 4 ✓ | 4 ✓ | 6 labels, 1 merge |
+| 4 | 4 ✓ | 4 ✓ | 5 ✓ |
+
+**Only 4 is correct on every recording** — 3 already fails the long meeting,
+so it is not merely "close to the cliff". (Shortening the window to 1.0 s
+makes `MIN_POOL` 2 far worse still, at 29, 42 and 55 labels, but 1.5 s is
+what was chosen.) The design's instinct here was right, and the setting is
+not a free parameter.
 
 `T_retire` is the opposite story: **it never fired in any accepted
 configuration** — no centroid was ever retired at the chosen constants. Its
@@ -438,7 +457,7 @@ field is for.
 the eight conditions tested, attributes 96–98% of the speech it does label
 to the right person, and holds every label stable over 87 minutes. The
 conservative clustering rules the design specified are doing real work:
-`MIN_POOL` at 4 is the difference between 4 labels and 42. Nothing here
+`MIN_POOL` at 4 is the difference between 4 labels and 20. Nothing here
 argues for changing the architecture, and the two headline risks recorded
 above both came out better than feared — Opus at Teams-like bitrates costs
 about one point of miss rate, and multi-hour stability was perfect.

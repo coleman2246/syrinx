@@ -444,11 +444,14 @@ fn main() -> Result<()> {
             let model = model_path(args.get("--model").context("--model")?);
             let (window_s, hop_s) = (args.num("--window", 1.5), args.num("--hop", 0.0));
             let hop_s = if hop_s == 0.0 { window_s / 2.0 } else { hop_s };
+            // Defaults come from Params::default() so a no-flags run is the
+            // calibrated configuration, and there is one place to change it.
+            let chosen = Params::default();
             let params = Params {
-                t_assign: args.num("--t-assign", 0.6),
-                t_retire: args.num("--t-retire", 0.85),
-                alpha: args.num("--alpha", 0.05),
-                min_pool: args.num("--min-pool", 4.0) as usize,
+                t_assign: args.num("--t-assign", chosen.t_assign),
+                t_retire: args.num("--t-retire", chosen.t_retire),
+                alpha: args.num("--alpha", chosen.alpha),
+                min_pool: args.num("--min-pool", chosen.min_pool as f32) as usize,
             };
 
             eprintln!(
@@ -762,12 +765,16 @@ fn sweep(args: &Args) -> Result<()> {
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect();
-    // The spec guessed T_assign ~0.6 from the literature. On 1.5 s windows of
+    // The plan asked for 0.4-0.7, which this covers. It also runs down to 0.20
+    // because that is where the answer turned out to live: on 1.5 s windows of
     // real meeting audio these models put same-speaker pairs at a median of
-    // 0.52 and different-speaker pairs at 0.03, so the useful range is well
-    // below that guess — hence a sweep that starts at 0.20.
+    // 0.52 and different-speaker pairs at 0.03, so the design's ~0.6 guess sits
+    // above most true matches rather than between the two distributions.
     let assigns: Vec<f32> = args
-        .list("--assigns", "0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55")
+        .list(
+            "--assigns",
+            "0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70",
+        )
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect();
