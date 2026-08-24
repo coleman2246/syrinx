@@ -4,6 +4,7 @@
 //!
 //! - [`asr`] wraps speech recognition behind a trait, with a deterministic mock
 //!   so everything above it is testable without a GPU.
+//! - [`diarize`] wraps speaker attribution behind the same kind of trait.
 //! - [`session`] owns protocol semantics and knows nothing about transport.
 //! - [`ws`] owns transport and knows nothing about recognition.
 //!
@@ -14,5 +15,6 @@ pub mod app;
 pub mod asr;
 pub mod auth;
 pub mod config;
+pub mod diarize;
 pub mod session;
 pub mod ws;
