@@ -6,6 +6,7 @@
 //! around it.
 
 use crate::session::Segment;
+use crate::stream::NEW_LINE_AFTER_SILENCE;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -69,6 +70,31 @@ pub fn stamp(seconds: f64) -> String {
     }
 }
 
+/// Group segments into turns: a maximal run whose speaker matches the last
+/// labelled one. An unlabelled segment attaches to the turn already open
+/// rather than starting a fresh one -- usually it is a short connective
+/// fragment the diarizer could not call.
+///
+/// Exposed so anything that needs to know where a turn starts -- the GUI's
+/// paragraph view, which coalesces a turn regardless of any pause within it,
+/// and `render` below, which additionally splits a turn back into lines on a
+/// silence gap or a source change -- shares one rule for it.
+pub fn turns(segments: &[Segment]) -> Vec<(Option<u32>, Vec<&Segment>)> {
+    let mut out: Vec<(Option<u32>, Vec<&Segment>)> = Vec::new();
+    let mut last_speaker: Option<u32> = None;
+    for seg in segments {
+        let opens_turn = out.is_empty() || (seg.speaker.is_some() && seg.speaker != last_speaker);
+        match (opens_turn, out.last_mut()) {
+            (false, Some((_, segs))) => segs.push(seg),
+            _ => out.push((seg.speaker, vec![seg])),
+        }
+        if seg.speaker.is_some() {
+            last_speaker = seg.speaker;
+        }
+    }
+    out
+}
+
 /// Render segments in the requested format.
 pub fn render(segments: &[Segment], fallback: &str, format: Format) -> String {
     match format {
@@ -76,35 +102,95 @@ pub fn render(segments: &[Segment], fallback: &str, format: Format) -> String {
         // predates segment tracking would have.
         Format::Plain => {
             if segments.is_empty() {
-                fallback.trim().to_string()
-            } else {
-                segments
-                    .iter()
-                    .map(|s| s.text.as_str())
-                    .collect::<String>()
-                    .trim()
-                    .to_string()
+                return fallback.trim().to_string();
             }
+            // A `Speaker N: ` prefix at each turn's start, where labels
+            // exist. Without any, `turns` yields one turn holding every
+            // segment, and this is byte-identical to a flat concatenation.
+            turns(segments)
+                .into_iter()
+                .map(|(speaker, segs)| {
+                    let prefix = speaker.map(|n| format!("Speaker {n}: ")).unwrap_or_default();
+                    let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+                    format!("{prefix}{text}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string()
         }
-        Format::Timestamped => segments
-            .iter()
-            .filter(|s| !s.text.trim().is_empty())
-            .map(|s| format!("{} {}", stamp(s.at), s.text.trim()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        // Falls back to the plain timestamp when a segment has no source, so a
-        // single-source recording saved this way is not littered with empty
-        // brackets.
-        Format::Labelled => segments
-            .iter()
-            .filter(|s| !s.text.trim().is_empty())
-            .map(|s| match &s.source {
-                Some(src) => format!("{} [{}] {}", stamp(s.at), src, s.text.trim()),
-                None => format!("{} {}", stamp(s.at), s.text.trim()),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Format::Timestamped | Format::Labelled => render_stamped(segments, format),
     }
+}
+
+/// Render `Timestamped` or `Labelled`: one line per turn, split further on a
+/// silence gap or, for `Labelled`, a source change -- the same rule
+/// `StreamWriter` uses to continue a line, so a saved file and a streamed
+/// one agree. The speaker only appears on the line that opens its turn; a
+/// line reopened later by a silence gap does not repeat it.
+fn render_stamped(segments: &[Segment], format: Format) -> String {
+    /// One physical output line: whether it opens its speaker's turn, and
+    /// the segments spliced onto it.
+    struct Line<'a> {
+        opens_turn: bool,
+        segs: Vec<&'a Segment>,
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut last_speaker: Option<u32> = None;
+    for seg in segments.iter().filter(|s| !s.text.trim().is_empty()) {
+        let opens_turn =
+            lines.is_empty() || (seg.speaker.is_some() && seg.speaker != last_speaker);
+        let opens_line = opens_turn || {
+            // `opens_turn` is false only once `lines` holds an open line.
+            let prev = *lines.last().unwrap().segs.last().unwrap();
+            (format == Format::Labelled && prev.source != seg.source)
+                || seg.at - prev.at >= NEW_LINE_AFTER_SILENCE
+        };
+        if opens_line {
+            lines.push(Line { opens_turn, segs: vec![seg] });
+        } else {
+            lines.last_mut().unwrap().segs.push(seg);
+        }
+        if seg.speaker.is_some() {
+            last_speaker = seg.speaker;
+        }
+    }
+
+    lines
+        .into_iter()
+        .map(|line| render_line(&line.segs, line.opens_turn, format))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One rendered line: its stamp, source (`Labelled`) and, if it opens a
+/// turn, the speaker -- then the text, spliced across the segments sharing
+/// the line the same way a stream continuation splices them (the interior
+/// spacing between fragments is kept; only the outer edges are trimmed).
+fn render_line(segs: &[&Segment], opens_turn: bool, format: Format) -> String {
+    let first = segs[0];
+    let source_part = match (format, &first.source) {
+        (Format::Labelled, Some(src)) => format!("[{src}] "),
+        _ => String::new(),
+    };
+    let speaker_prefix = if opens_turn {
+        first.speaker.map(|n| format!("Speaker {n}: ")).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let last = segs.len() - 1;
+    let text: String = segs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| match (i == 0, i == last) {
+            (true, true) => s.text.trim().to_string(),
+            (true, false) => s.text.trim_start().to_string(),
+            (false, true) => s.text.trim_end().to_string(),
+            (false, false) => s.text.clone(),
+        })
+        .collect();
+    format!("{} {source_part}{speaker_prefix}{text}", stamp(first.at))
 }
 
 /// Split segments by source, in first-appearance order.
@@ -415,6 +501,15 @@ mod tests {
         }
     }
 
+    fn seg_spk(at: f64, text: &str, speaker: Option<u32>) -> Segment {
+        Segment {
+            at,
+            text: text.into(),
+            source: None,
+            speaker,
+        }
+    }
+
     #[test]
     fn labelled_format_names_the_source_on_each_line() {
         let segs = [seg_src(0.0, "hello", "Mic"), seg_src(5.0, "hi", "System")];
@@ -502,5 +597,83 @@ mod tests {
     fn a_timestamp_is_always_produced() {
         // Saving must never fail because a clock or a subprocess misbehaved.
         assert!(!timestamp().is_empty());
+    }
+
+    #[test]
+    fn turns_group_labelled_runs_and_attach_unlabelled_fragments() {
+        let segs = [
+            seg_spk(0.0, "we ship Thursday", Some(1)),
+            seg_spk(0.6, " right", None),
+            seg_spk(1.0, "no we don't", Some(2)),
+        ];
+        let t = turns(&segs);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].0, Some(1));
+        assert_eq!(t[0].1.len(), 2, "the unlabelled fragment attaches");
+        assert_eq!(t[1].0, Some(2));
+        assert_eq!(t[1].1.len(), 1);
+    }
+
+    #[test]
+    fn turns_without_any_label_is_a_single_turn() {
+        let segs = [seg(0.0, "a"), seg(1.0, "b")];
+        let t = turns(&segs);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].0, None);
+        assert_eq!(t[0].1.len(), 2);
+    }
+
+    #[test]
+    fn a_speaker_change_breaks_the_line_and_names_the_speaker() {
+        let segs = [
+            seg_spk(0.0, "we ship Thursday", Some(1)),
+            seg_spk(0.6, "no we don't", Some(2)),
+        ];
+        assert_eq!(
+            render(&segs, "", Format::Timestamped),
+            "[00:00] Speaker 1: we ship Thursday\n[00:00] Speaker 2: no we don't"
+        );
+    }
+
+    #[test]
+    fn an_unlabelled_fragment_stays_on_the_current_turn() {
+        // Usually a short connective the diarizer could not call; breaking
+        // the paragraph for it would shred every transcript.
+        let segs = [
+            seg_spk(0.0, "so the plan", Some(1)),
+            seg_spk(0.6, " is simple", None),
+        ];
+        assert_eq!(
+            render(&segs, "", Format::Timestamped),
+            "[00:00] Speaker 1: so the plan is simple"
+        );
+    }
+
+    #[test]
+    fn plain_gains_prefixes_only_when_labels_exist() {
+        // Without labels the plain format must stay byte-identical to today.
+        let unlabelled = [seg_spk(0.0, "hello ", None), seg_spk(0.6, "world", None)];
+        assert_eq!(render(&unlabelled, "", Format::Plain), "hello world");
+
+        let labelled = [
+            seg_spk(0.0, "hello", Some(1)),
+            seg_spk(0.6, "hi there", Some(2)),
+        ];
+        assert_eq!(
+            render(&labelled, "", Format::Plain),
+            "Speaker 1: hello\nSpeaker 2: hi there"
+        );
+    }
+
+    #[test]
+    fn labelled_keeps_the_source_and_adds_the_speaker() {
+        // The bracket names the capture source exactly as today;
+        // diarization adds the speaker, it does not rename the source.
+        let mut s = seg_spk(0.0, "hello", Some(2));
+        s.source = Some("System audio".into());
+        assert_eq!(
+            render(&[s], "", Format::Labelled),
+            "[00:00] [System audio] Speaker 2: hello"
+        );
     }
 }

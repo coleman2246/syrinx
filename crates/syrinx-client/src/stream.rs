@@ -29,9 +29,13 @@ pub struct StreamWriter {
     /// Whether the next write needs a newline in front of it, because the file
     /// already has content that did not end in one.
     needs_newline: bool,
-    /// When the last fragment arrived, and what produced it, so a stamped line
-    /// can be continued rather than restarted for every fragment.
-    last: Option<(f64, Option<String>)>,
+    /// When the last fragment arrived, what produced it, and which speaker's
+    /// turn is open, so a stamped line can be continued rather than
+    /// restarted for every fragment. The speaker is the last *labelled* one
+    /// seen: an unlabelled fragment does not overwrite it, so a short
+    /// connective segment the diarizer could not call stays attached to the
+    /// turn already open.
+    last: Option<(f64, Option<String>, Option<u32>)>,
 }
 
 /// How long a silence has to be before a stamped line is considered finished.
@@ -40,7 +44,10 @@ pub struct StreamWriter {
 /// anything much longer than that is a real pause rather than a chunk
 /// boundary. Without this, every fragment started its own line and a stamped
 /// transcript broke mid-word: "brown fox j" then "umps over the".
-const NEW_LINE_AFTER_SILENCE: f64 = 1.5;
+///
+/// `pub(crate)` so `save::render` can split a turn back into lines the same
+/// way, keeping a saved file and a streamed one in agreement.
+pub(crate) const NEW_LINE_AFTER_SILENCE: f64 = 1.5;
 
 impl StreamWriter {
     /// Open `path` for appending, creating it if it does not exist.
@@ -80,25 +87,31 @@ impl StreamWriter {
             self.needs_newline = false;
         }
 
-        match self.format {
-            // Prose as it arrives, spacing and all, so the file reads as the
-            // same text the screen shows.
-            Format::Plain => out.push_str(&seg.text),
-            _ => {
-                if self.continues_line(seg) {
-                    // Mid-utterance: keep the words on the line already open,
-                    // with whatever spacing the model gave them.
-                    out.push_str(&seg.text);
-                } else {
-                    if self.last.is_some() {
-                        out.push('\n');
-                    }
-                    out.push_str(&self.line_prefix(seg));
-                    out.push_str(seg.text.trim_start());
-                }
+        if self.continues_line(seg) {
+            // Mid-utterance: keep the words on the line already open, with
+            // whatever spacing the model gave them.
+            out.push_str(&seg.text);
+        } else {
+            if self.last.is_some() {
+                out.push('\n');
             }
+            out.push_str(&self.line_prefix(seg));
+            // Plain has no stamp to trim up to, and trims nothing else either
+            // -- the file reads as the same text the screen shows.
+            let text = if matches!(self.format, Format::Plain) {
+                seg.text.as_str()
+            } else {
+                seg.text.trim_start()
+            };
+            out.push_str(text);
         }
-        self.last = Some((seg.at, seg.source.clone()));
+
+        // The turn's speaker carries forward across an unlabelled fragment:
+        // only a labelled one ever changes it.
+        let speaker = seg
+            .speaker
+            .or_else(|| self.last.as_ref().and_then(|(_, _, sp)| *sp));
+        self.last = Some((seg.at, seg.source.clone(), speaker));
 
         // `File` is unbuffered, so this reaches the operating system before the
         // call returns: a process that dies afterwards loses nothing. Surviving
@@ -112,10 +125,21 @@ impl StreamWriter {
 
     /// Whether this fragment belongs on the line already open.
     fn continues_line(&self, seg: &Segment) -> bool {
-        let Some((last_at, last_source)) = &self.last else {
+        let Some((last_at, last_source, last_speaker)) = &self.last else {
             return false;
         };
-        // A different speaker always starts a new line, however close in time:
+        // A labelled speaker change always breaks the line, in every format:
+        // the prefix that opens the line would otherwise be wrong for the
+        // second half of it.
+        if seg.speaker.is_some() && seg.speaker != *last_speaker {
+            return false;
+        }
+        if matches!(self.format, Format::Plain) {
+            // Nothing else forces a break: without a speaker change, prose
+            // just keeps arriving.
+            return true;
+        }
+        // A different source always starts a new line too, however close in time:
         // the label at the start of the line would otherwise be wrong for half
         // of it.
         if matches!(self.format, Format::Labelled) && *last_source != seg.source {
@@ -124,11 +148,34 @@ impl StreamWriter {
         seg.at - last_at < NEW_LINE_AFTER_SILENCE
     }
 
-    /// The stamp, and source where relevant, that opens a line.
+    /// The stamp, source and speaker, where relevant, that open a line.
+    ///
+    /// The speaker only appears when this fragment opens its turn: a line
+    /// reopened by a silence gap within the same speaker's turn does not
+    /// repeat it.
     fn line_prefix(&self, seg: &Segment) -> String {
+        let speaker_prefix = if self.opens_turn(seg) {
+            seg.speaker
+                .map(|n| format!("Speaker {n}: "))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         match (self.format, &seg.source) {
-            (Format::Labelled, Some(src)) => format!("{} [{}] ", stamp(seg.at), src),
-            _ => format!("{} ", stamp(seg.at)),
+            (Format::Plain, _) => speaker_prefix,
+            (Format::Labelled, Some(src)) => {
+                format!("{} [{}] {}", stamp(seg.at), src, speaker_prefix)
+            }
+            _ => format!("{} {}", stamp(seg.at), speaker_prefix),
+        }
+    }
+
+    /// Whether `seg` opens a new speaker's turn, as opposed to continuing
+    /// (or merely resuming, after a pause, within) the turn already open.
+    fn opens_turn(&self, seg: &Segment) -> bool {
+        match &self.last {
+            None => seg.speaker.is_some(),
+            Some((_, _, last_speaker)) => seg.speaker.is_some() && seg.speaker != *last_speaker,
         }
     }
 
@@ -165,6 +212,15 @@ mod tests {
             text: text.into(),
             source: None,
             speaker: None,
+        }
+    }
+
+    fn seg_spk(at: f64, text: &str, speaker: Option<u32>) -> Segment {
+        Segment {
+            at,
+            text: text.into(),
+            source: None,
+            speaker,
         }
     }
 
@@ -288,6 +344,72 @@ mod tests {
         })
         .unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "[00:00] [Yeti] hello");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_speaker_change_breaks_the_line_and_names_the_speaker() {
+        let p = scratch("spk-change");
+        let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
+        w.append(&seg_spk(0.0, "we ship Thursday", Some(1))).unwrap();
+        w.append(&seg_spk(0.6, "no we don't", Some(2))).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "[00:00] Speaker 1: we ship Thursday\n[00:00] Speaker 2: no we don't"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn an_unlabelled_fragment_stays_on_the_current_turn() {
+        // Usually a short connective the diarizer could not call; breaking
+        // the paragraph for it would shred every transcript.
+        let p = scratch("spk-none");
+        let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
+        w.append(&seg_spk(0.0, "so the plan", Some(1))).unwrap();
+        w.append(&seg_spk(0.6, " is simple", None)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "[00:00] Speaker 1: so the plan is simple"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn plain_gains_prefixes_only_when_labels_exist() {
+        // Without labels the plain format must stay byte-identical to today.
+        let p = scratch("spk-plain");
+        let mut w = StreamWriter::open(&p, Format::Plain).unwrap();
+        w.append(&seg_spk(0.0, "hello ", None)).unwrap();
+        w.append(&seg_spk(0.6, "world", None)).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello world");
+        drop(w);
+        let _ = std::fs::remove_file(&p);
+
+        let p = scratch("spk-plain2");
+        let mut w = StreamWriter::open(&p, Format::Plain).unwrap();
+        w.append(&seg_spk(0.0, "hello", Some(1))).unwrap();
+        w.append(&seg_spk(0.6, "hi there", Some(2))).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "Speaker 1: hello\nSpeaker 2: hi there"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn labelled_keeps_the_source_and_adds_the_speaker() {
+        // The bracket names the capture source exactly as today; diarization
+        // adds the speaker, it does not rename the source.
+        let p = scratch("spk-labelled");
+        let mut w = StreamWriter::open(&p, Format::Labelled).unwrap();
+        let mut s = seg_spk(0.0, "hello", Some(2));
+        s.source = Some("System audio".into());
+        w.append(&s).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "[00:00] [System audio] Speaker 2: hello"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
