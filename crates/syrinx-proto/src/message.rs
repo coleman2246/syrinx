@@ -15,6 +15,11 @@ pub enum ClientMessage {
         language: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         vocabulary: Option<Vec<String>>,
+        /// Ask for speaker labels on this session's transcript messages.
+        /// Best-effort: the server answers what it will actually do in
+        /// `session.ready`, and proceeds unlabelled rather than refusing.
+        #[serde(default, skip_serializing_if = "is_false")]
+        diarize: bool,
     },
     /// Force emission of buffered audio without ending the session.
     #[serde(rename = "session.flush")]
@@ -66,6 +71,11 @@ pub enum ServerMessage {
     SessionClosed { reason: String },
 }
 
+/// serde helper: lets a false bool vanish from the wire entirely.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +88,7 @@ mod tests {
             encoding: Encoding::PcmS16le,
             language: None,
             vocabulary: None,
+            diarize: false,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
@@ -93,10 +104,52 @@ mod tests {
             encoding: Encoding::PcmS16le,
             language: None,
             vocabulary: None,
+            diarize: false,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(!s.contains("language"), "got: {s}");
         assert!(!s.contains("vocabulary"), "got: {s}");
+    }
+
+    #[test]
+    fn session_start_without_diarize_parses_as_false() {
+        // Wire compatibility: every message an old client sends today.
+        let s =
+            r#"{"type":"session.start","mode":"live","sample_rate":16000,"encoding":"pcm_s16le"}"#;
+        let m: ClientMessage = serde_json::from_str(s).unwrap();
+        let ClientMessage::SessionStart { diarize, .. } = m else {
+            panic!()
+        };
+        assert!(!diarize);
+    }
+
+    #[test]
+    fn diarize_false_is_omitted_from_the_wire() {
+        // False is the overwhelmingly common case; a field on every message
+        // saying "nothing special" is noise an old server need never see.
+        let m = ClientMessage::SessionStart {
+            mode: Mode::Live,
+            sample_rate: 16000,
+            encoding: Encoding::PcmS16le,
+            language: None,
+            vocabulary: None,
+            diarize: false,
+        };
+        assert!(!serde_json::to_string(&m).unwrap().contains("diarize"));
+    }
+
+    #[test]
+    fn diarize_true_round_trips() {
+        let m = ClientMessage::SessionStart {
+            mode: Mode::Transcript,
+            sample_rate: 16000,
+            encoding: Encoding::PcmS16le,
+            language: None,
+            vocabulary: None,
+            diarize: true,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMessage>(&s).unwrap(), m);
     }
 
     #[test]

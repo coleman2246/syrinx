@@ -114,6 +114,7 @@ async fn happy_path_emits_ready_then_ordered_commits_then_closed() {
         encoding: Encoding::PcmS16le,
         language: None,
         vocabulary: None,
+        diarize: false,
     }))
     .await
     .unwrap();
@@ -175,6 +176,7 @@ async fn live_mode_never_emits_revision_messages_over_the_wire() {
         encoding: Encoding::PcmS16le,
         language: None,
         vocabulary: None,
+        diarize: false,
     }))
     .await
     .unwrap();
@@ -207,6 +209,7 @@ async fn sessions_beyond_capacity_are_refused_with_a_retryable_error() {
             encoding: Encoding::PcmS16le,
             language: None,
             vocabulary: None,
+            diarize: false,
         }))
         .await
         .unwrap();

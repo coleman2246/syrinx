@@ -112,6 +112,8 @@ pub async fn transcribe(
             encoding: Encoding::PcmS16le,
             language: None,
             vocabulary: None,
+            // Bulk transcription never gets labels in this design.
+            diarize: false,
         })?
         .into(),
     ))

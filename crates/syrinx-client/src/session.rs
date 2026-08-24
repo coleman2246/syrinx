@@ -220,6 +220,8 @@ async fn run(
             encoding: Encoding::PcmS16le,
             language: None,
             vocabulary: None,
+            // Live session labels arrive in a later task.
+            diarize: false,
         })?
         .into(),
     ))
