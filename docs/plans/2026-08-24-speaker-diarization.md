@@ -64,11 +64,15 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 hound = "3"
-# ort: use the same version parakeet-rs pins. Find it first:
+# ort: use the same version parakeet-rs pins (2.0.0-rc.13 at time of
+# writing). Find it first:
 #   cargo tree -p syrinx-server --features cuda -i ort
 # rc-series ort versions do not unify across majors, so this MUST match
-# what Phase 2 will need to coexist with.
-ort = { version = "<match parakeet-rs>", features = ["cpu"] }
+# what Phase 2 will need to coexist with. No feature list: CPU execution
+# is ort's built-in default (there is no "cpu" feature), and default
+# features keep download-binaries, which is what makes this crate build
+# without a hand-installed onnxruntime.
+ort = "<match parakeet-rs>"
 ```
 
 - [ ] **Step 2: Fetch models and test audio**
@@ -185,7 +189,7 @@ fn is_false(b: &bool) -> bool {
 }
 ```
 
-Fix every construction site found by the grep with `diarize: false` (the client starts requesting it in Task 8; existing proto tests get `diarize: false`).
+Fix every construction site found by the grep with `diarize: false` (the client starts requesting it in Task 8; existing proto tests get `diarize: false`). One of them is `crates/syrinx-client/src/bulk.rs` — the offline file-transcription path. Leaving it at `false` is deliberate: bulk transcription never gets labels in this design, consistent with the spec's live-meeting focus.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -530,7 +534,7 @@ fn majority_label(&self, from: u64, to: u64) -> Option<u32> {
 `emit` gains the speaker parameter; `finish()` pads/pushes the tail chunk as today, then force-releases everything held (`lag = 0` drain) before draining the model, and any model tail text emits with the last known label window.
 
 - [ ] **Step 1: Read `crates/syrinx-server/tests/modes.rs`** to learn the existing session-test helpers and style.
-- [ ] **Step 2: Write the eight failing tests** (behaviours 1–7 above; 8 is a doc comment).
+- [ ] **Step 2: Write the seven failing tests** (behaviours 1–7 above; behaviour 8 is a doc comment, not a test).
 - [ ] **Step 3: Run** `cargo test -p syrinx-server` — expect compile failure (signature), then test failures.
 - [ ] **Step 4: Implement** as sketched; keep `emit` the single funnel.
 - [ ] **Step 5: Run** `cargo test --workspace` — green, including untouched golden/protocol tests (behaviour 1 guarantees this).
@@ -575,7 +579,7 @@ Not env-overridable — it's a behaviour setting, same reasoning as `max_session
 
 - [ ] **Step 3: Wire ws.rs**
 
-- `AppState` gains `pub diarize: Option<Arc<dyn crate::diarize::DiarizerFactory>>`; `AppState::new` takes it (all current callers pass `None` — grep `AppState::new`).
+- `AppState` gains `pub diarize: Option<Arc<dyn crate::diarize::DiarizerFactory>>`; `AppState::new` takes it (all current callers pass `None` — grep `AppState::new`). Note the protocol tests build the server via `app.rs::build_router(model, config)`, which calls `AppState::new` internally — `build_router` must grow the factory parameter too, or Step 4's tests have no way to inject a `MockDiarizer` factory.
 - `wait_for_start` returns `Option<(Mode, bool)>` — destructure `diarize` from `SessionStart`.
 - Honest handshake and session wiring:
 
@@ -745,7 +749,7 @@ git commit -am "Break lines on a speaker change and name the turn"
 
 - In `transcript_scroll`: when any segment carries a speaker, render grouped turns — a bold `Speaker N` header (use the existing theme's emphasis, look at how `ui.weak`/`ui.label` are used nearby) followed by the turn's concatenated text as one label; otherwise the flat `self.state.transcript` exactly as today.
 - Turn grouping: reuse the same rule as Task 9 — factor a small `pub fn turns(segments: &[Segment]) -> Vec<(Option<u32>, String)>` into `syrinx-client` (`save.rs` is the natural home, next to `by_source`) and unit-test it there rather than in the GUI.
-- Below the status row, when the session requested labels but `state.diarize` is false and mode keeps a transcript: a `ui.weak("Speaker labels unavailable on this server")` line. Requested = the config flag; the GUI knows it.
+- Below the status row, when the session requested labels but `state.diarize` is false: a `ui.weak("Speaker labels unavailable on this server")` line. "Requested" means the config flag is set **and the wire mode is Transcript** — condition on `mode.wire_mode()`, not `keeps_transcript()`. **Both** mode keeps a transcript but runs the wire live and never asks for labels; showing the notice there would wrongly blame the server for the mode working as designed.
 
 - [ ] **Step 2: Test** — the `turns()` function gets unit tests in syrinx-client (labelled runs group; unlabelled attaches; no labels → single `(None, everything)` turn). GUI rendering is verified manually in Step 3.
 
@@ -841,8 +845,15 @@ diarize = ["dep:ort"]
 # cuda stays as-is; the two are independent.
 
 [dependencies]
-ort = { version = "<exactly what parakeet-rs pins>", optional = true, default-features = false, features = ["cpu"] }
+ort = { version = "<exactly what parakeet-rs pins>", optional = true }
 ```
+
+No feature list on `ort`: there is no `cpu` feature (CPU execution is the
+built-in default), and `default-features = false` would strip
+`download-binaries` while parakeet-rs wants `load-dynamic` — let cargo's
+feature unification with parakeet-rs's own `ort` spec settle the link
+strategy rather than fighting it here. Selecting the CPU execution
+provider happens in code, per session builder, in Step 2.
 
 Verify with `cargo tree --features cuda,diarize -i ort` that exactly one `ort` version appears. If the fbank crate chosen in the spike is used, add it here (optional, in the `diarize` feature); if the spike hand-rolled fbank, port that code into `real.rs`'s module.
 
