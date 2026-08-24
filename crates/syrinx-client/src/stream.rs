@@ -414,6 +414,40 @@ mod tests {
     }
 
     #[test]
+    fn a_silence_gap_within_a_turn_does_not_repeat_the_speaker() {
+        // The pause reopens the line, but not the turn: the speaker already
+        // named it, and repeating "Speaker 1:" on every fragment after a
+        // pause would be noise.
+        let p = scratch("spk-gap");
+        let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
+        w.append(&seg_spk(0.0, "hello", Some(1))).unwrap();
+        w.append(&seg_spk(65.0, "still there", Some(1))).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "[00:00] Speaker 1: hello\n[01:05] still there"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_resumed_session_still_shows_the_speaker_on_its_first_line() {
+        // A resumed writer starts with no memory of the file it is
+        // appending to, so its own first fragment always opens a turn.
+        let p = scratch("spk-resume");
+        let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
+        w.append(&seg_spk(0.0, "one", Some(1))).unwrap();
+        drop(w);
+        let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
+        w.append(&seg_spk(0.0, "two", Some(2))).unwrap();
+        drop(w);
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "[00:00] Speaker 1: one\n[00:00] Speaker 2: two"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn silence_writes_nothing() {
         // Empty commits would otherwise litter the file with blank lines.
         let p = scratch("silence");

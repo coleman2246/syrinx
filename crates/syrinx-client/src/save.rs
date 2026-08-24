@@ -79,6 +79,11 @@ pub fn stamp(seconds: f64) -> String {
 /// paragraph view, which coalesces a turn regardless of any pause within it,
 /// and `render` below, which additionally splits a turn back into lines on a
 /// silence gap or a source change -- shares one rule for it.
+///
+/// Segments rather than the plan's sketched rendered `String`: `render`
+/// below needs the raw segments to format each of `Plain`/`Timestamped`/
+/// `Labelled` differently per turn; the GUI's paragraph view (Task 10) can
+/// concatenate the text itself.
 pub fn turns(segments: &[Segment]) -> Vec<(Option<u32>, Vec<&Segment>)> {
     let mut out: Vec<(Option<u32>, Vec<&Segment>)> = Vec::new();
     let mut last_speaker: Option<u32> = None;
@@ -119,15 +124,37 @@ pub fn render(segments: &[Segment], fallback: &str, format: Format) -> String {
                 .trim()
                 .to_string()
         }
+        // Without any label, this must render exactly as it did before
+        // turns existed: one line per segment, unconditionally. Only once a
+        // label is present does a turn start merging lines together --
+        // otherwise every plain recording's timestamps would start silently
+        // vanishing on any two fragments less than 1.5s apart.
+        Format::Timestamped | Format::Labelled if segments.iter().all(|s| s.speaker.is_none()) => {
+            render_stamped_flat(segments, format)
+        }
         Format::Timestamped | Format::Labelled => render_stamped(segments, format),
     }
 }
 
-/// Render `Timestamped` or `Labelled`: one line per turn, split further on a
-/// silence gap or, for `Labelled`, a source change -- the same rule
-/// `StreamWriter` uses to continue a line, so a saved file and a streamed
-/// one agree. The speaker only appears on the line that opens its turn; a
-/// line reopened later by a silence gap does not repeat it.
+/// `Timestamped`/`Labelled` before turns existed: one line per segment,
+/// regardless of how close in time two fragments are.
+fn render_stamped_flat(segments: &[Segment], format: Format) -> String {
+    segments
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .map(|s| match (format, &s.source) {
+            (Format::Labelled, Some(src)) => format!("{} [{}] {}", stamp(s.at), src, s.text.trim()),
+            _ => format!("{} {}", stamp(s.at), s.text.trim()),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render `Timestamped` or `Labelled` once a label is present: one line per
+/// turn, split further on a silence gap or, for `Labelled`, a source change
+/// -- the same rule `StreamWriter` uses to continue a line, so a saved file
+/// and a streamed one agree. The speaker only appears on the line that opens
+/// its turn; a line reopened later by a silence gap does not repeat it.
 fn render_stamped(segments: &[Segment], format: Format) -> String {
     /// One physical output line: whether it opens its speaker's turn, and
     /// the segments spliced onto it.
@@ -675,5 +702,29 @@ mod tests {
             render(&[s], "", Format::Labelled),
             "[00:00] [System audio] Speaker 2: hello"
         );
+    }
+
+    #[test]
+    fn unlabelled_close_segments_still_get_their_own_stamped_line() {
+        // Regression: turn-merging must not engage when no segment carries a
+        // speaker, or a plain recording's timestamps would start silently
+        // vanishing on any two fragments less than 1.5s apart.
+        let segs = [seg(0.0, "hello "), seg(0.6, "world")];
+        assert_eq!(
+            render(&segs, "", Format::Timestamped),
+            "[00:00] hello\n[00:00] world"
+        );
+    }
+
+    #[test]
+    fn plain_does_not_break_a_turn_on_a_silence_gap() {
+        // A turn is a speaker run, not a time window: unlike Timestamped and
+        // Labelled, Plain has no stamps to go stale, so nothing about a
+        // pause should split one speaker's paragraph in two.
+        let segs = [
+            seg_spk(0.0, "hello ", Some(1)),
+            seg_spk(65.0, "world", Some(1)),
+        ];
+        assert_eq!(render(&segs, "", Format::Plain), "Speaker 1: hello world");
     }
 }
