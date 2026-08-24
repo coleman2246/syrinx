@@ -142,7 +142,8 @@ impl Embeddings {
     }
 
     fn store(&self, path: &str) -> Result<()> {
-        let mut f = std::fs::File::create(path)?;
+        let tmp = format!("{path}.partial");
+        let mut f = std::fs::File::create(&tmp)?;
         f.write_all(b"DZEM")?;
         f.write_all(&(self.dim as u32).to_le_bytes())?;
         f.write_all(&(self.len() as u32).to_le_bytes())?;
@@ -153,9 +154,19 @@ impl Embeddings {
         for v in &self.vectors {
             f.write_all(&v.to_le_bytes())?;
         }
-        Ok(())
+        drop(f);
+        Ok(std::fs::rename(&tmp, path)?)
     }
 }
+
+/// **Bump this whenever `vad.rs`, `fbank.rs`, `embed.rs` or `windows()`
+/// changes.** The cache keys name the wav, model and window geometry, but
+/// nothing about the code that produced the contents, so without a version in
+/// the filename a pipeline fix silently reads back results from the pipeline
+/// it replaced. That is not hypothetical: fixing silero's context window
+/// during the spike invalidated every `.vad` file already written, and
+/// nothing but remembering to delete them by hand stood in the way.
+const PIPELINE_VERSION: u32 = 2;
 
 fn cache_path(wav: &str, model: &str, window_s: f32, hop_s: f32) -> String {
     let stem = |p: &str| {
@@ -167,7 +178,7 @@ fn cache_path(wav: &str, model: &str, window_s: f32, hop_s: f32) -> String {
             .to_string()
     };
     format!(
-        "{}/cache/{}.{}.w{:.0}h{:.0}.emb",
+        "{}/cache/{}.{}.w{:.0}h{:.0}.v{PIPELINE_VERSION}.emb",
         spike_dir(),
         stem(wav),
         stem(model),
@@ -176,10 +187,11 @@ fn cache_path(wav: &str, model: &str, window_s: f32, hop_s: f32) -> String {
     )
 }
 
-/// Voiced-frame flags depend only on the wav, so they outlive every sweep.
+/// Voiced-frame flags depend only on the wav and the VAD code, so they outlive
+/// every sweep but not a change to `vad.rs`.
 fn voiced_frames(wav: &str) -> Result<Vec<bool>> {
     let stem = wav.rsplit('/').next().unwrap_or(wav);
-    let path = format!("{}/cache/{stem}.vad", spike_dir());
+    let path = format!("{}/cache/{stem}.v{PIPELINE_VERSION}.vad", spike_dir());
     if let Ok(bytes) = std::fs::read(&path) {
         return Ok(bytes.iter().map(|&b| b != 0).collect());
     }
@@ -194,8 +206,13 @@ fn voiced_frames(wav: &str) -> Result<Vec<bool>> {
         samples.len() as f32 / fbank::SAMPLE_RATE / 60.0,
         started.elapsed().as_secs_f32()
     );
+    // Write-then-rename: a run killed mid-write would otherwise leave a short
+    // file that loads without complaint and silently truncates the meeting.
+    // Unlike the embedding cache, these bytes carry no length to check against.
     std::fs::create_dir_all(format!("{}/cache", spike_dir()))?;
-    std::fs::write(&path, voiced.iter().map(|&v| v as u8).collect::<Vec<_>>())?;
+    let tmp = format!("{path}.partial");
+    std::fs::write(&tmp, voiced.iter().map(|&v| v as u8).collect::<Vec<_>>())?;
+    std::fs::rename(&tmp, &path)?;
     Ok(voiced)
 }
 
@@ -350,10 +367,17 @@ impl Args {
         let i = self.0.iter().position(|a| a == name)?;
         self.0.get(i + 1).map(|s| s.as_str())
     }
-    fn num(&self, name: &str, default: f32) -> f32 {
-        self.get(name)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
+    /// A value that will not parse is fatal, never a silent fall back to the
+    /// default. This harness exists to attribute numbers to constants, so
+    /// quietly sweeping `0.45` because `--t-assign 0,45` was unreadable would
+    /// invalidate the output while looking like a clean run.
+    fn num(&self, name: &str, default: f32) -> Result<f32> {
+        match self.get(name) {
+            None => Ok(default),
+            Some(v) => v
+                .parse()
+                .with_context(|| format!("{name}: expected a number, got {v:?}")),
+        }
     }
     fn list(&self, name: &str, default: &str) -> Vec<String> {
         self.get(name)
@@ -361,6 +385,17 @@ impl Args {
             .split(',')
             .filter(|s| !s.is_empty())
             .map(String::from)
+            .collect()
+    }
+    /// Comma-separated numbers, where one bad entry fails the run rather than
+    /// silently shortening the grid.
+    fn nums<T: std::str::FromStr>(&self, name: &str, default: &str) -> Result<Vec<T>> {
+        self.list(name, default)
+            .iter()
+            .map(|s| {
+                s.parse::<T>()
+                    .map_err(|_| anyhow::anyhow!("{name}: expected a number, got {s:?}"))
+            })
             .collect()
     }
     fn has(&self, name: &str) -> bool {
@@ -442,16 +477,16 @@ fn main() -> Result<()> {
         "run" => {
             let wav = resolve("audio", args.get("--wav").context("--wav")?);
             let model = model_path(args.get("--model").context("--model")?);
-            let (window_s, hop_s) = (args.num("--window", 1.5), args.num("--hop", 0.0));
+            let (window_s, hop_s) = (args.num("--window", 1.5)?, args.num("--hop", 0.0)?);
             let hop_s = if hop_s == 0.0 { window_s / 2.0 } else { hop_s };
             // Defaults come from Params::default() so a no-flags run is the
             // calibrated configuration, and there is one place to change it.
             let chosen = Params::default();
             let params = Params {
-                t_assign: args.num("--t-assign", chosen.t_assign),
-                t_retire: args.num("--t-retire", chosen.t_retire),
-                alpha: args.num("--alpha", chosen.alpha),
-                min_pool: args.num("--min-pool", chosen.min_pool as f32) as usize,
+                t_assign: args.num("--t-assign", chosen.t_assign)?,
+                t_retire: args.num("--t-retire", chosen.t_retire)?,
+                alpha: args.num("--alpha", chosen.alpha)?,
+                min_pool: args.num("--min-pool", chosen.min_pool as f32)? as usize,
             };
 
             eprintln!(
@@ -532,7 +567,7 @@ fn main() -> Result<()> {
             let wav = resolve("audio", args.get("--wav").context("--wav")?);
             let samples = reference::read_wav(&wav)?;
             let mut vad = vad::Vad::new(&format!("{}/silero_vad.onnx", spike_dir()))?;
-            let until = (args.num("--until", 120.0) * fbank::SAMPLE_RATE) as usize;
+            let until = (args.num("--until", 120.0)? * fbank::SAMPLE_RATE) as usize;
             let mut probs = Vec::new();
             for f in 0..(samples.len().min(until) / vad::FRAME) {
                 probs.push(vad.prob(&samples[f * vad::FRAME..(f + 1) * vad::FRAME])?);
@@ -556,7 +591,7 @@ fn main() -> Result<()> {
         // are two windows of the same voice, versus two windows of different
         // voices, on this audio? Clustering cannot beat this ceiling.
         "separability" => {
-            let window_s = args.num("--window", 1.5);
+            let window_s = args.num("--window", 1.5)?;
             let hop_s = window_s / 2.0;
             for model in args.list(
                 "--model",
@@ -610,10 +645,10 @@ fn main() -> Result<()> {
                         pct(&diff, 0.5),
                         pct(&diff, 0.9),
                     );
-                    let (eer_t, eer) = equal_error(&same, &diff);
+                    let (threshold, wrong) = best_split(&same, &diff);
                     println!(
-                        "  best split at {eer_t:.2} -> {:.1}% of pairs wrong",
-                        100.0 * eer
+                        "  best split at {threshold:.2} -> {:.1}% of pairs wrong",
+                        100.0 * wrong
                     );
                 }
             }
@@ -623,8 +658,8 @@ fn main() -> Result<()> {
         // with a batch of 16 is the wrong number for the spec's CPU budget.
         // This measures the shape the server will actually run in.
         "bench" => {
-            let window_s = args.num("--window", 1.5);
-            let hop_s = args.num("--hop", window_s / 2.0);
+            let window_s = args.num("--window", 1.5)?;
+            let hop_s = args.num("--hop", window_s / 2.0)?;
             let samples = reference::read_wav(&resolve(
                 "audio",
                 args.get("--wav").unwrap_or("ES2002a.Mix-Headset.wav"),
@@ -671,9 +706,9 @@ fn main() -> Result<()> {
         // derived from the hop, because voiced-audio accumulation stretches
         // wall-clock time by however silent the meeting is.
         "lag" => {
-            let window_s = args.num("--window", 1.5);
-            let hop_s = args.num("--hop", window_s / 2.0);
-            let chunk = args.num("--chunk", 0.56);
+            let window_s = args.num("--window", 1.5)?;
+            let hop_s = args.num("--hop", window_s / 2.0)?;
+            let chunk = args.num("--chunk", 0.56)?;
             for wav in args.list(
                 "--wav",
                 "ES2002a.Mix-Headset.wav,IS1000a.Mix-Headset.wav,EN2001a.Mix-Headset.wav",
@@ -732,7 +767,7 @@ fn main() -> Result<()> {
 
 /// The threshold minimising total pair errors, and the error rate there.
 /// Both inputs must be sorted ascending.
-fn equal_error(same: &[f32], diff: &[f32]) -> (f32, f32) {
+fn best_split(same: &[f32], diff: &[f32]) -> (f32, f32) {
     let mut best = (0.0, 1.0);
     let mut t = 0.0;
     while t <= 1.0 {
@@ -755,39 +790,19 @@ fn sweep(args: &Args) -> Result<()> {
         "wespeaker_en_voxceleb_resnet34_LM.onnx,\
          3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx",
     );
-    let windows: Vec<f32> = args
-        .list("--windows", "1.0,1.5,2.0")
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let pools: Vec<usize> = args
-        .list("--pools", "2,3,4,5,6")
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let windows: Vec<f32> = args.nums("--windows", "1.0,1.5,2.0")?;
+    let pools: Vec<usize> = args.nums("--pools", "2,3,4,5,6")?;
     // The plan asked for 0.4-0.7, which this covers. It also runs down to 0.20
     // because that is where the answer turned out to live: on 1.5 s windows of
     // real meeting audio these models put same-speaker pairs at a median of
     // 0.52 and different-speaker pairs at 0.03, so the design's ~0.6 guess sits
     // above most true matches rather than between the two distributions.
-    let assigns: Vec<f32> = args
-        .list(
-            "--assigns",
-            "0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70",
-        )
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let retires: Vec<f32> = args
-        .list("--retires", "0.60,0.70,0.80,0.85")
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let alphas: Vec<f32> = args
-        .list("--alphas", "0.05")
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let assigns: Vec<f32> = args.nums(
+        "--assigns",
+        "0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70",
+    )?;
+    let retires: Vec<f32> = args.nums("--retires", "0.60,0.70,0.80,0.85")?;
+    let alphas: Vec<f32> = args.nums("--alphas", "0.05")?;
 
     println!(
         "model\tmeeting\twindow\tt_assign\tt_retire\tmin_pool\talpha\tref\thyp\tsplits\tmerges\tmiss%\tconf%"

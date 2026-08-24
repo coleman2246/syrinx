@@ -134,6 +134,16 @@ impl Embedder {
         let out = self.session.run(inputs)?;
         let (shape, data) = out[self.output.as_str()].try_extract_tensor::<f32>()?;
         let dim = shape[1] as usize;
+        // A single non-finite value would spread through an EMA update and
+        // poison that centroid for the rest of the run, silently. Better to
+        // stop than to publish numbers computed against a dead centroid.
+        if let Some(bad) = data.iter().position(|x| !x.is_finite()) {
+            bail!(
+                "embedding {} is not finite at dimension {}",
+                bad / dim,
+                bad % dim
+            );
+        }
 
         Ok((0..batch)
             .map(|b| l2_normalize(&data[b * dim..(b + 1) * dim]))
