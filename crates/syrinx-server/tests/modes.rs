@@ -9,7 +9,7 @@ use syrinx_server::session::Session;
 
 fn drive(mode: Mode, chunks: usize) -> Vec<ServerMessage> {
     let backend = MockBackend::new(&["alpha", "beta", "gamma"]);
-    let mut s = Session::new(mode, &backend, "sid-1".into());
+    let mut s = Session::new(mode, &backend, "sid-1".into(), None);
     let mut out = Vec::new();
     for _ in 0..chunks {
         out.extend(s.push_audio(&vec![0.0; 8960]).unwrap());
@@ -62,7 +62,7 @@ fn audio_shorter_than_a_chunk_emits_nothing_until_finish() {
     // Network frames have no relationship to the model's chunk size, so a
     // partial chunk must buffer rather than emit a truncated inference.
     let backend = MockBackend::new(&["alpha"]);
-    let mut s = Session::new(Mode::Live, &backend, "sid".into());
+    let mut s = Session::new(Mode::Live, &backend, "sid".into(), None);
 
     assert!(s.push_audio(&vec![0.0; 100]).unwrap().is_empty());
     assert_eq!(s.finish().unwrap().len(), 1, "finish must flush the tail");
@@ -72,13 +72,13 @@ fn audio_shorter_than_a_chunk_emits_nothing_until_finish() {
 fn one_oversized_push_emits_several_chunks() {
     // A client may send a large frame; it must decompose into whole chunks.
     let backend = MockBackend::new(&["a", "b", "c"]);
-    let mut s = Session::new(Mode::Live, &backend, "sid".into());
+    let mut s = Session::new(Mode::Live, &backend, "sid".into(), None);
     assert_eq!(s.push_audio(&vec![0.0; 8960 * 3]).unwrap().len(), 3);
 }
 
 #[test]
 fn finish_on_an_empty_session_emits_nothing() {
     let backend = MockBackend::new(&["alpha"]);
-    let mut s = Session::new(Mode::Live, &backend, "sid".into());
+    let mut s = Session::new(Mode::Live, &backend, "sid".into(), None);
     assert!(s.finish().unwrap().is_empty());
 }

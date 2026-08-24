@@ -143,7 +143,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Inference on the blocking pool: it is synchronous and GPU-bound.
     let sid = session_id.clone();
     let infer = tokio::task::spawn_blocking(move || {
-        let mut session = Session::new(mode, backend.as_ref(), sid);
+        // No diarizer yet; wiring one up is Task 7.
+        let mut session = Session::new(mode, backend.as_ref(), sid, None);
         while let Some(ev) = audio_rx.blocking_recv() {
             let is_finish = matches!(ev, AudioEvent::Finish);
             let produced = match ev {

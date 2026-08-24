@@ -23,7 +23,7 @@ pub trait DiarizerFactory: Send + Sync {
 }
 
 /// Scripted diarizer for protocol and session tests. Deterministic on
-/// purpose, like [`crate::asr::mock::MockBackend`]: tests assert exact
+/// purpose, like [`crate::asr::mock::MockStream`]: tests assert exact
 /// message sequences.
 pub struct MockDiarizer {
     script: std::collections::VecDeque<Result<Option<u32>>>,
