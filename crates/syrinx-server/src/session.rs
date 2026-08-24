@@ -84,6 +84,7 @@ impl Session {
         ServerMessage::TranscriptCommit {
             seq: self.seq,
             text,
+            speaker: None,
         }
     }
 }

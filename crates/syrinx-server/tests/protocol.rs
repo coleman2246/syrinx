@@ -133,7 +133,7 @@ async fn happy_path_emits_ready_then_ordered_commits_then_closed() {
     let mut closed = false;
     while let Some(m) = next_msg(&mut ws).await {
         match m {
-            ServerMessage::TranscriptCommit { seq, text } => commits.push((seq, text)),
+            ServerMessage::TranscriptCommit { seq, text, .. } => commits.push((seq, text)),
             ServerMessage::SessionClosed { .. } => {
                 closed = true;
                 break;

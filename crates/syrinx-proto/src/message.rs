@@ -46,11 +46,27 @@ pub enum ServerMessage {
 
     /// Final text. Never revised. The only transcript message live mode emits.
     #[serde(rename = "transcript.commit")]
-    TranscriptCommit { seq: u64, text: String },
+    TranscriptCommit {
+        seq: u64,
+        text: String,
+        /// Who said it, numbered from 1 in order of first confident
+        /// appearance. Absent when no diarizer ran, or when it honestly
+        /// could not tell for this stretch -- a gap, never a guess.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speaker: Option<u32>,
+    },
 
     /// Text that may still change. Transcript mode only.
     #[serde(rename = "transcript.provisional")]
-    TranscriptProvisional { seq: u64, text: String },
+    TranscriptProvisional {
+        seq: u64,
+        text: String,
+        /// Who said it, numbered from 1 in order of first confident
+        /// appearance. Absent when no diarizer ran, or when it honestly
+        /// could not tell for this stretch -- a gap, never a guess.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speaker: Option<u32>,
+    },
 
     /// Retract `retract_n` characters and replace with `text`.
     ///
@@ -162,6 +178,7 @@ mod tests {
         let m = ServerMessage::TranscriptCommit {
             seq: 7,
             text: "hello".into(),
+            speaker: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&s).unwrap(), m);
@@ -206,6 +223,43 @@ mod tests {
             diarize: true,
         };
         assert!(serde_json::to_string(&m).unwrap().contains("\"diarize\":true"));
+    }
+
+    #[test]
+    fn session_ready_omits_diarize_when_false() {
+        let m = ServerMessage::SessionReady {
+            session_id: "x".into(),
+            chunk_ms: 560,
+            model: "m".into(),
+            diarize: false,
+        };
+        assert!(!serde_json::to_string(&m).unwrap().contains("diarize"));
+    }
+
+    #[test]
+    fn commit_without_speaker_parses_and_omits() {
+        // Both directions of compatibility in one place: an old server's commit
+        // parses, and an unlabelled commit from a new server looks identical to
+        // an old client.
+        let old = r#"{"type":"transcript.commit","seq":1,"text":"hi"}"#;
+        let m: ServerMessage = serde_json::from_str(old).unwrap();
+        let ServerMessage::TranscriptCommit { speaker, .. } = &m else {
+            panic!()
+        };
+        assert_eq!(*speaker, None);
+        assert!(!serde_json::to_string(&m).unwrap().contains("speaker"));
+    }
+
+    #[test]
+    fn commit_with_speaker_round_trips() {
+        let m = ServerMessage::TranscriptCommit {
+            seq: 7,
+            text: "hello".into(),
+            speaker: Some(2),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"speaker\":2"), "got: {s}");
+        assert_eq!(serde_json::from_str::<ServerMessage>(&s).unwrap(), m);
     }
 
     #[test]
