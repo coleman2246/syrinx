@@ -413,7 +413,7 @@ The heart of Phase 1. `Session` gains an optional diarizer; when present, commit
 Behavioural contract to encode in tests, one test each:
 
 1. **No diarizer → byte-identical behaviour to today**, including zero added lag. (Guard test: with `None`, pushing one chunk of a scripted backend yields its commit immediately, `speaker: None`.)
-2. **With a diarizer, commits lag by `LAG_CHUNKS` (= 1)**: pushing chunk 1 yields nothing; pushing chunk 2 yields chunk 1's text.
+2. **With a diarizer, commits lag by `LAG_CHUNKS` (= 2, the spike's calibrated value)**: pushing chunks 1 and 2 yields nothing; pushing chunk 3 releases chunk 1's text.
 3. **The label is the majority over the text's chunk plus its lag window**: script `[Some(1), Some(1)]` → chunk 1's commit carries `Some(1)`; script `[Some(1), Some(2)]` → ties break toward the **earlier** chunk's label (the chunk the words actually live in), so `Some(1)`.
 4. **Uncertainty is honest**: script `[None, None]` → commit carries `speaker: None`.
 5. **`finish()` flushes held commits** with whatever labels exist — nothing is ever lost to the lag buffer.
@@ -426,8 +426,9 @@ Implementation shape (complete, to be adapted to the real file):
 ```rust
 /// How many chunks a commit is held so its speaker label can settle. The
 /// diarizer needs more audio context than the transducer does; the spec
-/// makes this a tunable, calibrated by the spike.
-const LAG_CHUNKS: usize = 1;
+/// makes this a tunable, and the spike calibrated it to 2 (≈1.12 s, covering
+/// the p90 label delay of a 1.5 s embedding window).
+const LAG_CHUNKS: usize = 2;
 
 /// Consecutive diarizer failures before the session stops asking. An
 /// occasional hiccup is survivable; a diarizer that fails every chunk is
