@@ -1,0 +1,4 @@
+# The repository's root ignore file says `/target/`, which only matches at the
+# root -- this crate is its own workspace, so it needs its own rule or its
+# build directory (onnxruntime's shared library included) lands in git.
+/target/

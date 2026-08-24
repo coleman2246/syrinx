@@ -287,3 +287,189 @@ harness, README model-download section mirroring the ASR one. Turn it on.
 - **Embedding quality on Teams-compressed audio.** Codec artifacts blur
   voice characteristics relative to clean corpora. This is exactly what the
   spike exists to measure before any integration work is spent.
+
+## Spike results
+
+**Date:** 2026-08-24. **Verdict: go.** Code in `spike/diarize`.
+
+### What was run
+
+`spike/diarize` implements the whole design end to end — silero VAD, sliding
+voiced windows, a hand-rolled Kaldi-compatible fbank, an ONNX speaker
+embedder, and the clusterer from "Stage 3" above — over wav files, scored
+against the AMI manual annotations (v1.6.2, word-level times, so pauses
+inside a turn are not counted as speech).
+
+Recordings, all AMI `Mix-Headset` at 16 kHz mono (corpus CC-BY-4.0):
+
+| Recording | Length | Speakers | Notes |
+|---|---|---|---|
+| ES2002a | 21 min | 4 | very skewed: 446 s / 346 s / 76 s / 22 s |
+| IS1000a | 26 min | 4 | balanced: 623 s / 196 s / 176 s / 121 s |
+| EN2001a | 87 min | 5 | the long-run stability test |
+
+Embeddings depend only on (model, recording, window, hop), never on the
+clustering thresholds, so the binary caches them to disk. A 1920-configuration
+sweep over `T_assign` × `T_retire` × `MIN_POOL` × window × model × recording
+therefore costs seconds, and every number below is sweep output rather than a
+hand-picked run.
+
+### The front-end had to be validated first
+
+A wrong fbank does not fail loudly — it produces embeddings that look
+plausible and separate nobody. `diarize-spike verify` checks each model
+against the same-speaker / different-speaker wav pairs shipped in the
+sherpa-onnx release. All three candidates cleared it (same-speaker mean
+0.66, different-speaker mean 0.15–0.29, no overlap between the
+distributions), which is what licenses trusting the meeting numbers.
+
+Two front-end details cost real time and are worth recording: Kaldi's mel
+bank runs to Nyquist (8000 Hz), not the 7600 Hz speech-synthesis convention;
+and **silero v5 wants 576 samples per call, not 512** — 64 samples of
+context from the previous frame prepended to the new 512. Feeding it a bare
+512 returns near-zero speech probability for everything, silently.
+
+### The embeddings are better than the design assumed, at a lower threshold
+
+Measured over windows the reference marks as a single clean speaker
+(`diarize-spike separability`, ES2002a, 1.5 s windows):
+
+| Model | same-speaker p50 | different-speaker p50 | best split | pairs wrong |
+|---|---|---|---|---|
+| WeSpeaker ResNet34-LM | 0.522 | 0.026 | 0.24 | 2.3% |
+| 3D-Speaker ERes2Net | 0.517 | 0.046 | 0.24 | 2.0% |
+| NeMo TitaNet-small | 0.558 | 0.196 | 0.36 | 7.2% |
+
+TitaNet separates 3× worse than the other two and was dropped after this
+measurement rather than carried through a full sweep.
+
+The important calibration finding: **the spec's `T_assign ≈ 0.6` guess was
+wrong for these models on this audio.** Same-speaker pairs sit at a median
+of 0.52, so 0.6 rejects most true matches — at 0.6 the clusterer pooled
+almost everything, found 2 speakers in a 4-speaker meeting, and left 38% of
+speech unlabelled. The sweep range was extended down to 0.20 and the usable
+plateau is 0.40–0.50.
+
+### Chosen model and constants
+
+**Model: `3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx`** (26.5 MB,
+192-dim), from the sherpa-onnx model zoo:
+`https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx`
+(the release tag really is spelled `recongition`). Apache-2.0, from the
+3D-Speaker project. VAD is `silero_vad.onnx` v5 (2.2 MB, MIT).
+
+| Constant | Value | Why this value |
+|---|---|---|
+| window | 1.5 s | 1.0 s finds too few speakers, 2.0 s misses 5% more speech |
+| hop | 0.75 s | half the window |
+| `T_assign` | 0.45 | middle of the 0.40–0.50 plateau |
+| `T_retire` | 0.80 | ≤0.60 merges real speakers; see below |
+| EMA alpha | 0.05 | insensitive: 0.02–0.20 moves nothing by more than 1.5% |
+| `MIN_POOL` | 4 | 2 is catastrophic; 3 works but has no margin |
+| `LAG_CHUNKS` | 2 | ≈1.12 s, covers the p90 label delay |
+
+`MIN_POOL` deserves emphasis, because it is the design's "reluctant create"
+rule earning its keep. At 2, the clusterer mints 29 and 42 labels for
+4-speaker meetings. At 3 it is correct but one step from that cliff. At 4 it
+is correct on every recording. The spec's instinct here was right and the
+setting is not a free parameter.
+
+`T_retire` is the opposite story: **it never fired in any accepted
+configuration** — no centroid was ever retired at the chosen constants. Its
+only measured effect is harm when set too low: on EN2001a, `T_retire ≤ 0.60`
+retires two genuinely different speakers into one, taking confusion from
+2.0% to 4.8%. The cliff is between 0.60 and 0.65. 0.80 clears it with margin
+while staying low enough to plausibly catch a real split. Its value as
+insurance is unmeasured, because no split ever happened to insure against.
+
+### Results at those constants
+
+Splits count extra labels holding ≥10% of a real speaker's speech; merges
+count labels covering ≥10% of more than one speaker. Miss is single-speaker
+speech left unlabelled; confusion is speech attributed to the wrong speaker
+under the best one-to-one mapping. Overlapped speech is excluded from
+scoring, per "out of scope" above.
+
+| Recording | Real | Labels | Splits | Merges | Miss | Confusion |
+|---|---|---|---|---|---|---|
+| ES2002a | 4 | 4 | 0 | 0 | 26.2% | 2.2% |
+| ES2002a, Opus 24 kbps | 4 | 4 | 0 | 0 | 27.8% | 2.2% |
+| ES2002a, Opus 16 kbps | 4 | **3** | 0 | 0 | 29.8% | 2.4% |
+| IS1000a | 4 | 4 | 0 | 0 | 31.3% | 2.6% |
+| IS1000a, Opus 24 kbps | 4 | 4 | 0 | 0 | 31.5% | 2.4% |
+| IS1000a, Opus 16 kbps | 4 | 4 | 0 | 0 | 32.8% | 2.1% |
+| EN2001a (87 min) | 5 | 5 | 0 | 0 | 12.5% | 2.0% |
+| EN2001a, Opus 24 kbps | 5 | 5 | 0 | 0 | 13.2% | 2.0% |
+
+WeSpeaker ResNet34-LM matches this on confusion to within 0.4 points and
+runs 0–2 points higher on miss, with one real difference: on ES2002a under
+Opus it loses that meeting's 76-second speaker at 24 kbps, where ERes2Net
+keeps them. That single case is the whole margin between the two models —
+they are otherwise interchangeable, single-threaded cost included (50 ms
+versus 45 ms per window), and swapping them is a one-line change.
+
+**Label stability, the spec's main worry:** on the 87-minute meeting every
+one of the five speakers holds the same label across all three thirds of the
+recording, under both models, clean and Opus-degraded. No renumbering, no
+drift, no late splits.
+
+**Turn boundaries:** when the diarizer starts a new turn, the median
+distance to a real turn change is 0.49–0.97 s on clean audio, with 55–72%
+inside 1 s; the worst case anywhere, ES2002a at Opus 24 kbps, is 1.01 s and
+47%. The reverse direction is much worse (median 0.6–4.5 s) but measures
+something else — short turns the diarizer never labels at all, which is the
+miss rate, not a boundary error.
+
+**Cost**, single-threaded, measured by `diarize-spike bench`: silero VAD
+0.079 ms per 32 ms frame (0.2% of a core), ERes2Net 45 ms per window at a
+0.75 s hop (6.0% of a core). Total ≈6% of one core per session, which
+matches the "a few percent of one core" claim in the CPU-budget note above.
+
+**Lag:** measured against real window timings rather than derived from the
+hop, the delay between a 560 ms ASR chunk ending and a label covering it
+existing is p50 0.42–0.45 s, p90 0.88–1.09 s, p99 ≈1.5 s. Two chunks
+(1.12 s) covers the p90; three (1.68 s) covers the p99. Two is the
+recommendation, with `speaker: None` absorbing the rest — which is what that
+field is for.
+
+### Verdict
+
+**Go.** The pipeline finds exactly the right number of speakers on seven of
+the eight conditions tested, attributes 96–98% of the speech it does label
+to the right person, and holds every label stable over 87 minutes. The
+conservative clustering rules the design specified are doing real work:
+`MIN_POOL` at 4 is the difference between 4 labels and 42. Nothing here
+argues for changing the architecture, and the two headline risks recorded
+above both came out better than feared — Opus at Teams-like bitrates costs
+about one point of miss rate, and multi-hour stability was perfect.
+
+### What this does not establish
+
+Honesty about the gaps, in rough order of how much they should worry Phase 2:
+
+- **No real Teams audio was tested.** Opus at 24 and 16 kbps is a proxy for
+  the codec, not for the acoustic path — Teams also brings automatic gain
+  control, noise suppression, and speakerphone-in-a-meeting-room, none of
+  which this measures. AMI `Mix-Headset` is a mix of close-talking headset
+  microphones and is *cleaner* than anything the server will really see. A
+  deliberate Teams calibration recording is still worth making before the
+  constants are treated as final.
+- **Five speakers, not ten.** The problem statement says three to ten
+  participants; AMI gave at most five. The crowding measurement is the
+  warning sign here: with five speakers on EN2001a the two closest centroids
+  sit at 0.519 cosine — *above* `T_assign`. Separation survived because
+  assignment goes to the nearest centroid rather than the first one over the
+  threshold, but the margin is gone at five speakers, and eight is untested.
+  If a meeting is going to fail, this is how.
+- **Quiet participants are the fragile case.** ES2002a's fourth speaker
+  (22 s of speech in 21 minutes) is never reliably labelled, and its
+  76-second speaker is the one Opus 16 kbps loses. Someone who says three
+  sentences in an hour may simply not get a label.
+- **The miss rate is high and is a design consequence, not a bug.** Roughly
+  a quarter to a third of single-speaker speech gets no label in the
+  conversational meetings, because a window needs 1.5 s of voiced audio and
+  many turns are shorter. It falls to 12.5% on the meeting with long turns.
+  Backchannels and one-word interjections will mostly arrive as
+  `speaker: None`.
+- **Overlapped speech is excluded from every number above**, so the real
+  transcript will look worse than 2% confusion during cross-talk.
