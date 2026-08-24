@@ -229,7 +229,11 @@ Composition with the existing formats, when labels are present:
   Without labels the format is byte-identical to today.
 - **timestamped** — timestamp, then speaker, then text:
   `[12:04] Speaker 2: ...`
-- **labelled** — time, source, then speaker: `[12:04] [teams] Speaker 2: ...`.
+- **labelled** — time, source, then speaker, where the source is the
+  capture's existing `short_label()` — the device, application, or
+  microphone name exactly as the format prints it today:
+  `[12:04] [System audio] Speaker 2: ...` or `[12:04] [Yeti] Speaker 1: ...`.
+  Diarization adds the speaker; it does not rename the source.
   Speaker numbering is **per-session**: with `SourceMode::Separate`, each
   source's session mints its own independent Speaker 1..N, and the source
   label is what distinguishes them. (For meetings this hardly matters —
