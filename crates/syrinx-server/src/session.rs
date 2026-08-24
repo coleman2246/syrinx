@@ -255,3 +255,39 @@ impl Session {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asr::mock::MockBackend;
+    use crate::diarize::MockDiarizer;
+
+    #[test]
+    fn silence_does_not_grow_the_label_buffer() {
+        // A chunk that produces no text releases no commit, and releasing a
+        // commit is what drains the labels behind it. A quiet meeting is hours
+        // of exactly that, so labels have to be dropped on their own account
+        // rather than as a side effect of text leaving.
+        //
+        // The bound is what matters, not the count: whatever is kept has to be
+        // enough for a commit's window and no more. This lives inside the
+        // module because the deque is private, and it is private because
+        // nothing outside needs it.
+        let backend = MockBackend::new(&[]).with_chunk_samples(16);
+        let mut s = Session::new(
+            Mode::Transcript,
+            &backend,
+            "sid".into(),
+            Some(Box::new(MockDiarizer::labels(&[Some(1)]))),
+        );
+        for _ in 0..20 {
+            assert!(s.push_audio(&[0.0; 16]).unwrap().is_empty());
+            assert!(
+                s.chunk_labels.len() <= LAG_CHUNKS + 1,
+                "{} labels held after {} chunks of silence",
+                s.chunk_labels.len(),
+                s.chunks_seen
+            );
+        }
+    }
+}
