@@ -88,6 +88,10 @@ pub unsafe extern "C" fn syrinx_start(
             // application's job through UITextDocumentProxy, and the injection
             // backends are all desktop ones.
             mode: OutputMode::Transcribe,
+            // The keyboard extension has no config file and no UI to expose
+            // this, and iOS gets no diarization models. A future host app
+            // wanting labels wires its own toggle through this crate.
+            diarize: false,
             label: None,
             inject: Default::default(),
             stream: None,

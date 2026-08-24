@@ -27,6 +27,12 @@ pub struct Config {
     pub source_key: Option<String>,
     #[serde(default)]
     pub mode: OutputMode,
+    /// Ask the server for anonymous speaker labels (Speaker 1, Speaker 2,
+    /// ...) in transcribe mode. Best-effort: a server with no diarization
+    /// models installed still works, just unlabelled -- see
+    /// `SessionState::diarize` for the honest answer once connected.
+    #[serde(default)]
+    pub diarize: bool,
     /// How text is typed at the cursor. Electron applications such as Teams
     /// need `ydotool`; see the Method docs.
     #[serde(default)]
@@ -177,6 +183,7 @@ impl Config {
         doc[key] = toml_edit::value(&self.url);
         doc["token"] = toml_edit::value(&self.token);
         doc["mode"] = toml_edit::value(self.mode.name());
+        doc["diarize"] = toml_edit::value(self.diarize);
         doc["inject"] = toml_edit::value(self.inject.name());
         doc["format"] = toml_edit::value(self.format.name());
         doc["waybar_signal"] = toml_edit::value(i64::from(self.waybar_signal));
@@ -289,6 +296,15 @@ pub fn template() -> String {
         s.push_str(&format!("#   \"{}\"{} -- {}\n", m.name(), pad(m.name()), m.summary()));
     }
     s.push_str(&format!("mode = \"{}\"\n\n", OutputMode::default().name()));
+
+    s.push_str(&comment_wrap(
+        "Ask the server for anonymous speaker labels (Speaker 1, Speaker 2, \
+         ...) on the transcript, for telling meeting participants apart. \
+         Only applies to \"transcribe\" mode, and needs a server with \
+         diarization models installed -- the server says in its handshake \
+         whether labels will come.",
+    ));
+    s.push_str("diarize = false\n\n");
 
     s.push_str("# How text is typed at the cursor, for the modes above that type.\n");
     for m in crate::inject::Method::ALL {
@@ -705,6 +721,7 @@ mod tests {
             stream_to: Some("~/notes.txt".into()),
             format: crate::save::Format::Labelled,
             mode: OutputMode::Both,
+            diarize: true,
             inject: crate::inject::Method::Paste,
             hotkey: Some("ctrl+alt+k".into()),
             waybar_signal: 3,
@@ -794,6 +811,29 @@ mod tests {
     }
 
     #[test]
+    fn diarize_defaults_to_false() {
+        // Zero-config state: no labels requested until asked for.
+        let c: Config = toml::from_str(r#"token = "abc""#).unwrap();
+        assert!(!c.diarize);
+    }
+
+    #[test]
+    fn diarize_true_parses() {
+        let c: Config = toml::from_str("token = \"a\"\ndiarize = true").unwrap();
+        assert!(c.diarize);
+    }
+
+    #[test]
+    fn the_template_documents_diarize() {
+        let text = template();
+        assert!(text.contains("diarize = false"), "got:\n{text}");
+        assert!(
+            text.contains("speaker labels"),
+            "the diarize comment is missing:\n{text}"
+        );
+    }
+
+    #[test]
     fn config_round_trips_through_toml() {
         // The GUI writes this file back when a source is chosen, so a value it
         // cannot re-read would silently lose the setting.
@@ -805,6 +845,7 @@ mod tests {
             hotkey: Some("ctrl+alt+d".into()),
             source_key: Some("rnnoise_source".into()),
             mode: OutputMode::Both,
+            diarize: true,
             inject: Default::default(),
             waybar_signal: 3,
         };

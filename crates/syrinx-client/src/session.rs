@@ -54,6 +54,8 @@ pub struct Segment {
     /// Which source produced this, when more than one is in play. `None` for a
     /// single source or a combined mix, where attribution is meaningless.
     pub source: Option<String>,
+    /// Anonymous speaker from the server's diarizer, when one ran.
+    pub speaker: Option<u32>,
 }
 
 /// Everything a front-end needs to render. Cheap to clone.
@@ -68,6 +70,9 @@ pub struct SessionState {
     pub last_fragment: String,
     pub model: Option<String>,
     pub chunk_ms: Option<u32>,
+    /// What the handshake actually granted -- the client may have asked and
+    /// still not received, e.g. no diarization models on the server.
+    pub diarize: bool,
     pub error: Option<String>,
     /// Live spectrum of the audio being sent, so a viewer can see the session
     /// is receiving sound rather than only that it is running.
@@ -84,6 +89,10 @@ pub struct SessionOptions {
     /// independent streams the caller runs a session per source.
     pub sources: Vec<Source>,
     pub mode: OutputMode,
+    /// Ask the server for anonymous speaker labels. Only takes effect in a
+    /// mode that keeps a transcript; see the `session.start` construction in
+    /// `run` for why a typing mode never sends this on.
+    pub diarize: bool,
     /// Label applied to this session's segments, for separate mode.
     pub label: Option<String>,
     /// How text is typed at the cursor.
@@ -220,8 +229,13 @@ async fn run(
             encoding: Encoding::PcmS16le,
             language: None,
             vocabulary: None,
-            // Live session labels arrive in a later task.
-            diarize: false,
+            // Never on a typing session, even if the caller asked: a typing
+            // mode runs the wire live and types every fragment as it lands,
+            // so "Speaker 2:" landing at the cursor would be destructive, not
+            // decorative. Mode::Transcript is exactly the modes that don't
+            // type -- guaranteed by OutputMode::wire_mode's own invariant
+            // test, so this holds by construction.
+            diarize: opts.diarize && opts.mode.wire_mode() == syrinx_proto::Mode::Transcript,
         })?
         .into(),
     ))
@@ -231,12 +245,16 @@ async fn run(
     match rx.next().await {
         Some(Ok(Ws::Text(t))) => match serde_json::from_str::<ServerMessage>(&t)? {
             ServerMessage::SessionReady {
-                model, chunk_ms, ..
+                model,
+                chunk_ms,
+                diarize,
+                ..
             } => {
                 let mut s = state.lock().expect("state lock poisoned");
                 s.status = Status::Listening;
                 s.model = Some(model);
                 s.chunk_ms = Some(chunk_ms);
+                s.diarize = diarize;
             }
             ServerMessage::Error { code, message, .. } => {
                 bail!("server refused the session ({code:?}): {message}")
@@ -307,8 +325,8 @@ async fn run(
         while let Some(Ok(msg)) = rx.next().await {
             let Ws::Text(t) = msg else { continue };
             match serde_json::from_str::<ServerMessage>(&t) {
-                Ok(ServerMessage::TranscriptCommit { text, .. })
-                | Ok(ServerMessage::TranscriptProvisional { text, .. }) => {
+                Ok(ServerMessage::TranscriptCommit { text, speaker, .. })
+                | Ok(ServerMessage::TranscriptProvisional { text, speaker, .. }) => {
                     if mode.types_at_cursor()
                         && let Err(e) = inject::type_text(&text, inject_method)
                     {
@@ -318,6 +336,7 @@ async fn run(
                         at: started.elapsed().as_secs_f64(),
                         text: text.clone(),
                         source: label.clone(),
+                        speaker,
                     };
                     // Written whatever the mode: the point of streaming is a
                     // copy on disk, and typing at the cursor is exactly when
@@ -359,6 +378,10 @@ async fn run(
                         at: started.elapsed().as_secs_f64(),
                         text: text.clone(),
                         source: label.clone(),
+                        // Revise carries no speaker by design: it is
+                        // reserved for a future post-processing layer, not
+                        // something the diarizer's lag buffer ever emits.
+                        speaker: None,
                     });
                     drop(s);
                     n();

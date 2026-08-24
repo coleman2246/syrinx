@@ -164,6 +164,7 @@ mod tests {
             at,
             text: text.into(),
             source: None,
+            speaker: None,
         }
     }
 
@@ -248,6 +249,7 @@ mod tests {
             at,
             text: text.into(),
             source: Some(src.into()),
+            speaker: None,
         };
         w.append(&mk(0.0, "hello", "Yeti")).unwrap();
         w.append(&mk(0.3, "goodbye", "System")).unwrap();
@@ -282,6 +284,7 @@ mod tests {
             at: 0.0,
             text: "hello".into(),
             source: Some("Yeti".into()),
+            speaker: None,
         })
         .unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "[00:00] [Yeti] hello");

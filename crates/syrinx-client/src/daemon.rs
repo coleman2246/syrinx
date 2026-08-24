@@ -548,6 +548,7 @@ impl DaemonRuntime {
                         token,
                         sources: resolved,
                         mode: self.opts.mode,
+                        diarize: self.opts.config.diarize,
                         // Attribution is meaningless once mixed.
                         label: None,
                         inject,
@@ -574,6 +575,7 @@ impl DaemonRuntime {
                             token: token.clone(),
                             sources: vec![source],
                             mode,
+                            diarize: self.opts.config.diarize,
                             label,
                             inject,
                             stream: stream.clone(),

@@ -402,6 +402,7 @@ mod tests {
             at,
             text: text.into(),
             source: None,
+            speaker: None,
         }
     }
 
@@ -410,6 +411,7 @@ mod tests {
             at,
             text: text.into(),
             source: Some(src.into()),
+            speaker: None,
         }
     }
 
