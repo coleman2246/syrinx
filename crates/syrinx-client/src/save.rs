@@ -155,40 +155,46 @@ fn render_stamped_flat(segments: &[Segment], format: Format) -> String {
 /// -- the same rule `StreamWriter` uses to continue a line, so a saved file
 /// and a streamed one agree. The speaker only appears on the line that opens
 /// its turn; a line reopened later by a silence gap does not repeat it.
+///
+/// Turn boundaries come from `turns` itself, so this and the GUI's paragraph
+/// view can never disagree about where one starts; only the further split
+/// into physical lines -- on a gap or a source change -- is local to saving.
 fn render_stamped(segments: &[Segment], format: Format) -> String {
-    /// One physical output line: whether it opens its speaker's turn, and
-    /// the segments spliced onto it.
-    struct Line<'a> {
-        opens_turn: bool,
-        segs: Vec<&'a Segment>,
-    }
+    let filtered: Vec<Segment> = segments
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .cloned()
+        .collect();
 
-    let mut lines: Vec<Line> = Vec::new();
-    let mut last_speaker: Option<u32> = None;
-    for seg in segments.iter().filter(|s| !s.text.trim().is_empty()) {
-        let opens_turn =
-            lines.is_empty() || (seg.speaker.is_some() && seg.speaker != last_speaker);
-        let opens_line = opens_turn || {
-            // `opens_turn` is false only once `lines` holds an open line.
-            let prev = *lines.last().unwrap().segs.last().unwrap();
-            (format == Format::Labelled && prev.source != seg.source)
-                || seg.at - prev.at >= NEW_LINE_AFTER_SILENCE
-        };
-        if opens_line {
-            lines.push(Line { opens_turn, segs: vec![seg] });
-        } else {
-            lines.last_mut().unwrap().segs.push(seg);
-        }
-        if seg.speaker.is_some() {
-            last_speaker = seg.speaker;
-        }
-    }
-
-    lines
+    turns(&filtered)
         .into_iter()
-        .map(|line| render_line(&line.segs, line.opens_turn, format))
+        .flat_map(|(_, segs)| lines_in_turn(segs, format))
+        .map(|(opens_turn, segs)| render_line(&segs, opens_turn, format))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Split one turn's segments into physical lines on a silence gap or, for
+/// `Labelled`, a source change. Only the first line carries `true` --
+/// `render_line` only names the speaker there, since a line reopened later
+/// by a gap is still the same turn.
+fn lines_in_turn(segs: Vec<&Segment>, format: Format) -> Vec<(bool, Vec<&Segment>)> {
+    let mut lines: Vec<Vec<&Segment>> = Vec::new();
+    for seg in segs {
+        let breaks = match lines.last().and_then(|l| l.last()) {
+            Some(prev) => {
+                (format == Format::Labelled && prev.source != seg.source)
+                    || seg.at - prev.at >= NEW_LINE_AFTER_SILENCE
+            }
+            None => false,
+        };
+        if lines.is_empty() || breaks {
+            lines.push(vec![seg]);
+        } else {
+            lines.last_mut().unwrap().push(seg);
+        }
+    }
+    lines.into_iter().enumerate().map(|(i, segs)| (i == 0, segs)).collect()
 }
 
 /// One rendered line: its stamp, source (`Labelled`) and, if it opens a
@@ -206,15 +212,18 @@ fn render_line(segs: &[&Segment], opens_turn: bool, format: Format) -> String {
     } else {
         String::new()
     };
-    let last = segs.len() - 1;
+    // Only the first segment is ever trimmed: fully, if it is also the last
+    // (matching the pre-turns single-line-per-segment convention); from the
+    // left only otherwise, since `StreamWriter` writes every continuation
+    // after it raw -- trimming the last segment's trailing whitespace here
+    // too would make a saved file disagree with a streamed one.
     let text: String = segs
         .iter()
         .enumerate()
-        .map(|(i, s)| match (i == 0, i == last) {
-            (true, true) => s.text.trim().to_string(),
-            (true, false) => s.text.trim_start().to_string(),
-            (false, true) => s.text.trim_end().to_string(),
-            (false, false) => s.text.clone(),
+        .map(|(i, s)| match i {
+            0 if segs.len() == 1 => s.text.trim().to_string(),
+            0 => s.text.trim_start().to_string(),
+            _ => s.text.clone(),
         })
         .collect();
     format!("{} {source_part}{speaker_prefix}{text}", stamp(first.at))
@@ -726,5 +735,31 @@ mod tests {
             seg_spk(65.0, "world", Some(1)),
         ];
         assert_eq!(render(&segs, "", Format::Plain), "Speaker 1: hello world");
+    }
+
+    #[test]
+    fn a_merged_lines_trailing_whitespace_matches_between_save_and_stream() {
+        // Regression: render_line used to trim_end the last segment of a
+        // merged line, but StreamWriter writes a continuation's text raw --
+        // so a saved file and a streamed one disagreed on trailing
+        // whitespace, contradicting render_stamped's own claim that they
+        // agree.
+        let segs = [
+            seg_spk(0.0, "hello ", Some(1)),
+            seg_spk(0.6, "world  ", Some(1)),
+        ];
+        let saved = render(&segs, "", Format::Timestamped);
+
+        let dir = tmp("stream-parity");
+        let p = dir.join("t.txt");
+        let mut w = crate::stream::StreamWriter::open(&p, Format::Timestamped).unwrap();
+        for s in &segs {
+            w.append(s).unwrap();
+        }
+        drop(w);
+        let streamed = std::fs::read_to_string(&p).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(saved, streamed);
     }
 }

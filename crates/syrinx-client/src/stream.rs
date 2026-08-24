@@ -29,13 +29,21 @@ pub struct StreamWriter {
     /// Whether the next write needs a newline in front of it, because the file
     /// already has content that did not end in one.
     needs_newline: bool,
-    /// When the last fragment arrived, what produced it, and which speaker's
-    /// turn is open, so a stamped line can be continued rather than
-    /// restarted for every fragment. The speaker is the last *labelled* one
-    /// seen: an unlabelled fragment does not overwrite it, so a short
-    /// connective segment the diarizer could not call stays attached to the
-    /// turn already open.
-    last: Option<(f64, Option<String>, Option<u32>)>,
+    /// The line already open, so it can be continued rather than restarted
+    /// for every fragment. `None` before the first fragment, or right after
+    /// a resumed writer's own first one.
+    last: Option<Last>,
+}
+
+/// When the last fragment arrived, what produced it, and which speaker's
+/// turn is open.
+struct Last {
+    at: f64,
+    source: Option<String>,
+    /// The last *labelled* speaker seen: an unlabelled fragment does not
+    /// overwrite it, so a short connective segment the diarizer could not
+    /// call stays attached to the turn already open.
+    speaker: Option<u32>,
 }
 
 /// How long a silence has to be before a stamped line is considered finished.
@@ -110,8 +118,12 @@ impl StreamWriter {
         // only a labelled one ever changes it.
         let speaker = seg
             .speaker
-            .or_else(|| self.last.as_ref().and_then(|(_, _, sp)| *sp));
-        self.last = Some((seg.at, seg.source.clone(), speaker));
+            .or_else(|| self.last.as_ref().and_then(|l| l.speaker));
+        self.last = Some(Last {
+            at: seg.at,
+            source: seg.source.clone(),
+            speaker,
+        });
 
         // `File` is unbuffered, so this reaches the operating system before the
         // call returns: a process that dies afterwards loses nothing. Surviving
@@ -125,13 +137,13 @@ impl StreamWriter {
 
     /// Whether this fragment belongs on the line already open.
     fn continues_line(&self, seg: &Segment) -> bool {
-        let Some((last_at, last_source, last_speaker)) = &self.last else {
+        let Some(last) = &self.last else {
             return false;
         };
         // A labelled speaker change always breaks the line, in every format:
         // the prefix that opens the line would otherwise be wrong for the
         // second half of it.
-        if seg.speaker.is_some() && seg.speaker != *last_speaker {
+        if seg.speaker.is_some() && seg.speaker != last.speaker {
             return false;
         }
         if matches!(self.format, Format::Plain) {
@@ -142,10 +154,10 @@ impl StreamWriter {
         // A different source always starts a new line too, however close in time:
         // the label at the start of the line would otherwise be wrong for half
         // of it.
-        if matches!(self.format, Format::Labelled) && *last_source != seg.source {
+        if matches!(self.format, Format::Labelled) && last.source != seg.source {
             return false;
         }
-        seg.at - last_at < NEW_LINE_AFTER_SILENCE
+        seg.at - last.at < NEW_LINE_AFTER_SILENCE
     }
 
     /// The stamp, source and speaker, where relevant, that open a line.
@@ -175,7 +187,7 @@ impl StreamWriter {
     fn opens_turn(&self, seg: &Segment) -> bool {
         match &self.last {
             None => seg.speaker.is_some(),
-            Some((_, _, last_speaker)) => seg.speaker.is_some() && seg.speaker != *last_speaker,
+            Some(last) => seg.speaker.is_some() && seg.speaker != last.speaker,
         }
     }
 
@@ -409,6 +421,22 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "[00:00] [System audio] Speaker 2: hello"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn plain_does_not_break_a_turn_on_a_silence_gap() {
+        // Plain has no stamp to go stale, so unlike Timestamped/Labelled a
+        // pause between fragments from the same speaker must not start a
+        // new line -- only a speaker change does.
+        let p = scratch("spk-plain-gap");
+        let mut w = StreamWriter::open(&p, Format::Plain).unwrap();
+        w.append(&seg_spk(0.0, "hello ", Some(1))).unwrap();
+        w.append(&seg_spk(65.0, "world", Some(1))).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "Speaker 1: hello world"
         );
         let _ = std::fs::remove_file(&p);
     }
