@@ -161,7 +161,9 @@ async fn main() -> Result<()> {
 
     tokio::spawn(model.clone().run_idle_reaper(REAPER_TICK));
 
-    let app = build_router(model, config.clone());
+    // No diarization factory yet: Phase 2 loads one from `diarize_model_dir`
+    // when the feature and the config agree it should exist.
+    let app = build_router(model, config.clone(), None);
     let listener = tokio::net::TcpListener::bind(&config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;

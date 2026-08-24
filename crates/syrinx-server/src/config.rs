@@ -38,6 +38,11 @@ pub struct Config {
     /// with `capacity` rather than degrading everyone already connected.
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+
+    /// Directory holding the diarization models (silero-vad + speaker
+    /// embedding). Absent = speaker labels unavailable, feature off.
+    #[serde(default)]
+    pub diarize_model_dir: Option<String>,
 }
 
 /// Execution provider. Defaults to CPU: it needs no GPU, cannot disturb other
@@ -218,5 +223,20 @@ mod tests {
         .unwrap();
         assert_eq!(c.max_sessions, 9);
         assert_eq!(c.vram_floor_mib, 2048);
+    }
+
+    #[test]
+    fn diarize_model_dir_defaults_to_absent() {
+        // Absent means the feature is off, which must be the zero-config state.
+        assert!(base().diarize_model_dir.is_none());
+    }
+
+    #[test]
+    fn diarize_model_dir_parses() {
+        let c = Config::from_toml(
+            "token = \"a\"\nmodel_dir = \"/m\"\ndiarize_model_dir = \"/d\"",
+        )
+        .unwrap();
+        assert_eq!(c.diarize_model_dir.as_deref(), Some("/d"));
     }
 }

@@ -40,15 +40,24 @@ pub struct AppState {
     /// Admission control. Sessions beyond the limit are refused outright rather
     /// than accepted into a pool that degrades everyone.
     pub slots: Arc<Semaphore>,
+    /// Absent when the server has no diarization models configured: `None`
+    /// here is what makes a `diarize` request in the handshake honestly
+    /// answered `false` rather than promised and never delivered.
+    pub diarize: Option<Arc<dyn crate::diarize::DiarizerFactory>>,
 }
 
 impl AppState {
-    pub fn new(model: Arc<ModelHandle>, config: Arc<Config>) -> Self {
+    pub fn new(
+        model: Arc<ModelHandle>,
+        config: Arc<Config>,
+        diarize: Option<Arc<dyn crate::diarize::DiarizerFactory>>,
+    ) -> Self {
         let slots = Arc::new(Semaphore::new(config.max_sessions));
         Self {
             model,
             config,
             slots,
+            diarize,
         }
     }
 }
@@ -83,10 +92,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     };
 
     // Await session.start before anything else.
-    let mode = match wait_for_start(&mut rx, &mut tx).await {
+    let (mode, diarize_requested) = match wait_for_start(&mut rx, &mut tx).await {
         Some(m) => m,
         None => return,
     };
+
+    // Honest handshake: a client can ask for labels and still not get them --
+    // no diarizer configured, or a mode with nowhere for a label to go. The
+    // client finds out here, once, rather than every commit staying silently
+    // unlabelled.
+    let labelling = diarize_requested && mode == Mode::Transcript && state.diarize.is_some();
 
     // Load the model now, not at startup. Loading is blocking and can take a
     // couple of seconds, so it must not run on the async runtime.
@@ -132,19 +147,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             session_id: session_id.clone(),
             chunk_ms: backend.chunk_ms(),
             model: backend.model_name().to_string(),
-            // Always false for now; wiring this to a real diarizer is Task 7.
-            diarize: false,
+            diarize: labelling,
         }))
         .await;
 
     let (audio_tx, mut audio_rx) = mpsc::channel::<AudioEvent>(AUDIO_QUEUE_DEPTH);
     let (msg_tx, mut msg_rx) = mpsc::channel::<ServerMessage>(32);
 
+    // Spawned here, not carried through the handshake bool: a fresh
+    // `Diarizer` per session, sharing whatever models the factory loaded once
+    // at startup.
+    let d = labelling.then(|| {
+        state
+            .diarize
+            .as_ref()
+            .expect("labelling implies a factory")
+            .diarizer()
+    });
+
     // Inference on the blocking pool: it is synchronous and GPU-bound.
     let sid = session_id.clone();
     let infer = tokio::task::spawn_blocking(move || {
-        // No diarizer yet; wiring one up is Task 7.
-        let mut session = Session::new(mode, backend.as_ref(), sid, None);
+        let mut session = Session::new(mode, backend.as_ref(), sid, d);
         while let Some(ev) = audio_rx.blocking_recv() {
             let is_finish = matches!(ev, AudioEvent::Finish);
             let produced = match ev {
@@ -232,11 +256,13 @@ enum AudioEvent {
 async fn wait_for_start(
     rx: &mut futures_util::stream::SplitStream<WebSocket>,
     tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-) -> Option<Mode> {
+) -> Option<(Mode, bool)> {
     while let Some(Ok(frame)) = rx.next().await {
         match frame {
             Message::Text(t) => match serde_json::from_str::<ClientMessage>(&t) {
-                Ok(ClientMessage::SessionStart { mode, .. }) => return Some(mode),
+                Ok(ClientMessage::SessionStart { mode, diarize, .. }) => {
+                    return Some((mode, diarize));
+                }
                 _ => {
                     let _ = tx
                         .send(json_msg(&ServerMessage::Error {

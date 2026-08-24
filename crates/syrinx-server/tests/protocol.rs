@@ -10,6 +10,7 @@ use syrinx_server::asr::AsrBackend;
 use syrinx_server::asr::lifecycle::{FixedVramProbe, ModelHandle, VramGuard};
 use syrinx_server::asr::mock::MockBackend;
 use syrinx_server::config::Config;
+use syrinx_server::diarize::{Diarizer, DiarizerFactory, MockDiarizer};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -17,8 +18,18 @@ use tokio_tungstenite::tungstenite::protocol::Message as TMessage;
 
 const TOKEN: &str = "test-token";
 
+/// A `DiarizerFactory` that hands every session the same scripted labels, so a
+/// protocol test can assert exact labelled commits over a real socket.
+struct ScriptedFactory(Vec<Option<u32>>);
+
+impl DiarizerFactory for ScriptedFactory {
+    fn diarizer(&self) -> Box<dyn Diarizer> {
+        Box::new(MockDiarizer::labels(&self.0))
+    }
+}
+
 /// Start the server on an ephemeral port; returns its address.
-async fn spawn_server(max_sessions: usize) -> String {
+async fn spawn_server(max_sessions: usize, diarize: Option<Arc<dyn DiarizerFactory>>) -> String {
     let config = Arc::new(
         Config::from_toml(&format!(
             r#"
@@ -42,7 +53,7 @@ async fn spawn_server(max_sessions: usize) -> String {
         3400,
         Duration::from_secs(600),
     ));
-    let app = build_router(model, config);
+    let app = build_router(model, config, diarize);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -92,7 +103,7 @@ async fn next_msg(
 
 #[tokio::test]
 async fn bad_token_is_rejected_before_any_session() {
-    let url = spawn_server(4).await;
+    let url = spawn_server(4, None).await;
     assert!(
         connect(&url, Some("wrong")).await.is_err(),
         "a bad token must not reach a session"
@@ -105,7 +116,7 @@ async fn bad_token_is_rejected_before_any_session() {
 
 #[tokio::test]
 async fn happy_path_emits_ready_then_ordered_commits_then_closed() {
-    let url = spawn_server(4).await;
+    let url = spawn_server(4, None).await;
     let mut ws = connect(&url, Some(TOKEN)).await.unwrap();
 
     ws.send(text(&ClientMessage::SessionStart {
@@ -150,7 +161,7 @@ async fn happy_path_emits_ready_then_ordered_commits_then_closed() {
 
 #[tokio::test]
 async fn audio_before_session_start_is_a_protocol_error() {
-    let url = spawn_server(4).await;
+    let url = spawn_server(4, None).await;
     let mut ws = connect(&url, Some(TOKEN)).await.unwrap();
 
     // The server has no mode, sample rate or encoding yet, so it cannot
@@ -167,7 +178,7 @@ async fn audio_before_session_start_is_a_protocol_error() {
 async fn live_mode_never_emits_revision_messages_over_the_wire() {
     // The same invariant as tests/modes.rs, asserted end to end through the
     // transport rather than at the session boundary.
-    let url = spawn_server(4).await;
+    let url = spawn_server(4, None).await;
     let mut ws = connect(&url, Some(TOKEN)).await.unwrap();
 
     ws.send(text(&ClientMessage::SessionStart {
@@ -199,7 +210,7 @@ async fn live_mode_never_emits_revision_messages_over_the_wire() {
 
 #[tokio::test]
 async fn sessions_beyond_capacity_are_refused_with_a_retryable_error() {
-    let url = spawn_server(1).await;
+    let url = spawn_server(1, None).await;
 
     let mut first = connect(&url, Some(TOKEN)).await.unwrap();
     first
@@ -229,4 +240,154 @@ async fn sessions_beyond_capacity_are_refused_with_a_retryable_error() {
         }
         other => panic!("expected capacity error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn transcribe_session_requesting_labels_gets_them_when_a_factory_is_configured() {
+    let factory: Arc<dyn DiarizerFactory> = Arc::new(ScriptedFactory(vec![Some(1), Some(1), Some(1)]));
+    let url = spawn_server(4, Some(factory)).await;
+    let mut ws = connect(&url, Some(TOKEN)).await.unwrap();
+
+    ws.send(text(&ClientMessage::SessionStart {
+        mode: Mode::Transcript,
+        sample_rate: 16000,
+        encoding: Encoding::PcmS16le,
+        language: None,
+        vocabulary: None,
+        diarize: true,
+    }))
+    .await
+    .unwrap();
+
+    match next_msg(&mut ws).await.unwrap() {
+        ServerMessage::SessionReady { diarize, .. } => {
+            assert!(diarize, "a configured server must honestly grant what it asked for")
+        }
+        other => panic!("expected session.ready, got {other:?}"),
+    }
+
+    for _ in 0..3 {
+        ws.send(one_chunk()).await.unwrap();
+    }
+    ws.send(text(&ClientMessage::SessionStop)).await.unwrap();
+
+    let mut commits = Vec::new();
+    while let Some(m) = next_msg(&mut ws).await {
+        match m {
+            ServerMessage::TranscriptCommit { text, speaker, .. } => commits.push((text, speaker)),
+            ServerMessage::SessionClosed { .. } => break,
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        commits,
+        vec![
+            ("alpha ".into(), Some(1)),
+            ("beta ".into(), Some(1)),
+            ("gamma ".into(), Some(1)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn transcribe_session_requesting_labels_gets_none_without_a_configured_factory() {
+    // A client can ask for labels a server has no way to give -- an old
+    // recording of behaviour that must stay honest, not silently ignored.
+    let url = spawn_server(4, None).await;
+    let mut ws = connect(&url, Some(TOKEN)).await.unwrap();
+
+    ws.send(text(&ClientMessage::SessionStart {
+        mode: Mode::Transcript,
+        sample_rate: 16000,
+        encoding: Encoding::PcmS16le,
+        language: None,
+        vocabulary: None,
+        diarize: true,
+    }))
+    .await
+    .unwrap();
+
+    match next_msg(&mut ws).await.unwrap() {
+        ServerMessage::SessionReady { diarize, .. } => {
+            assert!(!diarize, "no diarizer is configured, so the handshake must say no")
+        }
+        other => panic!("expected session.ready, got {other:?}"),
+    }
+
+    for _ in 0..3 {
+        ws.send(one_chunk()).await.unwrap();
+    }
+    ws.send(text(&ClientMessage::SessionStop)).await.unwrap();
+
+    let mut commits = Vec::new();
+    while let Some(m) = next_msg(&mut ws).await {
+        match m {
+            ServerMessage::TranscriptCommit { text, speaker, .. } => commits.push((text, speaker)),
+            ServerMessage::SessionClosed { .. } => break,
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    // Unlabelled means no lag either: commits arrive immediately, same as any
+    // session that never asked.
+    assert_eq!(
+        commits,
+        vec![
+            ("alpha ".into(), None),
+            ("beta ".into(), None),
+            ("gamma ".into(), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn live_mode_never_gets_labels_even_when_requested_and_available() {
+    // Mode gating happens regardless of what the server has configured: live
+    // mode types into someone else's application, where a speaker label has
+    // nowhere to go.
+    let factory: Arc<dyn DiarizerFactory> = Arc::new(ScriptedFactory(vec![Some(1), Some(1), Some(1)]));
+    let url = spawn_server(4, Some(factory)).await;
+    let mut ws = connect(&url, Some(TOKEN)).await.unwrap();
+
+    ws.send(text(&ClientMessage::SessionStart {
+        mode: Mode::Live,
+        sample_rate: 16000,
+        encoding: Encoding::PcmS16le,
+        language: None,
+        vocabulary: None,
+        diarize: true,
+    }))
+    .await
+    .unwrap();
+
+    match next_msg(&mut ws).await.unwrap() {
+        ServerMessage::SessionReady { diarize, .. } => {
+            assert!(!diarize, "live mode must never be granted labels")
+        }
+        other => panic!("expected session.ready, got {other:?}"),
+    }
+
+    for _ in 0..3 {
+        ws.send(one_chunk()).await.unwrap();
+    }
+    ws.send(text(&ClientMessage::SessionStop)).await.unwrap();
+
+    let mut commits = Vec::new();
+    while let Some(m) = next_msg(&mut ws).await {
+        match m {
+            ServerMessage::TranscriptCommit { text, speaker, .. } => commits.push((text, speaker)),
+            ServerMessage::SessionClosed { .. } => break,
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        commits,
+        vec![
+            ("alpha ".into(), None),
+            ("beta ".into(), None),
+            ("gamma ".into(), None),
+        ]
+    );
 }

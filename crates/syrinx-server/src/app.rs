@@ -5,13 +5,18 @@
 
 use crate::asr::lifecycle::ModelHandle;
 use crate::config::Config;
+use crate::diarize::DiarizerFactory;
 use crate::ws::{AppState, stream_handler};
 use axum::Router;
 use axum::routing::get;
 use std::sync::Arc;
 
-pub fn build_router(model: Arc<ModelHandle>, config: Arc<Config>) -> Router {
-    let state = AppState::new(model, config);
+pub fn build_router(
+    model: Arc<ModelHandle>,
+    config: Arc<Config>,
+    diarize: Option<Arc<dyn DiarizerFactory>>,
+) -> Router {
+    let state = AppState::new(model, config, diarize);
     Router::new()
         .route("/v1/stream", get(stream_handler))
         .route("/health", get(|| async { "ok" }))
