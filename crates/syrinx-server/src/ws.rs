@@ -132,6 +132,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             session_id: session_id.clone(),
             chunk_ms: backend.chunk_ms(),
             model: backend.model_name().to_string(),
+            // Always false for now; wiring this to a real diarizer is Task 7.
+            diarize: false,
         }))
         .await;
 

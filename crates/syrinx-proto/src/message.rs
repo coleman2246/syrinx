@@ -37,6 +37,11 @@ pub enum ServerMessage {
         session_id: String,
         chunk_ms: u32,
         model: String,
+        /// Whether this session will attach speaker labels. The client can ask
+        /// and still not receive -- missing models, or a mode without a
+        /// transcript -- and the honest answer belongs in the handshake.
+        #[serde(default, skip_serializing_if = "is_false")]
+        diarize: bool,
     },
 
     /// Final text. Never revised. The only transcript message live mode emits.
@@ -173,6 +178,34 @@ mod tests {
         };
         let s = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&s).unwrap(), m);
+    }
+
+    #[test]
+    fn unknown_field_on_a_known_variant_is_ignored() {
+        // Forward compatibility: a future client field this server does not
+        // know about yet must not break parsing.
+        let s = r#"{"type":"session.start","mode":"live","sample_rate":16000,"encoding":"pcm_s16le","future_field":true}"#;
+        assert!(serde_json::from_str::<ClientMessage>(s).is_ok());
+    }
+
+    #[test]
+    fn session_ready_without_diarize_parses_as_false() {
+        // A new client against an old server must not choke on the handshake.
+        let s = r#"{"type":"session.ready","session_id":"x","chunk_ms":560,"model":"m"}"#;
+        let m: ServerMessage = serde_json::from_str(s).unwrap();
+        let ServerMessage::SessionReady { diarize, .. } = m else { panic!() };
+        assert!(!diarize);
+    }
+
+    #[test]
+    fn session_ready_reports_diarize_when_on() {
+        let m = ServerMessage::SessionReady {
+            session_id: "x".into(),
+            chunk_ms: 560,
+            model: "m".into(),
+            diarize: true,
+        };
+        assert!(serde_json::to_string(&m).unwrap().contains("\"diarize\":true"));
     }
 
     #[test]
