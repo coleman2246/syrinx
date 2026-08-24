@@ -89,9 +89,10 @@ pub struct SessionOptions {
     /// independent streams the caller runs a session per source.
     pub sources: Vec<Source>,
     pub mode: OutputMode,
-    /// Ask the server for anonymous speaker labels. Only takes effect in a
-    /// mode that keeps a transcript; see the `session.start` construction in
-    /// `run` for why a typing mode never sends this on.
+    /// Ask the server for anonymous speaker labels. Only takes effect when
+    /// the mode's wire mode is `Transcript` -- `Both` keeps a transcript too,
+    /// but types at the cursor and so runs the wire live and never requests
+    /// labels; see the `session.start` construction in `run`.
     pub diarize: bool,
     /// Label applied to this session's segments, for separate mode.
     pub label: Option<String>,

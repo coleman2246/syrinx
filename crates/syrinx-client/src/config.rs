@@ -852,6 +852,7 @@ mod tests {
         let back: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
         assert_eq!(back.source_key, c.source_key);
         assert_eq!(back.mode, c.mode);
+        assert_eq!(back.diarize, c.diarize);
         assert_eq!(back.waybar_signal, c.waybar_signal);
     }
 }

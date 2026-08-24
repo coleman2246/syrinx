@@ -89,8 +89,8 @@ pub unsafe extern "C" fn syrinx_start(
             // backends are all desktop ones.
             mode: OutputMode::Transcribe,
             // The keyboard extension has no config file and no UI to expose
-            // this, and iOS gets no diarization models. A future host app
-            // wanting labels wires its own toggle through this crate.
+            // this. A future host app wanting labels wires its own toggle
+            // through this crate.
             diarize: false,
             label: None,
             inject: Default::default(),

@@ -809,6 +809,10 @@ fn merge_states(states: &[crate::session::SessionState]) -> crate::session::Sess
             .unwrap_or_default(),
         model: states.iter().find_map(|s| s.model.clone()),
         chunk_ms: states.iter().find_map(|s| s.chunk_ms),
+        // Any session that got labels is enough to say so; separate mode
+        // runs one session per source and only the non-typing ones request
+        // diarization, so an all-false merge would wrongly blame the server.
+        diarize: states.iter().any(|s| s.diarize),
         error: states.iter().find_map(|s| s.error.clone()),
         // Levels come from the first source; a merged spectrum would say less
         // than one real one.
