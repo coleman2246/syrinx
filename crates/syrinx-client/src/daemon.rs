@@ -307,8 +307,10 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         snap.hotkey = hotkey_report.clone();
         snap.stream_to = state.opts.config.stream_to.clone();
         snap.format = state.opts.format;
-        *published.lock().expect("published state poisoned") = snap.clone();
 
+        // Built from `snap` before it moves into `published`, so a whole
+        // extra `DaemonState` clone -- segments included -- is not paid every
+        // 25 ms just to hand the tray three small fields.
         if let Some(h) = &tray_handle {
             h.update(TrayState {
                 status: snap.status,
@@ -316,6 +318,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                 last_fragment: snap.last_fragment.clone(),
             });
         }
+        *published.lock().expect("published state poisoned") = snap;
 
         // 25 ms rather than 100: the loop publishes the state a 30 Hz meter
         // reads, and doing almost nothing forty times a second is cheap.
@@ -472,6 +475,13 @@ impl DaemonRuntime {
         );
         out.source_keys = self.opts.source_keys.clone();
         out.source_mode = self.opts.source_mode;
+        // What this daemon actually asked the server for, mirroring the same
+        // check `session::run` makes when it builds `session.start` -- so the
+        // viewer judges the honest-handshake notice against the request that
+        // was really sent, not a second, possibly-stale read of the config.
+        let wire_mode = self.opts.mode.wire_mode();
+        out.diarize_requested =
+            self.opts.config.diarize && wire_mode == syrinx_proto::Mode::Transcript;
 
         // A file job owns the status while it runs, so a viewer shows progress
         // rather than an idle window with nothing happening.
@@ -480,6 +490,8 @@ impl DaemonRuntime {
             if !j.done {
                 out.status = crate::session::Status::Transcribing;
                 out.progress = j.progress;
+                // Bulk transcription never requests labels (see bulk.rs).
+                out.diarize_requested = false;
             }
         }
         // Preview levels apply only when idle; a running session meters the

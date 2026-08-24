@@ -744,16 +744,20 @@ impl App {
             });
     }
 
-    /// Whether to say the server did not honour a diarization request: asked
-    /// for by config, on a session whose wire mode actually requests labels,
-    /// yet the handshake granted none. `Both` types at the cursor and so runs
-    /// the wire live -- it never asks -- so it must not trigger this, which is
-    /// why this checks `wire_mode()` rather than `keeps_transcript()`.
+    /// Whether to say the server did not honour a diarization request.
+    ///
+    /// Judged against `state.diarize_requested`, which the daemon stamps from
+    /// what it actually sent -- not a GUI-side read of the config file, which
+    /// is a second process reading a file the daemon may have read a moment
+    /// earlier or later, and can disagree with it. `Listening` is the only
+    /// status where the handshake has demonstrably already answered:
+    /// `Connecting` precedes it entirely (every cold start would flash the
+    /// notice for the whole model-load window), and `Transcribing` belongs to
+    /// a bulk file job, which never requests labels in the first place.
     fn labels_unavailable(&self) -> bool {
-        self.config.diarize
-            && self.state.mode.wire_mode() == syrinx_proto::Mode::Transcript
+        self.state.diarize_requested
             && !self.state.diarize
-            && self.state.status.is_active()
+            && self.state.status == Status::Listening
     }
 
     /// Keys handled by this window.

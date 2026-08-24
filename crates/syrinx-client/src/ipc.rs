@@ -95,6 +95,14 @@ pub struct DaemonState {
     /// What the handshake actually granted; see `SessionState::diarize`.
     #[serde(default)]
     pub diarize: bool,
+    /// Whether the daemon actually asked for labels on the session behind
+    /// this state. Set by the daemon from the config and mode it built the
+    /// session with -- not derived here from `SessionState`, and not to be
+    /// re-derived by a viewer from its own config read, which is a second
+    /// process reading a file the daemon may have read a moment earlier or
+    /// later. False for a bulk file job, which never requests labels.
+    #[serde(default)]
+    pub diarize_requested: bool,
     pub error: Option<String>,
     /// Stable key of the first source, kept for viewers that show only one.
     pub source_key: Option<String>,
@@ -136,6 +144,9 @@ impl DaemonState {
             model: s.model.clone(),
             chunk_ms: s.chunk_ms,
             diarize: s.diarize,
+            // Not derivable from a `SessionState`; the daemon stamps the real
+            // value on afterward, from what it built the session with.
+            diarize_requested: false,
             error: s.error.clone(),
             source_key,
             source_keys: Vec::new(),
