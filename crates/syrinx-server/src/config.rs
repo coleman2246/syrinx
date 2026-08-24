@@ -166,10 +166,20 @@ mod tests {
         // pressure. They belong in a file that can be reviewed, not in an
         // environment nobody can see.
         let mut c = base();
-        let before = (c.max_sessions, c.vram_floor_mib, c.idle_unload_secs);
+        let before = (
+            c.max_sessions,
+            c.vram_floor_mib,
+            c.idle_unload_secs,
+            c.diarize_model_dir.clone(),
+        );
         c.apply_env(|_| Some("999".into()));
         assert_eq!(
-            (c.max_sessions, c.vram_floor_mib, c.idle_unload_secs),
+            (
+                c.max_sessions,
+                c.vram_floor_mib,
+                c.idle_unload_secs,
+                c.diarize_model_dir.clone(),
+            ),
             before
         );
     }
