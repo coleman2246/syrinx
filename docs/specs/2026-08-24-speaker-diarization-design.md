@@ -309,8 +309,9 @@ Recordings, all AMI `Mix-Headset` at 16 kHz mono (corpus CC-BY-4.0):
 | EN2001a | 87 min | 5 | the long-run stability test |
 
 Embeddings depend only on (model, recording, window, hop), never on the
-clustering thresholds, so the binary caches them to disk. A 1920-configuration
+clustering thresholds, so the binary caches them to disk. A 2640-configuration
 sweep over `T_assign` × `T_retire` × `MIN_POOL` × window × model × recording
+(1920 originally; the `T_assign` grid was later widened through 0.70)
 therefore costs seconds, and every number below is sweep output rather than a
 hand-picked run.
 
