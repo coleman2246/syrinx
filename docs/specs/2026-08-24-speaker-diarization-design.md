@@ -87,8 +87,12 @@ session: dictation working matters more than labels.
 
 **`session.ready`** gains `diarize: bool`, reporting what the session will
 actually do — the client can ask and still not receive, and the honest
-answer belongs in the handshake. The GUI shows "speaker labels unavailable"
-instead of silently producing an unlabeled transcript.
+answer belongs in the handshake. Also `#[serde(default)]`, so a new client
+parses an old server's handshake as `diarize: false`. The GUI shows
+"speaker labels unavailable" instead of silently producing an unlabeled
+transcript. Note that the GUI's "both" output mode runs the wire in live
+mode, so its transcript never carries labels — that is the mode working as
+designed, not a bug for the GUI plan to fix.
 
 **`transcript.commit` and `transcript.provisional`** gain
 `speaker: Option<u32>` with `skip_serializing_if = "Option::is_none"` — the
@@ -121,10 +125,21 @@ consumer appears), behind a trait:
 ```rust
 pub trait Diarizer: Send {
     /// Feed audio, aligned with the ASR chunk stream.
-    /// Returns the speaker label for this stretch, if one can be assigned.
-    fn push(&mut self, audio: &[f32]) -> Option<u32>;
+    /// Ok(None) means "no confident label" (silence, cross-talk) and is
+    /// normal; Err means the diarizer itself failed. The distinction is
+    /// load-bearing: the session counts consecutive errors to decide when
+    /// to drop the diarizer, and must not count honest uncertainty.
+    fn push(&mut self, audio: &[f32]) -> Result<Option<u32>>;
 }
 ```
+
+Dependency note: `ort` is today only a transitive dependency via
+`parakeet-rs`, which is optional behind the `cuda` feature — default and CI
+builds contain no `ort`. The real diarizer therefore takes a **direct `ort`
+dependency, version-aligned with parakeet-rs's pin** (rc-series versions do
+not unify across majors), behind its own cargo feature. The clustering
+logic and `MockDiarizer` are pure Rust with no `ort` and stay
+unconditional, so CI keeps testing them in the default, CUDA-free build.
 
 **Stage 1 — VAD.** Silero-VAD (ONNX, ~2 MB, via `ort`) classifies ~30 ms
 frames as speech or not. Only voiced audio flows downstream: embedding
@@ -161,10 +176,14 @@ deliberately asymmetric rules — this is where label stability lives:
 label is the majority speaker across embedding windows overlapping that
 range. Alignment subtlety: the diarizer needs ~1.5 s of voice before it can
 speak, while the ASR emits after 560 ms — so the session holds a lag buffer
-of one chunk (~560 ms) between ASR output and emission so the label has
-caught up by commit time. Transcribe-mode latency goes from ~0.6 s to
-~1.2 s, imperceptible in a meeting transcript. Live mode has no diarizer
-and keeps its latency.
+between ASR output and emission so the label has caught up by commit time.
+The lag depth is a tunable alongside the window length, not a fixed
+constant: one chunk (~560 ms) does not strictly cover a window that
+overlaps a chunk's tail, and the spike decides where the latency/coverage
+trade-off lands (likely one or two chunks; `None`-on-uncertainty covers
+whatever the buffer does not). Transcribe-mode latency grows by the buffer
+depth — from ~0.6 s to ~1.2–1.8 s, imperceptible in a meeting transcript.
+Live mode has no diarizer and keeps its latency.
 
 **Out of scope:** overlapping speech. Two simultaneous voices arrive mixed
 into one waveform; the dominant voice wins the window and the other is
@@ -202,8 +221,19 @@ A speaker change starts a new paragraph; unlabeled commits attach to the
 current paragraph without breaking it (they are usually short connective
 fragments). **Save as…** and `stream_to` write the same shape —
 `Speaker 2: text` per turn — since the streamed file is what the LLM
-consumes. The `timestamped` format composes: timestamp, then speaker, then
-text.
+consumes.
+
+Composition with the existing formats, when labels are present:
+
+- **plain** — a `Speaker 2: ` prefix where a turn starts, prose otherwise.
+  Without labels the format is byte-identical to today.
+- **timestamped** — timestamp, then speaker, then text:
+  `[12:04] Speaker 2: ...`
+- **labelled** — time, source, then speaker: `[12:04] [teams] Speaker 2: ...`.
+  Speaker numbering is **per-session**: with `SourceMode::Separate`, each
+  source's session mints its own independent Speaker 1..N, and the source
+  label is what distinguishes them. (For meetings this hardly matters —
+  diarization is aimed at a single mixed capture.)
 
 ## Testing
 
