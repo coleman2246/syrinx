@@ -482,6 +482,11 @@ behind it. Double-clicking `target\release\syrinx-gui.exe` starts the daemon
 if none is running, opens the window, and leaves the daemon running when the
 window is closed.
 
+The icon is compiled into `syrinx-gui.exe` as a resource, so the file and any
+pin made from it are recognisable in Explorer before the program has ever run.
+`crates/syrinx-gui/assets/` holds the source SVG and the commands to re-render
+it.
+
 The daemon is spawned with `DETACHED_PROCESS`, so it has no console of its own
 and closing the terminal you launched from cannot reach it. Running
 `syrinx daemon` directly in a terminal is the ordinary foreground case and does
