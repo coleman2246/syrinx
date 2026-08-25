@@ -24,9 +24,27 @@ parakeet-rs = { version = "0.3", features = ["cuda", "load-dynamic"], optional =
 # Used to dlopen cuDNN with RTLD_GLOBAL; see asr::parakeet::preload_cudnn.
 libc = { version = "0.2", optional = true }
 
+# The VAD and speaker-embedding backend, same optionality reasoning as
+# parakeet-rs above. Pinned to exactly the rc parakeet-rs itself pins (see
+# Cargo.lock): rc-series `ort` versions do not unify across majors, so this
+# has to be the same one or `cargo tree -i ort` would show two. No feature
+# list: there is no `cpu` feature (CPU execution is ort's built-in default),
+# and stripping default features would drop `download-binaries`, which is
+# what lets a diarize-only build fetch its own onnxruntime rather than
+# needing one hand-installed. Let cargo's feature unification with
+# parakeet-rs's own `ort` spec settle the link strategy when `cuda` and
+# `diarize` are both on.
+ort = { version = "2.0.0-rc.13", optional = true }
+# Hand-rolled Kaldi-compatible fbank (real::fbank) needs an FFT; rustfft is
+# also what parakeet-rs pulls in transitively (as realfft's dependency), so
+# this does not add a second FFT implementation to the tree.
+rustfft = { version = "6", optional = true }
+
 [features]
 default = []
 cuda = ["dep:parakeet-rs", "dep:libc"]
+# cuda stays as-is; the two are independent.
+diarize = ["dep:ort", "dep:rustfft"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.30"

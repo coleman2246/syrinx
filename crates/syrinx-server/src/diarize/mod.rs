@@ -6,6 +6,11 @@
 
 pub mod cluster;
 
+/// The real ONNX-backed VAD and embedding wrappers. Optional so the default
+/// build needs no `ort`, mirroring `asr::parakeet`'s `cuda` gate.
+#[cfg(feature = "diarize")]
+pub mod real;
+
 use anyhow::Result;
 
 /// One session's speaker-attribution state.
