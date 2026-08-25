@@ -133,7 +133,11 @@ fn windows(samples: &[f32], voiced: &[bool], window_s: f32, hop_s: f32) -> Resul
     let mut acc: VecDeque<usize> = VecDeque::new();
     let mut last = None;
 
-    for (i, &v) in voiced.iter().enumerate() {
+    // Clamped rather than trusted: the voiced flags come from their own cache
+    // file, so a `.vad` written for a longer recording that once had this
+    // name would otherwise index off the end of `samples` and panic.
+    let frames = voiced.len().min(samples.len() / FRAME);
+    for (i, &v) in voiced[..frames].iter().enumerate() {
         if !v {
             continue;
         }
@@ -186,15 +190,22 @@ fn agrees_with_the_shipped_assembler(
     voiced: &[bool],
     mine: &[Window],
 ) -> Result<()> {
-    /// 8960 samples, an ASR chunk, is 17.5 frames.
-    const CHUNK_FRAMES: usize = 17;
+    /// An ASR chunk is 8960 samples, which is 17.5 frames -- so a session
+    /// hands the assembler 17 frames and then 18, not 17 every time. Feeding a
+    /// constant 17 would leave the assembler's handling of an odd chunk
+    /// boundary untested by the very check that exists to test it.
+    const CHUNK_FRAMES: [usize; 2] = [17, 18];
 
     let mut assembler = WindowAssembler::default();
     let frames = voiced.len().min(samples.len() / FRAME);
     let mut matched = 0usize;
 
-    for first_frame in (0..frames).step_by(CHUNK_FRAMES) {
-        let n = CHUNK_FRAMES.min(frames - first_frame);
+    let mut first_frame = 0;
+    for chunk in (0..).map(|i| CHUNK_FRAMES[i % 2]) {
+        if first_frame >= frames {
+            break;
+        }
+        let n = chunk.min(frames - first_frame);
         let framed = Framed {
             first_frame,
             samples: samples[first_frame * FRAME..(first_frame + n) * FRAME].to_vec(),
@@ -216,6 +227,7 @@ fn agrees_with_the_shipped_assembler(
             );
             matched += 1;
         }
+        first_frame += n;
     }
     ensure!(
         matched == mine.len(),
@@ -281,7 +293,10 @@ impl Embeddings {
 
     fn store(&self, path: &str) -> Result<()> {
         let tmp = format!("{path}.partial");
-        let mut f = std::fs::File::create(&tmp)?;
+        // Buffered: the loops below write four bytes at a time, and a 192-dim
+        // embedding for an 87-minute meeting is over three million of those
+        // calls.
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         f.write_all(b"DZEM")?;
         f.write_all(&(self.dim as u32).to_le_bytes())?;
         f.write_all(&(self.len() as u32).to_le_bytes())?;
@@ -292,7 +307,12 @@ impl Embeddings {
         for v in &self.vectors {
             f.write_all(&v.to_le_bytes())?;
         }
-        drop(f);
+        // Not `drop`: dropping a `BufWriter` discards the error from its final
+        // flush, which is the one that would report a full disk -- and the
+        // rename below would then publish a truncated cache as a good one.
+        f.into_inner()
+            .map_err(|e| anyhow::anyhow!("{tmp}: {}", e.error()))?
+            .sync_all()?;
         Ok(std::fs::rename(&tmp, path)?)
     }
 }
@@ -312,11 +332,38 @@ impl Embeddings {
 /// what the version number exists not to have to do.
 const PIPELINE_VERSION: u32 = 3;
 
+/// A short digest of a file's canonical path, so that two recordings sharing a
+/// basename cannot share a cache entry.
+///
+/// Without it `/a/mix.wav` and `/b/mix.wav` key to the same files and the
+/// second silently reads the first's embeddings -- a wrong number that looks
+/// like a clean run, which is the one failure this harness must not have. The
+/// basename stays in the key as well, because a cache directory full of
+/// nothing but hashes is impossible to read.
+///
+/// FNV-1a: no dependency, and the cost of a collision here is a stale cache
+/// rather than a wrong answer, since a collision also has to survive matching
+/// basenames. Falls back to the path as written when it cannot be
+/// canonicalised, which only happens for a file that is about to fail to open
+/// anyway.
+fn path_key(path: &str) -> String {
+    let canonical = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canonical.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn cache_path(wav: &str, model: &str, window_s: f32, hop_s: f32) -> String {
     format!(
-        "{}/cache/{}.{}.w{:.0}h{:.0}.v{PIPELINE_VERSION}.emb",
+        "{}/cache/{}-{}.{}.w{:.0}h{:.0}.v{PIPELINE_VERSION}.emb",
         probe_dir(),
         stem(wav),
+        path_key(wav),
         stem(model),
         window_s * 1000.0,
         hop_s * 1000.0
@@ -326,8 +373,12 @@ fn cache_path(wav: &str, model: &str, window_s: f32, hop_s: f32) -> String {
 /// Voiced-frame flags depend only on the wav and the VAD, so they outlive
 /// every sweep but not a change to `real::vad`.
 fn voiced_frames(wav: &str) -> Result<Vec<bool>> {
-    let name = basename(wav);
-    let path = format!("{}/cache/{name}.v{PIPELINE_VERSION}.vad", probe_dir());
+    let path = format!(
+        "{}/cache/{}-{}.v{PIPELINE_VERSION}.vad",
+        probe_dir(),
+        basename(wav),
+        path_key(wav)
+    );
     if let Ok(bytes) = std::fs::read(&path) {
         return Ok(bytes.iter().map(|&b| b != 0).collect());
     }
@@ -357,16 +408,26 @@ fn voiced_frames(wav: &str) -> Result<Vec<bool>> {
 /// makes a 2640-configuration sweep cost seconds instead of an afternoon.
 fn embeddings(wav: &str, model: &str, window_s: f32, hop_s: f32) -> Result<Embeddings> {
     let path = cache_path(wav, model, window_s, hop_s);
-    if let Ok(cached) = Embeddings::load(&path) {
-        // Before the early return, not after it. A cached file was written by
-        // whatever `window.rs` said on the day it was written, so a cache hit
-        // that skipped this check would leave harness-and-server agreement
-        // resting on somebody remembering to bump `PIPELINE_VERSION` -- the
-        // by-hand step that constant exists to remove. Since a warm cache is
-        // the normal case, skipping it here would mean the check almost never
-        // ran.
-        recheck_shipped_windowing(wav, window_s, hop_s)?;
-        return Ok(cached);
+    match Embeddings::load(&path) {
+        Ok(cached) => {
+            // Before the early return, not after it. A cached file was written
+            // by whatever `window.rs` said on the day it was written, so a
+            // cache hit that skipped this check would leave harness-and-server
+            // agreement resting on somebody remembering to bump
+            // `PIPELINE_VERSION` -- the by-hand step that constant exists to
+            // remove. Since a warm cache is the normal case, skipping it here
+            // would mean the check almost never ran.
+            recheck_shipped_windowing(wav, window_s, hop_s, &cached)?;
+            return Ok(cached);
+        }
+        // A cache file that exists but will not load is worth a word. Silence
+        // here reads as a slow first run, and the re-embed that follows writes
+        // a fresh file, so a cache that is corrupt every time looks like a
+        // machine that is merely slow.
+        Err(e) if std::fs::exists(&path).unwrap_or(false) => {
+            eprintln!("  cache: {path} exists but did not load ({e}); re-embedding");
+        }
+        Err(_) => {}
     }
 
     let voiced = voiced_frames(wav)?;
@@ -403,25 +464,60 @@ fn embeddings(wav: &str, model: &str, window_s: f32, hop_s: f32) -> Result<Embed
     Ok(out)
 }
 
-/// Rebuild the windows for a run that took its embeddings from cache, purely
-/// so [`windows`] can check them against the shipped assembler again.
+/// Rebuild the windows for a run that took its embeddings from cache, and
+/// check them twice: against the shipped assembler, and against the cached
+/// file itself.
+///
+/// The second check is what the rebuilt windows are *for*. Comparing their
+/// times to the ones in the cache detects a cache written by an older
+/// [`windows`] -- which is half of what [`PIPELINE_VERSION`] is asking a human
+/// to remember, now done by the machine. Exact float equality is right here:
+/// both sides compute the time the same way from the same frame indices and
+/// the cache round-trips them as raw little-endian `f32`, so any difference at
+/// all means the windowing moved.
 ///
 /// Cheap enough to do unconditionally: the voiced flags are separately cached,
 /// and the windowing itself is arithmetic over them. The wav read is the only
 /// real cost, and it buys the guarantee that no run of this harness reports a
-/// number without having first re-confirmed that its windower still matches
-/// the server's.
+/// number without having first re-confirmed both.
 ///
 /// Silent at any other geometry, because `WindowAssembler` implements only the
 /// shipped one: the sweep's 1.0 s and 2.0 s windows have no counterpart in the
 /// tree to disagree with.
-fn recheck_shipped_windowing(wav: &str, window_s: f32, hop_s: f32) -> Result<()> {
+fn recheck_shipped_windowing(
+    wav: &str,
+    window_s: f32,
+    hop_s: f32,
+    cached: &Embeddings,
+) -> Result<()> {
     if window_s != PRODUCTION_WINDOW_S || hop_s != PRODUCTION_HOP_S {
         return Ok(());
     }
     let voiced = voiced_frames(wav)?;
     let samples = reference::read_wav(wav)?;
-    windows(&samples, &voiced, window_s, hop_s)?;
+    let rebuilt = windows(&samples, &voiced, window_s, hop_s)?;
+
+    ensure!(
+        rebuilt.len() == cached.len(),
+        "{wav}: the cache holds {} windows but the windower now produces {}; \
+         the cache predates a change to the pipeline and PIPELINE_VERSION was \
+         not bumped. Delete {}/cache and re-run.",
+        cached.len(),
+        rebuilt.len(),
+        probe_dir()
+    );
+    for (i, (window, &(t0, t1))) in rebuilt.iter().zip(&cached.times).enumerate() {
+        ensure!(
+            window.t0 == t0 && window.t1 == t1,
+            "{wav}: cached window {i} covers {t0:.2}-{t1:.2}s but the windower \
+             now puts it at {:.2}-{:.2}s; the cache predates a change to the \
+             pipeline and PIPELINE_VERSION was not bumped. Delete {}/cache and \
+             re-run.",
+            window.t0,
+            window.t1,
+            probe_dir()
+        );
+    }
     Ok(())
 }
 
@@ -562,20 +658,177 @@ fn model_path(name: &str) -> String {
 
 // --------------------------------------------------------------------- args
 
-struct Args(Vec<String>);
+/// One flag: its name, whether a value follows it, and what it does.
+type Flag = (&'static str, bool, &'static str);
+
+/// What a subcommand accepts. The flag list is the single source for three
+/// things that otherwise drift apart: `--help`, the check that rejects an
+/// unknown flag, and the reader's idea of what can be varied.
+struct Spec {
+    name: &'static str,
+    what: &'static str,
+    operand: &'static str,
+    flags: &'static [Flag],
+}
+
+impl Spec {
+    fn help(&self) -> String {
+        let invocation = match self.operand {
+            "" => self.name.to_string(),
+            operand => format!("{} {operand}", self.name),
+        };
+        let mut out = format!("diarize_probe {invocation} -- {}\n", self.what);
+        for (flag, takes_value, what) in self.flags {
+            let shown = if *takes_value {
+                format!("{flag} <value>")
+            } else {
+                flag.to_string()
+            };
+            out.push_str(&format!("  {shown:<20} {what}\n"));
+        }
+        out
+    }
+}
+
+/// The four clustering thresholds, shared by every subcommand that clusters.
+const T_ASSIGN_FLAG: Flag = ("--t-assign", true, "cosine to join a centroid");
+const T_RETIRE_FLAG: Flag = (
+    "--t-retire",
+    true,
+    "cosine at which one centroid retires into another",
+);
+const ALPHA_FLAG: Flag = ("--alpha", true, "how far one window moves a centroid");
+const MIN_POOL_FLAG: Flag = (
+    "--min-pool",
+    true,
+    "agreeing orphans before a new speaker is minted",
+);
+const WINDOW_FLAG: Flag = ("--window", true, "window length in seconds");
+const HOP_FLAG: Flag = ("--hop", true, "hop in seconds; 0 means half the window");
+const MODEL_FLAG: Flag = ("--model", true, "embedding model filename, or a path");
+const WAV_FLAG: Flag = ("--wav", true, "recording filename, or a path");
+
+const RUN: Spec = Spec {
+    name: "run",
+    what: "label one meeting with one configuration, and score it",
+    operand: "<wav>",
+    flags: &[
+        MODEL_FLAG,
+        WAV_FLAG,
+        WINDOW_FLAG,
+        HOP_FLAG,
+        T_ASSIGN_FLAG,
+        T_RETIRE_FLAG,
+        ALPHA_FLAG,
+        MIN_POOL_FLAG,
+        ("--quiet", false, "suppress the per-segment listing"),
+    ],
+};
+const VERIFY: Spec = Spec {
+    name: "verify",
+    what: "check the fbank front end against known same/different pairs",
+    operand: "",
+    flags: &[("--model", true, "comma-separated models to check")],
+};
+const SEPARABILITY: Spec = Spec {
+    name: "separability",
+    what: "how far apart two voices are before any clustering",
+    operand: "",
+    flags: &[
+        ("--model", true, "comma-separated models"),
+        ("--wav", true, "comma-separated recordings"),
+        WINDOW_FLAG,
+        HOP_FLAG,
+    ],
+};
+const SWEEP: Spec = Spec {
+    name: "sweep",
+    what: "score every configuration in a grid, one row each",
+    operand: "",
+    flags: &[
+        ("--model", true, "comma-separated models"),
+        ("--wav", true, "comma-separated recordings"),
+        ("--windows", true, "comma-separated window lengths"),
+        ("--pools", true, "comma-separated MIN_POOL values"),
+        ("--assigns", true, "comma-separated T_assign values"),
+        ("--retires", true, "comma-separated T_retire values"),
+        ("--alphas", true, "comma-separated EMA alphas"),
+    ],
+};
+const BENCH: Spec = Spec {
+    name: "bench",
+    what: "what one session costs on one core",
+    operand: "[wav]",
+    flags: &[
+        ("--model", true, "comma-separated models"),
+        WAV_FLAG,
+        WINDOW_FLAG,
+        HOP_FLAG,
+        ("--runs", true, "windows to average over"),
+    ],
+};
+const LAG: Spec = Spec {
+    name: "lag",
+    what: "how long a chunk waits for a label to exist",
+    operand: "",
+    flags: &[
+        MODEL_FLAG,
+        ("--wav", true, "comma-separated recordings"),
+        WINDOW_FLAG,
+        HOP_FLAG,
+        ("--chunk", true, "ASR chunk length in seconds"),
+    ],
+};
+
+struct Args {
+    argv: Vec<String>,
+    positionals: Vec<String>,
+    spec: &'static Spec,
+}
 
 impl Args {
+    /// Parse and validate against the subcommand's spec.
+    ///
+    /// An unrecognised flag is fatal. The reasoning is [`Args::num`]'s applied
+    /// to the flag name rather than its value: `--t-asign 0.6` would otherwise
+    /// be ignored in silence and the run would report the shipped threshold's
+    /// numbers under a heading claiming 0.6, which is exactly the kind of
+    /// wrong-but-plausible output this harness exists to keep out of the
+    /// design doc.
+    fn new(argv: &[String], spec: &'static Spec) -> Result<Self> {
+        let mut positionals = Vec::new();
+        let mut i = 0;
+        while i < argv.len() {
+            let arg = &argv[i];
+            // A negative number is a value, not a flag, and `-0.5` would
+            // otherwise be rejected as one.
+            let is_flag = arg.starts_with('-')
+                && !arg[1..].starts_with(|c: char| c.is_ascii_digit() || c == '.');
+            if !is_flag {
+                positionals.push(arg.clone());
+                i += 1;
+                continue;
+            }
+            let known = spec.flags.iter().find(|(f, _, _)| f == arg);
+            let Some((_, takes_value, _)) = known else {
+                bail!("unknown flag {arg}\n\n{}", spec.help());
+            };
+            i += if *takes_value { 2 } else { 1 };
+        }
+        Ok(Self {
+            argv: argv.to_vec(),
+            positionals,
+            spec,
+        })
+    }
+
     fn get(&self, name: &str) -> Option<&str> {
-        let i = self.0.iter().position(|a| a == name)?;
-        self.0.get(i + 1).map(|s| s.as_str())
+        let i = self.argv.iter().position(|a| a == name)?;
+        self.argv.get(i + 1).map(|s| s.as_str())
     }
     /// The subcommand's own argument, when it is not a flag: `run meeting.wav`.
-    /// Every flag starts with `--`, so a leading bare word is unambiguous.
     fn positional(&self) -> Option<&str> {
-        self.0
-            .first()
-            .filter(|a| !a.starts_with('-'))
-            .map(String::as_str)
+        self.positionals.first().map(String::as_str)
     }
     /// A value that will not parse is fatal, never a silent fall back to the
     /// default. This harness exists to attribute numbers to constants, so
@@ -610,7 +863,7 @@ impl Args {
             .collect()
     }
     fn has(&self, name: &str) -> bool {
-        self.0.iter().any(|a| a == name)
+        self.argv.iter().any(|a| a == name)
     }
     /// The four clustering thresholds, each defaulting to the shipped
     /// constant. Overriding one leaves the other three at what the server
@@ -635,22 +888,49 @@ impl Args {
 
 // --------------------------------------------------------------------- main
 
-const USAGE: &str = "usage: diarize_probe <run|verify|separability|sweep|bench|lag> [args]";
+/// A subcommand: what it accepts, and the function that runs it.
+type Subcommand = (&'static Spec, fn(&Args) -> Result<()>);
+
+const SPECS: &[Subcommand] = &[
+    (&RUN, run),
+    (&VERIFY, verify),
+    (&SEPARABILITY, separability),
+    (&SWEEP, sweep),
+    (&BENCH, bench),
+    (&LAG, lag),
+];
+
+fn usage() -> String {
+    let mut out = String::from("usage: diarize_probe <subcommand> [flags]\n\n");
+    for (spec, _) in SPECS {
+        out.push_str(&format!("  {:<14} {}\n", spec.name, spec.what));
+    }
+    out.push_str("\nAdd --help to any subcommand for its flags.\n");
+    out
+}
 
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (cmd, rest) = argv.split_first().context(USAGE)?;
-    let args = Args(rest.to_vec());
-
-    match cmd.as_str() {
-        "run" => run(&args),
-        "verify" => verify(&args),
-        "separability" => separability(&args),
-        "sweep" => sweep(&args),
-        "bench" => bench(&args),
-        "lag" => lag(&args),
-        _ => bail!("unknown command {cmd}\n{USAGE}"),
+    let Some((cmd, rest)) = argv.split_first() else {
+        print!("{}", usage());
+        return Ok(());
+    };
+    if cmd == "-h" || cmd == "--help" {
+        print!("{}", usage());
+        return Ok(());
     }
+
+    let Some((spec, handler)) = SPECS.iter().find(|(s, _)| s.name == cmd) else {
+        bail!("unknown command {cmd}\n\n{}", usage());
+    };
+    // Checked before the arguments are parsed, and before anything is loaded:
+    // `sweep --help` used to run the sweep, which is minutes of work in answer
+    // to a question about flags.
+    if rest.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{}", spec.help());
+        return Ok(());
+    }
+    handler(&Args::new(rest, spec)?)
 }
 
 /// Label one meeting with one configuration, and say how well it went.
@@ -664,7 +944,7 @@ fn run(args: &Args) -> Result<()> {
         "audio",
         args.positional()
             .or_else(|| args.get("--wav"))
-            .context("usage: run <wav> [--model M] [--window S] [--quiet]")?,
+            .with_context(|| args.spec.help())?,
     );
     let model = model_path(args.get("--model").unwrap_or(CHOSEN));
     let (window_s, hop_s) = args.geometry()?;
@@ -846,6 +1126,20 @@ fn separability(args: &Args) -> Result<()> {
             }
             same.sort_by(f32::total_cmp);
             diff.sort_by(f32::total_cmp);
+            // A recording whose reference never marks two clean windows of one
+            // speaker, or never two of different speakers, produces no pairs
+            // and no measurement. Said plainly here, because the percentile
+            // below would otherwise underflow its way to a panic and blame the
+            // arithmetic rather than the input.
+            ensure!(
+                !same.is_empty() && !diff.is_empty(),
+                "{}: {} same-speaker and {} different-speaker pairs among {} \
+                 single-speaker windows -- too few to measure separability",
+                meeting_of(&wav),
+                same.len(),
+                diff.len(),
+                tagged.len()
+            );
             let pct = |v: &Vec<f32>, p: f32| v[((v.len() - 1) as f32 * p) as usize];
 
             println!(
@@ -864,7 +1158,7 @@ fn separability(args: &Args) -> Result<()> {
                 pct(&diff, 0.5),
                 pct(&diff, 0.9),
             );
-            let (threshold, wrong) = best_split(&same, &diff);
+            let (threshold, wrong) = best_split(&same, &diff)?;
             println!(
                 "  best split at {threshold:.2} -> {:.1}% of pairs wrong",
                 100.0 * wrong
@@ -876,7 +1170,18 @@ fn separability(args: &Args) -> Result<()> {
 
 /// The threshold minimising total pair errors, and the error rate there.
 /// Both inputs must be sorted ascending.
-fn best_split(same: &[f32], diff: &[f32]) -> (f32, f32) {
+///
+/// Empty inputs are an error rather than a division by zero: the rates below
+/// would come out `NaN`, every comparison against the running best would be
+/// false, and the function would return its `(0.0, 1.0)` seed -- a plausible
+/// looking "best split at 0.00" that means nothing happened.
+fn best_split(same: &[f32], diff: &[f32]) -> Result<(f32, f32)> {
+    ensure!(
+        !same.is_empty() && !diff.is_empty(),
+        "best_split needs both distributions; got {} same and {} different",
+        same.len(),
+        diff.len()
+    );
     let mut best = (0.0, 1.0);
     let mut t = 0.0;
     while t <= 1.0 {
@@ -889,7 +1194,7 @@ fn best_split(same: &[f32], diff: &[f32]) -> (f32, f32) {
         }
         t += 0.01;
     }
-    best
+    Ok(best)
 }
 
 /// Every configuration in the grid, one row each, cheap because the
@@ -1082,6 +1387,13 @@ fn lag(args: &Args) -> Result<()> {
             }
         }
         delays.sort_by(f32::total_cmp);
+        // No speech chunk ever had a window finish over it: nothing to report,
+        // and the percentile below would underflow rather than say so.
+        ensure!(
+            !delays.is_empty(),
+            "{}: no speech chunk was ever covered by a finished window",
+            meeting_of(&wav)
+        );
         let pct = |p: f32| delays[((delays.len() - 1) as f32 * p) as usize];
         println!(
             "{:<10} {} speech chunks: delay p50 {:.2}s p90 {:.2}s p99 {:.2}s \

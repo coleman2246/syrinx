@@ -19,12 +19,26 @@ IPA ?= $(HOME)/Downloads/SyrinxDemo.ipa
 .PHONY: test lint build-cuda serve dictate probe check ios ios-framework
 
 ## Run the full suite. No GPU needed -- the mock backend covers the protocol.
+##
+## The second line is the diarizer's own tests. They need no models and take
+## well under a second, but they are behind the feature, so a plain `cargo
+## test` runs 66 of syrinx-server's tests and skips 20 -- everything covering
+## the VAD and embedding wrappers and the model-resolution rules.
 test:
 	cargo test
+	cargo test --features diarize --lib
 
+## Clippy over every feature combination that ships. The last two exist
+## because `examples/diarize_probe` is `required-features = ["diarize"]`, so
+## without them cargo skips it entirely and nothing in this repo ever
+## type-checks the harness: changing `OnlineClusterer::with_params` or
+## deleting one of its diagnostics would leave `make lint` and `make test`
+## both green and the probe broken.
 lint:
 	cargo clippy --all-targets -- -D warnings
 	cargo clippy --all-targets --features cuda -- -D warnings
+	cargo clippy --all-targets --features diarize -- -D warnings
+	cargo clippy --all-targets --features cuda,diarize -- -D warnings
 
 ## Build the server WITH GPU support. Do this before `serve`.
 build-cuda:
