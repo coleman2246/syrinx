@@ -97,10 +97,20 @@ impl Vad {
     /// `self`, so calling this repeatedly with successive chunks of one
     /// stream is equivalent to calling it once with the whole stream
     /// concatenated -- in particular, a turn that starts in one chunk and
-    /// continues into the next is not treated as two turns.
+    /// continues into the next is not treated as two turns. Following from
+    /// that: the returned `Vec<bool>` indexes the concatenated stream, not
+    /// `samples` -- after a call that left a remainder, `voiced[0]` on the
+    /// *next* call describes a frame that began before that call's own
+    /// `samples` did.
+    ///
+    /// If a frame's inference fails partway through a call, whatever frames
+    /// had not yet been decoded are dropped rather than retried on the next
+    /// call -- defensible, since `state` and `context` are already threaded
+    /// per frame and a mid-call failure leaves them synchronised only up to
+    /// the point of failure anyway, so there is no clean buffer left to
+    /// resume from. The caller sees the `Err` and moves on with fresh audio.
     pub fn run(&mut self, samples: &[f32]) -> Result<Vec<bool>> {
-        let mut buf = std::mem::take(&mut self.remainder);
-        buf.extend_from_slice(samples);
+        let buf = take_frames(&mut self.remainder, samples);
 
         let frames = buf.len() / FRAME;
         let mut voiced = Vec::with_capacity(frames);
@@ -108,8 +118,6 @@ impl Vad {
             let p = self.prob(&buf[f * FRAME..(f + 1) * FRAME])?;
             voiced.push(self.gate.step(p));
         }
-
-        self.remainder = buf.split_off(frames * FRAME);
         Ok(voiced)
     }
 }
@@ -128,6 +136,21 @@ fn with_context(context: &[f32], frame: &[f32]) -> Vec<f32> {
     let mut buf = Vec::with_capacity(CONTEXT + frame.len());
     buf.extend_from_slice(context);
     buf.extend_from_slice(frame);
+    buf
+}
+
+/// Combine `remainder` with `samples`, split off as many complete
+/// `FRAME`-sized frames as the combined length allows, and leave whatever
+/// is left over in `remainder` for the next call. Pulled out of
+/// [`Vad::run`] as a free function -- the third application of the
+/// `with_context` pattern -- so the framing arithmetic that dropped a
+/// chunk's trailing partial frame before this module hoisted `remainder`
+/// onto `Vad` is unit-testable without a session.
+fn take_frames(remainder: &mut Vec<f32>, samples: &[f32]) -> Vec<f32> {
+    let mut buf = std::mem::take(remainder);
+    buf.extend_from_slice(samples);
+    let frames = buf.len() / FRAME;
+    *remainder = buf.split_off(frames * FRAME);
     buf
 }
 
@@ -195,6 +218,39 @@ mod tests {
         let next_context = &buf[buf.len() - CONTEXT..];
 
         assert_eq!(next_context, &frame[FRAME - CONTEXT..]);
+    }
+
+    // --------------------------------------------------------- take_frames
+
+    /// Pins the bug this module used to have: an 8960-sample ASR chunk
+    /// (`asr::parakeet::CHUNK_SAMPLES`) is 17.5 frames, and the trailing
+    /// 256-sample half-frame must be carried into the next call rather than
+    /// silently dropped -- and the next call's first frame must actually
+    /// open with those carried samples, not just have the right length.
+    #[test]
+    fn a_chunk_and_a_half_carries_its_tail_into_the_next_calls_first_frame() {
+        let mut remainder = Vec::new();
+        let chunk: Vec<f32> = (0..8960).map(|i| i as f32).collect();
+
+        let framed = take_frames(&mut remainder, &chunk);
+        assert_eq!(framed.len(), 17 * FRAME, "8960 samples is 17.5 frames");
+        assert_eq!(remainder.len(), 256, "the trailing half-frame is carried");
+        assert_eq!(remainder, chunk[17 * FRAME..]);
+        let carried = remainder.clone();
+
+        // Just enough new samples (512 - 256) to complete exactly one more
+        // frame out of the carried tail.
+        let next_chunk = vec![-1.0; FRAME - 256];
+        let next_framed = take_frames(&mut remainder, &next_chunk);
+
+        assert_eq!(next_framed.len(), FRAME);
+        assert_eq!(
+            &next_framed[..256],
+            carried.as_slice(),
+            "the next call's first frame must open with the carried samples"
+        );
+        assert_eq!(&next_framed[256..], next_chunk.as_slice());
+        assert!(remainder.is_empty(), "the frame completed exactly");
     }
 
     // -------------------------------------------------------------- Gate
