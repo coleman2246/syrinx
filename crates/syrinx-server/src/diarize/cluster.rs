@@ -606,13 +606,13 @@ mod tests {
     }
 
     #[test]
-    fn the_swept_constructor_at_the_constants_is_the_shipped_one() {
-        // What the probe's sweep rests on: the cell at the calibrated
-        // constants has to be the configuration the server actually runs, or
-        // every number in the design doc's tables belongs to some other
-        // clusterer. Delegation makes that true by construction; this pins it,
-        // because the failure mode is a later edit reading a const directly in
-        // one method and the field in another.
+    fn new_does_not_drift_from_the_calibrated_constants() {
+        // Narrow on purpose, and worth being clear about what it does not
+        // prove: `new` delegates to `with_params`, so this can only fail if a
+        // later edit stops it delegating and passes something other than the
+        // constants. It says nothing about whether `with_params` reads the
+        // arguments it is handed -- the four tests below are what cover that,
+        // and they are the ones the sweep actually rests on.
         let (_, second, between) = converging_pair();
 
         // One script through all four constants: pooling and minting
@@ -644,6 +644,134 @@ mod tests {
         for expected in [None, Some(1), Some(2), Some(3)] {
             assert!(labels.contains(&expected), "{expected:?} never came up");
         }
+    }
+
+    // ---------------------------------------------- the swept parameters
+    //
+    // One test per parameter, each holding the other three at the shipped
+    // constant and asserting that the swept value behaves *differently* from
+    // `new()` on a script built so that this parameter alone decides the
+    // outcome. Equality against `new()` cannot show this: `new` delegates, so
+    // a `with_params` that accepted an argument and then ignored it would
+    // satisfy every equality test in this file while silently pinning the
+    // probe's 2640-cell sweep to a single configuration. These are the tests
+    // that would fail if that happened, and the reason the sweep's axes can be
+    // believed at all.
+
+    /// The labels a fresh clusterer emits for a script, and the live centroids
+    /// it is left holding.
+    fn observe_all(mut c: OnlineClusterer, script: &[Vec<f32>]) -> (Vec<Option<u32>>, Vec<u32>) {
+        let labels = script.iter().map(|e| c.observe(e)).collect();
+        (labels, c.live_labels())
+    }
+
+    #[test]
+    fn a_smaller_min_pool_mints_on_less_evidence() {
+        // Two agreeing orphans: enough to mint at a pool of 2, not at 4.
+        let script = vec![noisy(0, 0), noisy(0, 1)];
+        assert!(
+            similarity(&script[0], &script[1]) >= T_ASSIGN,
+            "the two windows must agree, or neither pool would mint"
+        );
+
+        let (shipped, _) = observe_all(OnlineClusterer::new(), &script);
+        let (swept, _) = observe_all(
+            OnlineClusterer::with_params(T_ASSIGN, T_RETIRE, EMA_ALPHA, 2),
+            &script,
+        );
+        assert_eq!(shipped, vec![None, None], "MIN_POOL 4 wants four windows");
+        assert_eq!(swept, vec![None, Some(1)], "a pool of 2 should have minted");
+    }
+
+    #[test]
+    fn a_higher_t_assign_refuses_an_assignment_the_shipped_one_takes() {
+        // Four identical windows mint under any threshold, so both clusterers
+        // reach the same centroid and only the fifth window is in question.
+        let mut script = vec![voice(0); MIN_POOL];
+        script.push(noisy(0, 99));
+
+        let near = similarity(&noisy(0, 99), &voice(0));
+        assert!(
+            (T_ASSIGN..0.99).contains(&near),
+            "the probe window sits at {near}, which has to be between the \
+             shipped threshold and the swept one for this to discriminate"
+        );
+
+        let (shipped, _) = observe_all(OnlineClusterer::new(), &script);
+        let (swept, _) = observe_all(
+            OnlineClusterer::with_params(0.99, T_RETIRE, EMA_ALPHA, MIN_POOL),
+            &script,
+        );
+        assert_eq!(shipped.last(), Some(&Some(1)), "0.45 should have assigned");
+        assert_eq!(swept.last(), Some(&None), "0.99 should have refused");
+    }
+
+    #[test]
+    fn a_larger_alpha_drags_the_centroid_further() {
+        // Mint on speaker 0, assign one window two-thirds of the way towards
+        // speaker 1, then ask whether speaker 1 is now close enough to join.
+        // At 0.05 the centroid barely moved and is not; at 1.0 it jumped the
+        // whole way and is.
+        let between = embedding(&[(0, 0.6), (1, 0.8)]);
+        assert!(
+            similarity(&between, &voice(0)) >= T_ASSIGN,
+            "the dragging window has to be assignable in the first place"
+        );
+        let mut script = vec![voice(0); MIN_POOL];
+        script.push(between);
+        script.push(voice(1));
+
+        let (shipped, _) = observe_all(OnlineClusterer::new(), &script);
+        let (swept, _) = observe_all(
+            OnlineClusterer::with_params(T_ASSIGN, T_RETIRE, 1.0, MIN_POOL),
+            &script,
+        );
+        assert_eq!(
+            shipped.last(),
+            Some(&None),
+            "alpha 0.05 should have left speaker 1 out of reach"
+        );
+        assert_eq!(
+            swept.last(),
+            Some(&Some(1)),
+            "alpha 1.0 should have moved the centroid onto the new window"
+        );
+    }
+
+    #[test]
+    fn a_lower_t_retire_folds_two_centroids_the_shipped_one_keeps() {
+        // Two speakers 0.4 apart: far enough to mint separately (below
+        // T_ASSIGN), close enough that a retire threshold of 0.35 calls them
+        // duplicates while the shipped 0.80 does not. The last window assigns
+        // rather than mints, which is what runs the convergence check.
+        let (_, second, _) = converging_pair();
+        let apart = similarity(&voice(0), &second);
+        assert!(
+            (0.35..T_ASSIGN).contains(&apart),
+            "the two speakers sit at {apart}, which has to fall between the \
+             swept retire threshold and T_ASSIGN"
+        );
+
+        let mut script = vec![voice(0); MIN_POOL];
+        script.extend(std::iter::repeat_n(second, MIN_POOL));
+        script.push(voice(0));
+
+        let (shipped, shipped_live) = observe_all(OnlineClusterer::new(), &script);
+        let (swept, swept_live) = observe_all(
+            OnlineClusterer::with_params(T_ASSIGN, 0.35, EMA_ALPHA, MIN_POOL),
+            &script,
+        );
+        assert_eq!(
+            shipped_live,
+            vec![1, 2],
+            "0.80 should have kept both speakers"
+        );
+        assert_eq!(swept_live, vec![1], "0.35 should have retired the newer");
+        // Both still answer the final window with speaker 1 -- the difference
+        // is only visible in what survives, which is why this asserts on the
+        // live centroids and not on the labels alone.
+        assert_eq!(shipped.last(), Some(&Some(1)));
+        assert_eq!(swept.last(), Some(&Some(1)));
     }
 
     #[test]

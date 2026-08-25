@@ -176,7 +176,9 @@ fn windows(samples: &[f32], voiced: &[bool], window_s: f32, hop_s: f32) -> Resul
 ///
 /// This is the check that keeps the numbers below attributable to the server:
 /// the harness carries its own windower, so nothing but this would notice the
-/// day one of them changed. Fed one ASR chunk's worth of frames at a time,
+/// day one of them changed. It runs on every run at the shipped geometry,
+/// warm cache included -- see [`recheck_shipped_windowing`] for why that
+/// matters. Fed one ASR chunk's worth of frames at a time,
 /// which is the shape the assembler actually runs in, and compared window by
 /// window so neither side has to be held in memory whole.
 fn agrees_with_the_shipped_assembler(
@@ -356,6 +358,14 @@ fn voiced_frames(wav: &str) -> Result<Vec<bool>> {
 fn embeddings(wav: &str, model: &str, window_s: f32, hop_s: f32) -> Result<Embeddings> {
     let path = cache_path(wav, model, window_s, hop_s);
     if let Ok(cached) = Embeddings::load(&path) {
+        // Before the early return, not after it. A cached file was written by
+        // whatever `window.rs` said on the day it was written, so a cache hit
+        // that skipped this check would leave harness-and-server agreement
+        // resting on somebody remembering to bump `PIPELINE_VERSION` -- the
+        // by-hand step that constant exists to remove. Since a warm cache is
+        // the normal case, skipping it here would mean the check almost never
+        // ran.
+        recheck_shipped_windowing(wav, window_s, hop_s)?;
         return Ok(cached);
     }
 
@@ -391,6 +401,28 @@ fn embeddings(wav: &str, model: &str, window_s: f32, hop_s: f32) -> Result<Embed
     std::fs::create_dir_all(format!("{}/cache", probe_dir()))?;
     out.store(&path)?;
     Ok(out)
+}
+
+/// Rebuild the windows for a run that took its embeddings from cache, purely
+/// so [`windows`] can check them against the shipped assembler again.
+///
+/// Cheap enough to do unconditionally: the voiced flags are separately cached,
+/// and the windowing itself is arithmetic over them. The wav read is the only
+/// real cost, and it buys the guarantee that no run of this harness reports a
+/// number without having first re-confirmed that its windower still matches
+/// the server's.
+///
+/// Silent at any other geometry, because `WindowAssembler` implements only the
+/// shipped one: the sweep's 1.0 s and 2.0 s windows have no counterpart in the
+/// tree to disagree with.
+fn recheck_shipped_windowing(wav: &str, window_s: f32, hop_s: f32) -> Result<()> {
+    if window_s != PRODUCTION_WINDOW_S || hop_s != PRODUCTION_HOP_S {
+        return Ok(());
+    }
+    let voiced = voiced_frames(wav)?;
+    let samples = reference::read_wav(wav)?;
+    windows(&samples, &voiced, window_s, hop_s)?;
+    Ok(())
 }
 
 /// An embedder for a model named on the command line, normalised the way the
@@ -494,11 +526,14 @@ fn basename(path: &str) -> &str {
 
 /// A filename without its directory or its extension, for cache keys and
 /// table columns.
+///
+/// The no-extension fallback is the basename, not `path`: falling back to the
+/// whole path would put slashes in a cache key, and [`cache_path`] would then
+/// write through them into a directory that does not exist, or -- worse, if it
+/// happens to -- into a file belonging to another recording.
 fn stem(path: &str) -> String {
-    basename(path)
-        .rsplit_once('.')
-        .map_or(path, |(s, _)| s)
-        .to_string()
+    let name = basename(path);
+    name.rsplit_once('.').map_or(name, |(s, _)| s).to_string()
 }
 
 /// The AMI meeting a recording belongs to: `ES2002a.Mix-Headset.wav` and
