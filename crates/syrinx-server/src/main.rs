@@ -6,6 +6,9 @@ use syrinx_server::asr::AsrBackend;
 use syrinx_server::asr::lifecycle::{ModelHandle, NvidiaSmiProbe, VramGuard, VramProbe};
 use syrinx_server::asr::mock::MockBackend;
 use syrinx_server::config::{Config, Provider};
+use syrinx_server::diarize::DiarizerFactory;
+#[cfg(feature = "diarize")]
+use syrinx_server::diarize::real::RealDiarizerFactory;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
@@ -56,6 +59,45 @@ fn build_loader(
             }
         }
     })
+}
+
+/// Load the diarization models, or explain in the log why speaker labels will
+/// not be available.
+///
+/// Never fatal, by design: a dictation server that will not boot over an
+/// optional feature's model file is the wrong trade (spec, "Error handling").
+/// Every path that returns `None` says so at `error!`, because the confusing
+/// state is a feature that was configured and then quietly did nothing --
+/// `session.ready` will answer `diarize: false` and the client will render the
+/// transcript unlabelled, with nothing anywhere to say why.
+#[cfg(feature = "diarize")]
+fn build_diarizer(config: &Config) -> Option<Arc<dyn DiarizerFactory>> {
+    let dir = config.diarize_model_dir.as_ref()?;
+    match RealDiarizerFactory::load(std::path::Path::new(dir)) {
+        Ok(factory) => Some(Arc::new(factory) as Arc<dyn DiarizerFactory>),
+        Err(e) => {
+            tracing::error!("speaker labelling disabled: {e:#}");
+            None
+        }
+    }
+}
+
+/// The same decision in a binary built without the feature: there is nothing
+/// to load, and the only thing worth doing is saying so when the configuration
+/// expected otherwise. Cargo writes both builds to the same path, so a plain
+/// `cargo build` replacing a diarize-capable binary is a real way to arrive
+/// here.
+#[cfg(not(feature = "diarize"))]
+fn build_diarizer(config: &Config) -> Option<Arc<dyn DiarizerFactory>> {
+    if config.diarize_model_dir.is_some() {
+        tracing::error!(
+            "diarize_model_dir is set, but this binary was built without the `diarize` \
+             cargo feature, so speaker labelling is not compiled in and every session \
+             will be answered diarize: false. Rebuild with:\n  \
+             ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so cargo build -p syrinx-server --features diarize"
+        );
+    }
+    None
 }
 
 /// Ask the running service whether it is listening.
@@ -161,9 +203,10 @@ async fn main() -> Result<()> {
 
     tokio::spawn(model.clone().run_idle_reaper(REAPER_TICK));
 
-    // No diarization factory yet: Phase 2 loads one from `diarize_model_dir`
-    // when the feature and the config agree it should exist.
-    let app = build_router(model, config.clone(), None);
+    // Diarization models load here rather than on first session: they are
+    // small, they are checked at load, and a startup that has already proved
+    // the feature works is what lets `session.ready` promise it honestly.
+    let app = build_router(model, config.clone(), build_diarizer(&config));
     let listener = tokio::net::TcpListener::bind(&config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;

@@ -39,8 +39,17 @@ pub struct Config {
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
 
-    /// Directory holding the diarization models (silero-vad + speaker
-    /// embedding). Absent = speaker labels unavailable, feature off.
+    /// Directory holding the diarization models. Absent = speaker labels
+    /// unavailable, feature off.
+    ///
+    /// Two files are expected in it: `silero_vad.onnx` (v5) and
+    /// `3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx`, both from the
+    /// sherpa-onnx model zoo. Another embedding model is accepted if its
+    /// filename identifies its family -- `wespeaker`, `3dspeaker`/`eres2net`,
+    /// `nemo`/`titanet` -- because feature normalisation is a property of the
+    /// training recipe that the ONNX file does not record. Anything else, or
+    /// more than one candidate, turns the feature off with an error in the log
+    /// rather than guessing.
     #[serde(default)]
     pub diarize_model_dir: Option<String>,
 }

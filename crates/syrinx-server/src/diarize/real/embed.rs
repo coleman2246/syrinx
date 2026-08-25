@@ -122,7 +122,7 @@ impl Embedder {
         self.dim
     }
 
-    /// Embed a single window. The common case for `RealDiarizer` (Task 13),
+    /// Embed a single window. The common case for [`super::RealDiarizer`],
     /// where one `push` completes at most one voiced window; a thin wrapper
     /// over [`Embedder::embed_batch`] with a batch of one.
     pub fn embed(&mut self, window: &[f32]) -> Result<Vec<f32>> {

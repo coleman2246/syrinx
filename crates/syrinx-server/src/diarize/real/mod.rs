@@ -3,21 +3,28 @@
 //! Ported from `spike/diarize/src/{vad,fbank,embed}.rs`, which validated this
 //! pipeline end-to-end against speaker-verification pairs and AMI meetings.
 //! Gated behind the `diarize` feature so the default build stays free of
-//! `ort`. [`super::Diarizer`] is implemented on top of these two structs by
-//! `RealDiarizer` (Task 13); this module only owns the model sessions.
+//! `ort`. [`Diarizer`](crate::diarize::Diarizer) is implemented on top of
+//! these two structs by
+//! [`RealDiarizer`](crate::diarize::real::RealDiarizer), which owns the
+//! pipeline; `vad` and `embed` own only the model sessions, and the `session`
+//! helper below the one decision they share.
 //!
 //! The fbank front end these wrap lives one level up, at
-//! [`super::fbank`]: it is pure arithmetic with no `ort` in it, so it is
-//! not gated here and gets CI coverage in the default build too.
+//! [`fbank`](crate::diarize::fbank): it is pure arithmetic with no `ort` in
+//! it, so it is not gated here and gets CI coverage in the default build too.
 
+mod diarizer;
 mod embed;
 mod vad;
 
 /// Re-exported for convenience: callers of this module's `Embedder::new`
 /// need `Norm` without reaching past it into `diarize::fbank` themselves.
 pub use super::fbank::Norm;
+/// Silero's frame size, which lives with the windowing that counts in it.
+pub use super::window::FRAME;
+pub use diarizer::{RealDiarizer, RealDiarizerFactory};
 pub use embed::Embedder;
-pub use vad::{FRAME, Vad};
+pub use vad::Vad;
 
 use anyhow::{Context, Result};
 use ort::execution_providers::CPU;

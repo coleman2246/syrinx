@@ -156,6 +156,10 @@ impl OnlineClusterer {
     /// Whether every pooled window is within `T_ASSIGN` of every other. The
     /// pool holds evidence for *one* new speaker, so a single disagreeing
     /// pair means it is not yet that evidence.
+    ///
+    /// Every-pair comparison, which is fine at this size: the pool never
+    /// exceeds `MIN_POOL` (4) entries, since reaching it either mints,
+    /// clears, or evicts the oldest.
     fn pool_agrees(&self) -> bool {
         self.pool
             .iter()
@@ -185,6 +189,10 @@ impl OnlineClusterer {
     /// The first converged pair in mint order, as `(older, newer)` indices.
     /// Centroids are only ever appended, so a lower index is always the
     /// earlier speaker.
+    ///
+    /// Quadratic in the number of centroids, and deliberately: one session is
+    /// a handful of speakers in a room, so this is a few dozen dot products
+    /// on an assignment that already cost an embedding.
     fn converged_pair(&self) -> Option<(usize, usize)> {
         let live = |i: usize| self.centroids[i].retired_into.is_none();
         (0..self.centroids.len())

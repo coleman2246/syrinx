@@ -10,8 +10,10 @@ use anyhow::{Result, anyhow, ensure};
 use ort::{session::Session, value::Tensor};
 
 use super::session;
+// The frame size is shared with the windowing that counts in it, and lives
+// there so it needs no `ort` to be tested against.
+use crate::diarize::window::FRAME;
 
-pub const FRAME: usize = 512;
 const STATE: usize = 2 * 128;
 /// v5 does its own STFT inside the graph and expects the caller to prepend
 /// the tail of the previous frame, so the tensor it actually wants is 576
@@ -33,10 +35,10 @@ pub struct Vad {
     context: Vec<f32>,
     /// Samples carried over from the previous [`Vad::run`] call because they
     /// did not fill a whole 512-sample frame -- the same idea as `context`,
-    /// just at the caller's boundary instead of silero's. `RealDiarizer`
-    /// (Task 13) calls `run` once per ASR chunk (8960 samples = 17.5
-    /// frames); without this, the trailing 256 samples of every single
-    /// chunk would be silently dropped instead of joining the next one.
+    /// just at the caller's boundary instead of silero's.
+    /// [`super::RealDiarizer`] calls `run` once per ASR chunk (8960 samples
+    /// = 17.5 frames); without this, the trailing 256 samples of every
+    /// single chunk would be silently dropped instead of joining the next.
     remainder: Vec<f32>,
     gate: Gate,
 }
