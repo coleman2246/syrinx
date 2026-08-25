@@ -115,8 +115,7 @@ fn ensure_daemon() -> Result<()> {
     // build rather than whatever is first on PATH.
     let cmd = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("syrinx")))
-        .filter(|p| p.exists())
+        .and_then(|p| p.parent().and_then(daemon_beside))
         .unwrap_or_else(|| PathBuf::from("syrinx"));
 
     tracing::info!("starting the syrinx daemon");
@@ -167,6 +166,20 @@ fn ensure_daemon() -> Result<()> {
         "the daemon did not start listening within 5s.\n{}",
         tail(&log_path)
     )
+}
+
+/// The daemon binary sitting next to this one, if it is there.
+///
+/// The extension is the whole point. This looked for a bare `syrinx`, which on
+/// Windows is never the sibling's name -- so the check above it failed every
+/// time and the launch fell through to `syrinx` on PATH, which is exactly the
+/// older install the comment there means to avoid. A fresh window driving a
+/// stale daemon looks like a bug in whatever the daemon does: it shows the
+/// state and the transcript, so only the parts it writes -- saved and streamed
+/// files -- come out of date.
+fn daemon_beside(dir: &std::path::Path) -> Option<PathBuf> {
+    let p = dir.join(format!("syrinx{}", std::env::consts::EXE_SUFFIX));
+    p.exists().then_some(p)
 }
 
 /// Cut the daemon loose from whatever started this window.
@@ -224,6 +237,34 @@ fn tail(path: &std::path::Path) -> String {
     lines[start..].join("\n")
 }
 
+/// The little round state indicator, painted rather than written.
+///
+/// It used to be `●` and `○` in a label, which renders as a missing-glyph box
+/// on Windows -- the fonts egui bundles do not reliably cover that block there,
+/// and it has no system fallback to reach for. A circle from the painter
+/// depends on no font at all, so it cannot fail that way on any machine.
+///
+/// Allocating the space rather than painting free-hand keeps it in the flow of
+/// the horizontal layout it sits in, so the label beside it stays vertically
+/// centred against it.
+fn state_dot(ui: &mut egui::Ui, colour: egui::Color32, filled: bool) {
+    // Matches the 18pt glyph it replaces closely enough that no row moved.
+    const SIZE: f32 = 12.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    if filled {
+        painter.circle_filled(rect.center(), SIZE / 2.0 - 1.0, colour);
+    } else {
+        // Hollow, as `○` was: idle should read as an indicator that is off,
+        // not as a second lit one in a duller colour.
+        painter.circle_stroke(
+            rect.center(),
+            SIZE / 2.0 - 1.5,
+            egui::Stroke::new(1.5, colour),
+        );
+    }
+}
+
 /// Render key/description pairs as an aligned two-column grid.
 fn keys_table(ui: &mut egui::Ui, id: &str, rows: &[(&str, &str)]) {
     egui::Grid::new(id)
@@ -279,6 +320,21 @@ mod ensure_daemon_tests {
         assert!(!out.contains("line 50"), "too much context: {out}");
         assert_eq!(out.lines().count(), 5);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_sibling_daemon_is_found_under_its_platform_name() {
+        // The bug this covers is invisible on Linux, where EXE_SUFFIX is
+        // empty: only on Windows did the old bare `syrinx` miss the sibling
+        // and send every launch to PATH instead.
+        let dir = scratch("beside");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(daemon_beside(&dir), None, "an empty directory has no daemon");
+
+        let exe = dir.join(format!("syrinx{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&exe, b"").unwrap();
+        assert_eq!(daemon_beside(&dir), Some(exe));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -499,14 +555,14 @@ impl App {
 
     fn status_row(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let (colour, dot) = match self.state.status {
-                Status::Listening => (theme::palette::RECORDING, "●"),
+            let (colour, filled) = match self.state.status {
+                Status::Listening => (theme::palette::RECORDING, true),
                 Status::Connecting | Status::Stopping | Status::Transcribing => {
-                    (theme::palette::WARNING, "●")
+                    (theme::palette::WARNING, true)
                 }
-                Status::Idle => (egui::Color32::GRAY, "○"),
+                Status::Idle => (egui::Color32::GRAY, false),
             };
-            ui.colored_label(colour, egui::RichText::new(dot).size(18.0));
+            state_dot(ui, colour, filled);
             ui.colored_label(
                 colour,
                 egui::RichText::new(self.state.status.label()).strong(),
@@ -615,10 +671,14 @@ impl App {
 
     fn mode_row(&mut self, ui: &mut egui::Ui, running: bool) {
         let mut chosen: Option<OutputMode> = None;
+        let mut labels: Option<bool> = None;
+        // The daemon's setting, never a copy kept here: it is the thing that
+        // reaches session.start, and two windows open at once must agree.
+        let mut diarize = self.state.diarize_configured;
         ui.horizontal(|ui| {
             ui.label("Mode:");
-            // Fixed at session start on the wire, so changing it needs a
-            // reconnect.
+            // Both of these are fixed at session start on the wire, so changing
+            // either needs a reconnect.
             ui.add_enabled_ui(!running, |ui| {
                 for m in OutputMode::ALL {
                     if ui
@@ -628,6 +688,18 @@ impl App {
                         chosen = Some(m);
                     }
                 }
+                if ui
+                    .checkbox(&mut diarize, "Speaker labels")
+                    .on_hover_text(if running {
+                        "Stop the session first"
+                    } else {
+                        "Ask the server for Speaker 1, Speaker 2… on transcribed \
+                         text. Typing at the cursor never gets labels."
+                    })
+                    .changed()
+                {
+                    labels = Some(diarize);
+                }
             });
         });
         if self.state.mode.types_at_cursor() {
@@ -635,6 +707,9 @@ impl App {
         }
         if let Some(mode) = chosen {
             self.send(Request::SetMode { mode });
+        }
+        if let Some(diarize) = labels {
+            self.send(Request::SetDiarize { diarize });
         }
     }
 
@@ -820,7 +895,7 @@ impl App {
                     } else {
                         theme::palette::WARNING
                     };
-                    ui.colored_label(colour, if report.is_active() { "●" } else { "○" });
+                    state_dot(ui, colour, report.is_active());
                     ui.label(report.summary());
                 });
                 if let Some(detail) = report.detail() {

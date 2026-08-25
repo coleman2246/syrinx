@@ -217,6 +217,10 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                     state.set_mode(mode);
                     Response::Ok
                 }
+                Request::SetDiarize { diarize } => {
+                    state.set_diarize(diarize);
+                    Response::Ok
+                }
                 Request::SetSource { key } => {
                     state.opts.source_keys = vec![key];
                     Response::Ok
@@ -475,6 +479,9 @@ impl DaemonRuntime {
         );
         out.source_keys = self.opts.source_keys.clone();
         out.source_mode = self.opts.source_mode;
+        // The setting, not the session's answer about it: a viewer's checkbox
+        // has to read what the next session would ask for.
+        out.diarize_configured = self.opts.config.diarize;
 
         // A file job owns the status while it runs, so a viewer shows progress
         // rather than an idle window with nothing happening.
@@ -731,6 +738,24 @@ impl DaemonRuntime {
         }
     }
 
+    /// Speaker labels are asked for in session.start on the wire too, so this
+    /// is `set_mode` exactly: ignored while running rather than applied to a
+    /// session that could only honour it by reconnecting.
+    ///
+    /// Written back to the config, unlike the mode. `diarize` reaches a session
+    /// from `opts.config`, and the whole point of this control is to spare
+    /// someone editing that file -- a checkbox whose effect died with the
+    /// daemon would send them straight back to it.
+    fn set_diarize(&mut self, on: bool) {
+        if self.running() {
+            return;
+        }
+        self.opts.config.diarize = on;
+        if let Err(e) = self.opts.config.save(&crate::Config::default_path()) {
+            warn!("saving the config: {e:#}");
+        }
+    }
+
     fn save(&self, format: save::Format, path: Option<&str>) -> Result<String> {
         let st = if self.sessions.is_empty() {
             self.last.clone()
@@ -841,4 +866,186 @@ fn merge_states(states: &[crate::session::SessionState]) -> crate::session::Sess
     out.transcript = crate::save::render(&segments, "", crate::save::Format::Labelled);
     out.segments = segments;
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{Segment, SessionState};
+
+    fn seg(at: f64, text: &str, speaker: Option<u32>, source: Option<&str>) -> Segment {
+        Segment {
+            at,
+            text: text.into(),
+            source: source.map(Into::into),
+            speaker,
+        }
+    }
+
+    fn config() -> Config {
+        Config {
+            url: "ws://127.0.0.1:8770/v1/stream".into(),
+            token: "t".into(),
+            source_key: None,
+            mode: OutputMode::Transcribe,
+            diarize: true,
+            inject: Default::default(),
+            stream_to: None,
+            format: save::Format::Plain,
+            hotkey: None,
+            waybar_signal: 8,
+        }
+    }
+
+    /// A daemon with nothing running, holding `last` -- the state a Save
+    /// reaches once a session has ended, which is when a transcript is
+    /// actually saved.
+    fn daemon_holding(last: SessionState) -> DaemonRuntime {
+        DaemonRuntime {
+            opts: DaemonOptions {
+                config: config(),
+                mode: OutputMode::Transcribe,
+                source_keys: Vec::new(),
+                source_mode: Default::default(),
+                save_each: false,
+                format: save::Format::Plain,
+                gui_command: None,
+            },
+            sessions: Vec::new(),
+            overlay: None,
+            preview: None,
+            last_viewer: None,
+            file_job: None,
+            last,
+        }
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("syrinx-daemon-{tag}-{}.txt", std::process::id()))
+    }
+
+    #[test]
+    fn saving_writes_the_labels_the_window_is_showing() {
+        // stream.rs and save.rs test their renderers directly; this is the
+        // daemon's own `save`, which is what a Save button actually reaches,
+        // and it is the step between them that was suspected of dropping the
+        // labels. Every format, because `Plain` prefixes turns by a different
+        // route than the two stamped ones.
+        let path = scratch("labels");
+        let d = daemon_holding(SessionState {
+            transcript: "we ship Thursday no we don't".into(),
+            segments: vec![
+                seg(0.0, "we ship Thursday", Some(1), None),
+                seg(2.0, "no we don't", Some(2), None),
+            ],
+            ..Default::default()
+        });
+
+        for format in save::Format::ALL {
+            let written = d.save(format, Some(&path.display().to_string())).unwrap();
+            assert_eq!(written, path.display().to_string());
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains("Speaker 1: we ship Thursday"),
+                "{format:?} lost the first label:\n{text}"
+            );
+            assert!(
+                text.contains("Speaker 2: no we don't"),
+                "{format:?} lost the second label:\n{text}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unlabelled_transcript_still_saves_as_it_always_did() {
+        // The other half of the same guarantee: nothing may start prefixing a
+        // recording that never had a speaker on it.
+        let path = scratch("unlabelled");
+        let d = daemon_holding(SessionState {
+            transcript: "just me talking".into(),
+            segments: vec![seg(0.0, "just me talking", None, None)],
+            ..Default::default()
+        });
+        d.save(save::Format::Plain, Some(&path.display().to_string()))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "just me talking\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn merging_sessions_keeps_every_speaker() {
+        // Separate mode's path into the same save. A merge that dropped
+        // `speaker` here would leave the GUI labelling from the live session
+        // while every file came out bare, which is exactly the report.
+        let merged = merge_states(&[
+            SessionState {
+                segments: vec![
+                    seg(0.0, "mic one", Some(1), Some("Mic")),
+                    seg(4.0, "mic two", Some(2), Some("Mic")),
+                ],
+                ..Default::default()
+            },
+            SessionState {
+                segments: vec![seg(2.0, "system", Some(1), Some("System"))],
+                ..Default::default()
+            },
+        ]);
+
+        let got: Vec<(&str, Option<u32>)> = merged
+            .segments
+            .iter()
+            .map(|s| (s.text.as_str(), s.speaker))
+            .collect();
+        assert_eq!(
+            got,
+            [("mic one", Some(1)), ("system", Some(1)), ("mic two", Some(2))],
+            "the merge must interleave by time and carry every speaker"
+        );
+    }
+
+    #[test]
+    fn a_merged_save_carries_the_prefixes_too() {
+        // `save` composes these two itself; a SessionHandle needs a live
+        // connection, so this is as close to the running daemon as a test
+        // reaches -- the composition is checked, the Vec<SessionHandle> that
+        // feeds it is not.
+        let path = scratch("merged");
+        let merged = merge_states(&[
+            SessionState {
+                segments: vec![seg(0.0, "we ship Thursday", Some(1), Some("Mic"))],
+                ..Default::default()
+            },
+            SessionState {
+                segments: vec![seg(2.0, "no we don't", Some(1), Some("System"))],
+                ..Default::default()
+            },
+        ]);
+        save::save_rendered(
+            Some(&path),
+            &merged.segments,
+            &merged.transcript,
+            save::Format::Labelled,
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[Mic] Speaker 1: we ship Thursday"), "{text}");
+        // Two sources' first speakers are two different people, so the second
+        // opens a turn of its own rather than joining the first.
+        assert!(text.contains("[System] Speaker 1: no we don't"), "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_viewer_is_told_what_the_next_session_would_ask_for() {
+        // The checkbox reads this. It is not `diarize` or `diarize_requested`:
+        // both are false with nothing running, and the setting is on.
+        let d = daemon_holding(SessionState::default());
+        let snap = d.snapshot();
+        assert!(snap.diarize_configured);
+        assert!(!snap.diarize);
+        assert!(!snap.diarize_requested);
+    }
 }

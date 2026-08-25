@@ -36,6 +36,9 @@ pub enum Request {
     Stop,
     Toggle,
     SetMode { mode: OutputMode },
+    /// Ask the server for speaker labels on the next session. Refused while
+    /// one is running, for the same reason as `SetMode`.
+    SetDiarize { diarize: bool },
     SetSource { key: String },
     /// Replace the whole selection, and optionally how they are combined.
     SetSources {
@@ -102,6 +105,13 @@ pub struct DaemonState {
     /// earlier or later.
     #[serde(default)]
     pub diarize_requested: bool,
+    /// What the daemon will ask for at the *next* session -- the setting
+    /// itself, which is neither of the two above: `diarize` is what a server
+    /// granted and `diarize_requested` is what one session sent, and both are
+    /// false while nothing is running. A control that has to show its own
+    /// state needs the setting, not either answer about a session.
+    #[serde(default)]
+    pub diarize_configured: bool,
     pub error: Option<String>,
     /// Stable key of the first source, kept for viewers that show only one.
     pub source_key: Option<String>,
@@ -144,6 +154,9 @@ impl DaemonState {
             chunk_ms: s.chunk_ms,
             diarize: s.diarize,
             diarize_requested: s.diarize_requested,
+            // Stamped by the daemon: a session knows what it asked for, not
+            // what the setting says now.
+            diarize_configured: false,
             error: s.error.clone(),
             source_key,
             source_keys: Vec::new(),
@@ -261,6 +274,7 @@ mod tests {
             Request::SetMode {
                 mode: OutputMode::Both,
             },
+            Request::SetDiarize { diarize: true },
             Request::Save {
                 format: Format::Timestamped,
                 path: Some("/tmp/x.txt".into()),
