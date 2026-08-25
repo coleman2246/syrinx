@@ -1,4 +1,5 @@
-//! Silero-VAD v5 over fixed 512-sample (32 ms) frames.
+//! Silero-VAD over fixed 512-sample (32 ms) frames. The shipped weights are
+//! v6.2; the interface described below arrived in v5 and is unchanged since.
 //!
 //! v5 carries a single `state` tensor between calls instead of v4's separate
 //! `h`/`c` pair, and it only accepts 512-sample frames at 16 kHz -- feeding it

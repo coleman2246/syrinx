@@ -42,7 +42,8 @@ pub struct Config {
     /// Directory holding the diarization models. Absent = speaker labels
     /// unavailable, feature off.
     ///
-    /// Two files are expected in it: `silero_vad.onnx` (v5) and
+    /// Two files are expected in it: `silero_vad.onnx` (v6.2; the v5-era
+    /// 512+64-sample interface, unchanged since) and
     /// `3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx`, both from the
     /// sherpa-onnx model zoo. Another embedding model is accepted if its
     /// filename identifies its family -- `wespeaker`, `3dspeaker`/`eres2net`,

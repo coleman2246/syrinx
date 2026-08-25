@@ -110,7 +110,7 @@ existing `language`/`vocabulary` pattern. Semantics:
 
 ```toml
 # absent = diarization unavailable, feature off
-diarize_model_dir = "~/models/diarize"   # silero-vad + embedding ONNX
+diarize_model_dir = "/home/you/models/diarize"   # silero-vad + embedding ONNX; no tilde expansion
 ```
 
 Same deployment story as the ASR model: not in the repository, not in the
@@ -372,7 +372,11 @@ alongside it.
 192-dim), from the sherpa-onnx model zoo:
 `https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx`
 (the release tag really is spelled `recongition`). Apache-2.0, from the
-3D-Speaker project. VAD is `silero_vad.onnx` v5 (2.2 MB, MIT).
+3D-Speaker project. VAD is `silero_vad.onnx` v6.2.1 (2.2 MB, MIT) —
+originally recorded here as "v5", but the spike fetched from silero's
+`master`, which carried v6.2 weights by then; the hash matches the v6.2.1
+tag, so that is what every number in this section was measured with. The
+512+64-sample interface is unchanged since v5.
 
 | Constant | Value | Why this value |
 |---|---|---|
