@@ -22,8 +22,10 @@ FROM rust:1.88-bookworm AS build
 
 WORKDIR /src
 
-# Manifests first, so the dependency build is cached until they change. Every
-# member needs a placeholder source file or cargo refuses to plan the build.
+# Manifests first, so the dependency build is cached until they change. EVERY
+# workspace member has to appear here, with a placeholder source file, even the
+# ones this image never builds: cargo loads the whole workspace before it plans
+# anything, and one missing member's Cargo.toml fails the build outright.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/syrinx-proto/Cargo.toml crates/syrinx-proto/
 COPY crates/syrinx-audio/Cargo.toml crates/syrinx-audio/
@@ -31,24 +33,28 @@ COPY crates/syrinx-client/Cargo.toml crates/syrinx-client/
 COPY crates/syrinx-server/Cargo.toml crates/syrinx-server/
 COPY crates/syrinx-cli/Cargo.toml crates/syrinx-cli/
 COPY crates/syrinx-gui/Cargo.toml crates/syrinx-gui/
+COPY crates/syrinx-ios/Cargo.toml crates/syrinx-ios/
 RUN mkdir -p crates/syrinx-proto/src crates/syrinx-audio/src crates/syrinx-client/src \
              crates/syrinx-server/src crates/syrinx-cli/src crates/syrinx-gui/src \
+             crates/syrinx-ios/src \
  && touch crates/syrinx-proto/src/lib.rs crates/syrinx-audio/src/lib.rs \
-          crates/syrinx-client/src/lib.rs \
+          crates/syrinx-client/src/lib.rs crates/syrinx-ios/src/lib.rs \
  && echo 'fn main() {}' > crates/syrinx-server/src/main.rs \
  && echo 'fn main() {}' > crates/syrinx-cli/src/main.rs \
  && echo 'fn main() {}' > crates/syrinx-gui/src/main.rs \
  && cargo build --release -p syrinx-server --features cuda,diarize \
  && rm -rf crates
 
-# Now the real sources. Only syrinx-server and what it depends on: the GUI
-# needs a windowing stack this image has no reason to carry.
+# Now the real sources. Every member again, for the reason above; only
+# syrinx-server is built, since the GUI needs a windowing stack this image has
+# no reason to carry and syrinx-ios only links for iOS.
 COPY crates/syrinx-proto crates/syrinx-proto
 COPY crates/syrinx-server crates/syrinx-server
 COPY crates/syrinx-audio crates/syrinx-audio
 COPY crates/syrinx-client crates/syrinx-client
 COPY crates/syrinx-cli crates/syrinx-cli
 COPY crates/syrinx-gui crates/syrinx-gui
+COPY crates/syrinx-ios crates/syrinx-ios
 # Touch so cargo does not trust the placeholder timestamps.
 RUN touch crates/*/src/lib.rs crates/*/src/main.rs 2>/dev/null; \
     cargo build --release -p syrinx-server --features cuda,diarize
