@@ -899,8 +899,9 @@ git commit -am "Load the diarizer at startup and hand one to each session"
 - Delete: `spike/` (its code now lives in the tree; its report lives in the spec)
 
 - [ ] **Step 1: Port the spike's main.rs** into the example: `cargo run -p syrinx-server --features diarize --example diarize_probe -- meeting.wav` prints `[t0–t1] Speaker N: <transcript-less segments>`. This is the calibration and regression tool for every future threshold change.
-- [ ] **Step 2: Verify against the AMI files** — output matches the spike report's quality.
-- [ ] **Step 3: Commit**
+- [ ] **Step 2: Keep the sweep reproducible.** Deleting `spike/` must not make the 2640-configuration sweep that produced the spec's numbers unreproducible. Port the spike's sweep mode (`--sweep`, the grid flags, the `minted`/`active`/`crowding` diagnostics, and the versioned embedding cache) into the probe as well. The server's clusterer keeps its calibrated `const`s as the one true default; give it a `#[doc(hidden)] pub fn with_params(t_assign, t_retire, alpha, min_pool)` constructor (a plain secondary constructor, not a config surface — the doc comment should say it exists for the probe's sweeps and that shipped behaviour uses the consts) so the probe can vary thresholds without forking the algorithm.
+- [ ] **Step 3: Verify against the AMI files** — the default run matches the spike report's quality, and one spot-check sweep cell reproduces the spec's number for that cell.
+- [ ] **Step 4: Commit**
 
 ```bash
 git rm -r spike && git add crates/syrinx-server/examples/diarize_probe.rs
