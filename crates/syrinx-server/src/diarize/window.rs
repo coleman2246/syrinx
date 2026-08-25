@@ -3,10 +3,10 @@
 //! Ported from the go/no-go spike's `windows()`, the reference the AMI numbers
 //! in the design doc were measured against. The spike itself is gone -- `git
 //! log -- 'spike/diarize'` for it -- and `examples/diarize_probe` is what
-//! reproduces those numbers now. Pure arithmetic -- no
-//! models, no `ort`, no feature gate -- for the same reason [`super::fbank`]
-//! has none: this is where the alignment bugs live, so the default
-//! `cargo test` should be catching them, not only the `diarize` build.
+//! reproduces those numbers now. Pure arithmetic -- no models, no `ort`, no
+//! feature gate -- for the same reason [`super::fbank`] has none: this is
+//! where the alignment bugs live, so the default `cargo test` should be
+//! catching them, not only the `diarize` build.
 //!
 //! Two pieces, because they fail differently. [`Framer`] answers "which
 //! samples do the VAD's flags describe?", which is a question about the

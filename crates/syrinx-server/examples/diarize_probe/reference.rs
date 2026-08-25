@@ -8,9 +8,8 @@
 //! reaches it -- because every number in the design doc's "Spike results" was
 //! produced by this scoring code, so it moves into the tree as it was rather
 //! than being rewritten around the tree's types. Nothing here is production
-//! code -- the server never scores itself
-//! against an annotation -- which is why it lives beside the probe instead of
-//! in `src/diarize`.
+//! code -- the server never scores itself against an annotation -- which is
+//! why it lives beside the probe instead of in `src/diarize`.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;

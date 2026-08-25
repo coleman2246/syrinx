@@ -129,9 +129,13 @@ than refusing the session. A client can ask and not receive — a server built
 without the feature, models missing or unreadable, a mode with no transcript to
 label — and the session then runs unlabelled, because a transcript without
 speaker labels is worth incomparably more than no transcript at all. The GUI
-says so once connected, under the transcript: *Speaker labels unavailable on
-this server*. The server logs *why* on its own side at `error!`, because that
-is the only end that knows which of those it was.
+says so under the status line, once a session is running: *Speaker labels
+unavailable on this server*.
+
+Which of those it was is a question only the server can answer, so it logs the
+two it knows about — no feature compiled in, or models it could not read — at
+`error!` on its own side. The third needs no log at either end: a client that
+asked for labels in a mode with no transcript already knows what it asked for.
 
 **The typing modes never see labels.** `type` and `both` put text at the
 cursor, where a `Speaker 2:` prefix would land in the middle of whatever you
@@ -148,10 +152,12 @@ down is worse than one with no labels at all.
 Short interjections arrive unlabelled, and that is the design rather than a
 gap in it. When the diarizer has not heard enough of a voice to be sure, it
 says nothing instead of attributing "yeah" or "okay" to whoever was already
-talking. The same goes for the opening seconds of a session, before it has
-heard anyone twice. Unlabelled text still appears — it joins the turn already
-open — and a label trails its text by about a second, which is the server
-holding two chunks back so the diarizer can catch up.
+talking. The start of a session goes the same way: a voice has to put together
+close to four seconds of speech, across four windows that agree with each
+other, before it is given a label at all — and that is four seconds of
+talking, not four seconds of meeting. Unlabelled text still appears, joining
+the turn already open, and a label trails its text by about a second, which is
+the server holding two chunks back so the diarizer can catch up.
 
 What has *not* been measured is the caveat worth carrying. No split (one
 person acquiring a second label) and no merge (two people sharing one)
