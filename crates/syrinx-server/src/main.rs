@@ -73,7 +73,7 @@ fn build_loader(
 #[cfg(feature = "diarize")]
 fn build_diarizer(config: &Config) -> Option<Arc<dyn DiarizerFactory>> {
     let dir = config.diarize_model_dir.as_ref()?;
-    match RealDiarizerFactory::load(std::path::Path::new(dir)) {
+    match RealDiarizerFactory::load(std::path::Path::new(dir), config.diarize_min_pool) {
         Ok(factory) => Some(Arc::new(factory) as Arc<dyn DiarizerFactory>),
         Err(e) => {
             tracing::error!("speaker labelling disabled: {e:#}");

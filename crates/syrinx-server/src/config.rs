@@ -1,6 +1,8 @@
 //! Server configuration.
 
+use anyhow::ensure;
 use serde::Deserialize;
+use std::ops::RangeInclusive;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -53,7 +55,52 @@ pub struct Config {
     /// rather than guessing.
     #[serde(default)]
     pub diarize_model_dir: Option<String>,
+
+    /// How many 560 ms chunks a commit is held back so its speaker label can
+    /// catch up, since the diarizer needs more audio than the transducer does.
+    ///
+    /// 2 is ~1.12 s, which covers the p90 label delay the spike measured at
+    /// 0.88-1.09 s; one chunk (0.56 s) does not. Lowering it buys that latency
+    /// back and pays for it in fragments that arrive unlabelled and turn
+    /// starts attributed to whoever was talking before -- 0 emits every commit
+    /// the moment its text exists, labelled from its own chunk alone. Raising
+    /// it to 3 (1.68 s) covers the p99 and buys nothing measurable beyond.
+    ///
+    /// Accepted range 0-16. See "Spike results" in
+    /// `docs/specs/2026-08-24-speaker-diarization-design.md`, which calls this
+    /// depth a tunable rather than a fixed constant.
+    #[serde(default = "default_diarize_lag_chunks")]
+    pub diarize_lag_chunks: usize,
+
+    /// How many mutually agreeing 1.5 s windows it takes to mint a new
+    /// speaker. At a 0.75 s hop, 4 is ~3.7 s of one voice before it is given a
+    /// number.
+    ///
+    /// Lowering it picks a new speaker up faster -- the fragile case is the
+    /// participant who says three sentences in an hour -- and pays by
+    /// splitting one person across several labels, which is the failure this
+    /// rule exists to prevent. The spike found 4 the only value correct on all
+    /// three annotated meetings: 3 produced 6 labels for the 5 speakers of the
+    /// 87-minute meeting, and 2 produced 20 labels for a 4-speaker one.
+    ///
+    /// Accepted range 2-16; a pool of one window has nothing to agree with.
+    /// See "Spike results" in
+    /// `docs/specs/2026-08-24-speaker-diarization-design.md`.
+    #[serde(default = "default_diarize_min_pool")]
+    pub diarize_min_pool: usize,
 }
+
+/// What [`Config::diarize_lag_chunks`] will accept. The top is ~9 s, five
+/// times the p99 label delay the spike measured, so every experiment worth
+/// running fits inside it; past it the buffer is holding a paragraph of
+/// transcript that a dropped connection would take with it.
+const DIARIZE_LAG_CHUNKS: RangeInclusive<usize> = 0..=16;
+
+/// What [`Config::diarize_min_pool`] will accept. One window cannot agree with
+/// itself, so 2 is where "agreeing windows" starts meaning anything. The top
+/// is ~12 s of one uninterrupted voice before a speaker is minted, by which
+/// point a meeting labels nobody at all.
+const DIARIZE_MIN_POOL: RangeInclusive<usize> = 2..=16;
 
 /// Execution provider. Defaults to CPU: it needs no GPU, cannot disturb other
 /// tenants, and at ~149ms per 560ms chunk it still keeps up in real time.
@@ -83,10 +130,56 @@ fn default_vram_floor() -> u64 {
 fn default_max_sessions() -> usize {
     4
 }
+/// The calibrated values are the ones the code already names, read from where
+/// their justification lives rather than copied here: a second literal would
+/// eventually disagree with the comment explaining it.
+fn default_diarize_lag_chunks() -> usize {
+    crate::session::LAG_CHUNKS
+}
+fn default_diarize_min_pool() -> usize {
+    crate::diarize::cluster::MIN_POOL
+}
 
 impl Config {
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(s)?)
+        let cfg: Self = toml::from_str(s)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Refuse settings that parse but cannot work, naming the key and what it
+    /// accepts.
+    ///
+    /// Only the two diarization tunables need this. The other numbers here are
+    /// either checked where they are used or have no wrong value -- a small
+    /// `max_sessions` is a cautious server, not a broken one. These two are
+    /// different: a pool of 1 mints a speaker from a single window, which is
+    /// the one outcome the clustering design exists to prevent, and a lag of
+    /// 200 holds two minutes of transcript hostage to a label. Both look
+    /// exactly like a working server until a meeting is under way, so the load
+    /// is where they have to fail.
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            DIARIZE_LAG_CHUNKS.contains(&self.diarize_lag_chunks),
+            "diarize_lag_chunks = {} is out of range: it must be {} to {}, in chunks \
+             of 560 ms. 0 emits each label as it comes; the calibrated value is {}.",
+            self.diarize_lag_chunks,
+            DIARIZE_LAG_CHUNKS.start(),
+            DIARIZE_LAG_CHUNKS.end(),
+            default_diarize_lag_chunks(),
+        );
+        ensure!(
+            DIARIZE_MIN_POOL.contains(&self.diarize_min_pool),
+            "diarize_min_pool = {} is out of range: it must be {} to {} windows. \
+             Below {} there is no second window for the first to agree with; the \
+             calibrated value is {}.",
+            self.diarize_min_pool,
+            DIARIZE_MIN_POOL.start(),
+            DIARIZE_MIN_POOL.end(),
+            DIARIZE_MIN_POOL.start(),
+            default_diarize_min_pool(),
+        );
+        Ok(())
     }
 
     /// Load from TOML, then let the environment override.
@@ -181,6 +274,8 @@ mod tests {
             c.vram_floor_mib,
             c.idle_unload_secs,
             c.diarize_model_dir.clone(),
+            c.diarize_lag_chunks,
+            c.diarize_min_pool,
         );
         c.apply_env(|_| Some("999".into()));
         assert_eq!(
@@ -189,6 +284,8 @@ mod tests {
                 c.vram_floor_mib,
                 c.idle_unload_secs,
                 c.diarize_model_dir.clone(),
+                c.diarize_lag_chunks,
+                c.diarize_min_pool,
             ),
             before
         );
@@ -258,5 +355,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.diarize_model_dir.as_deref(), Some("/d"));
+    }
+
+    /// `base()` plus one line, for the tunables.
+    fn with(line: &str) -> anyhow::Result<Config> {
+        Config::from_toml(&format!("token = \"a\"\nmodel_dir = \"/m\"\n{line}"))
+    }
+
+    #[test]
+    fn the_diarize_tunables_default_to_the_calibrated_values() {
+        // A config that says nothing about them must behave exactly as the
+        // server did before they existed, which is what makes them safe to add
+        // to a deployment that has already been tuned by hand.
+        let c = base();
+        assert_eq!(c.diarize_lag_chunks, 2);
+        assert_eq!(c.diarize_min_pool, 4);
+        assert_eq!(c.diarize_lag_chunks, crate::session::LAG_CHUNKS);
+        assert_eq!(c.diarize_min_pool, crate::diarize::cluster::MIN_POOL);
+    }
+
+    #[test]
+    fn the_diarize_tunables_parse() {
+        let c = with("diarize_lag_chunks = 1\ndiarize_min_pool = 3").unwrap();
+        assert_eq!(c.diarize_lag_chunks, 1);
+        assert_eq!(c.diarize_min_pool, 3);
+    }
+
+    #[test]
+    fn a_lag_of_zero_is_a_setting_and_not_a_mistake() {
+        // The bottom of the range is meaningful: no wait at all, every commit
+        // labelled from its own chunk. Rejecting it as "off" would remove the
+        // one setting that answers "how much of this delay is the diarizer?".
+        assert_eq!(
+            with("diarize_lag_chunks = 0").unwrap().diarize_lag_chunks,
+            0
+        );
+        assert_eq!(
+            with("diarize_lag_chunks = 16").unwrap().diarize_lag_chunks,
+            16
+        );
+    }
+
+    #[test]
+    fn an_absurd_lag_is_refused_at_load_by_name() {
+        // Nine seconds of held transcript is not a trade-off anyone is making
+        // on purpose, and a server that accepted it would look healthy while
+        // the client waited.
+        let err = with("diarize_lag_chunks = 17").expect_err("above the range");
+        let message = format!("{err:#}");
+        assert!(message.contains("diarize_lag_chunks"), "{message}");
+        assert!(message.contains("0 to 16"), "{message}");
+    }
+
+    #[test]
+    fn a_pool_below_two_cannot_express_agreement() {
+        // "Windows that agree with each other" needs two windows. At 1 every
+        // stray cough mints a speaker, which is the one failure the clustering
+        // rules were built around.
+        let err = with("diarize_min_pool = 1").expect_err("below the range");
+        let message = format!("{err:#}");
+        assert!(message.contains("diarize_min_pool"), "{message}");
+        assert!(message.contains("2 to 16"), "{message}");
+
+        assert_eq!(with("diarize_min_pool = 2").unwrap().diarize_min_pool, 2);
+        assert_eq!(with("diarize_min_pool = 16").unwrap().diarize_min_pool, 16);
+    }
+
+    #[test]
+    fn an_absurd_pool_is_refused_at_load_by_name() {
+        let err = with("diarize_min_pool = 17").expect_err("above the range");
+        let message = format!("{err:#}");
+        assert!(message.contains("diarize_min_pool"), "{message}");
+        assert!(message.contains("2 to 16"), "{message}");
     }
 }

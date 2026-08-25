@@ -161,8 +161,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Inference on the blocking pool: it is synchronous and GPU-bound.
     let sid = session_id.clone();
+    // Read before the closure takes ownership of everything it needs; the depth
+    // is the server's `diarize_lag_chunks`, defaulting to the calibrated 2.
+    let lag_chunks = state.config.diarize_lag_chunks;
     let infer = tokio::task::spawn_blocking(move || {
-        let mut session = Session::new(mode, backend.as_ref(), sid, d);
+        let mut session = Session::with_lag(mode, backend.as_ref(), sid, d, lag_chunks);
         while let Some(ev) = audio_rx.blocking_recv() {
             let is_finish = matches!(ev, AudioEvent::Finish);
             let produced = match ev {

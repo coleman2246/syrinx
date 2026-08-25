@@ -20,8 +20,9 @@
 // external to this crate, so a private const would force it to keep its own
 // copy of the other three. A stale copy there would attribute a sweep's
 // numbers to constants the server no longer ships, which is precisely the
-// failure the probe exists to prevent. Hidden from the docs because they are
-// still not a configuration surface -- see [`OnlineClusterer::with_params`].
+// failure the probe exists to prevent. Hidden from the docs because three of
+// them are not a configuration surface -- see [`OnlineClusterer::with_params`]
+// -- and the fourth, `MIN_POOL`, is only the default of one.
 
 /// Cosine similarity above which an embedding joins its nearest centroid.
 /// 0.45, not the 0.6 the design first guessed: the spike measured
@@ -32,6 +33,11 @@ pub const T_ASSIGN: f32 = 0.45;
 /// Mutually agreeing orphan windows before a new speaker is minted. Not a
 /// free parameter: at 2 the spike minted 20 labels for a 4-speaker meeting,
 /// and 3 still failed an 87-minute one.
+///
+/// The default of the `diarize_min_pool` config key, which reads it from here
+/// so the shipped number stays next to the measurement that chose it. A
+/// deployment can trade it down for faster pickup on its own audio; nothing
+/// here changes what was measured on AMI.
 #[doc(hidden)]
 pub const MIN_POOL: usize = 4;
 /// How much one window moves a centroid. Small: a centroid is its history,
@@ -66,8 +72,8 @@ pub struct OnlineClusterer {
     pool: Vec<Vec<f32>>,
     next_label: u32,
     /// The four thresholds, held rather than read from the consts so that the
-    /// probe can sweep them. Every shipped clusterer is built by
-    /// [`OnlineClusterer::new`] and carries exactly the consts above.
+    /// probe can sweep them and the server can configure `min_pool`. The other
+    /// three are the consts above in every clusterer that ships.
     t_assign: f32,
     t_retire: f32,
     alpha: f32,
@@ -82,20 +88,36 @@ impl Default for OnlineClusterer {
 
 impl OnlineClusterer {
     pub fn new() -> Self {
-        Self::with_params(T_ASSIGN, T_RETIRE, EMA_ALPHA, MIN_POOL)
+        Self::with_min_pool(MIN_POOL)
     }
 
-    /// A clusterer with the thresholds overridden. **Not a configuration
-    /// surface**: shipped behaviour is [`OnlineClusterer::new`]'s, which is
-    /// the calibrated constants above and the only construction the server
-    /// ever performs.
+    /// A clusterer at a configured pool size: the server's `diarize_min_pool`,
+    /// whose default is [`MIN_POOL`].
+    ///
+    /// The one clustering parameter the configuration exposes. The other three
+    /// were measured once and have no trade an operator could make with them
+    /// -- `T_RETIRE` never fired in any accepted configuration, and `T_ASSIGN`
+    /// fails quietly rather than loudly when it is wrong, which is not a knob
+    /// to hand out. This one has a trade worth offering: how fast a new voice
+    /// is picked up against how often one person is split across two labels.
+    ///
+    /// Both this and [`OnlineClusterer::new`] reach the fields through
+    /// [`OnlineClusterer::with_params`], so there is still exactly one place
+    /// the constants are assigned.
+    pub fn with_min_pool(min_pool: usize) -> Self {
+        Self::with_params(T_ASSIGN, T_RETIRE, EMA_ALPHA, min_pool)
+    }
+
+    /// A clusterer with all four thresholds overridden. **Not a configuration
+    /// surface**: the server builds every clusterer through
+    /// [`OnlineClusterer::new`] or [`OnlineClusterer::with_min_pool`], so
+    /// `T_ASSIGN`, `T_RETIRE` and `EMA_ALPHA` are the calibrated constants
+    /// above in everything that ships.
     ///
     /// This exists for `examples/diarize_probe`'s sweep, which re-measures
     /// those constants against annotated meetings and therefore has to vary
     /// them without forking the algorithm -- a sweep against a second copy of
-    /// this code would answer a question about the copy. `new` delegates here
-    /// so there is one assignment of the constants to the fields rather than
-    /// two that have to agree.
+    /// this code would answer a question about the copy.
     #[doc(hidden)]
     pub fn with_params(t_assign: f32, t_retire: f32, alpha: f32, min_pool: usize) -> Self {
         Self {
@@ -608,11 +630,12 @@ mod tests {
     #[test]
     fn new_does_not_drift_from_the_calibrated_constants() {
         // Narrow on purpose, and worth being clear about what it does not
-        // prove: `new` delegates to `with_params`, so this can only fail if a
-        // later edit stops it delegating and passes something other than the
-        // constants. It says nothing about whether `with_params` reads the
-        // arguments it is handed -- the four tests below are what cover that,
-        // and they are the ones the sweep actually rests on.
+        // prove: `new` delegates through `with_min_pool` to `with_params`, so
+        // this can only fail if a later edit stops it delegating and passes
+        // something other than the constants. It says nothing about whether
+        // `with_params` reads the arguments it is handed -- the four tests
+        // below are what cover that, and they are the ones the sweep actually
+        // rests on.
         let (_, second, between) = converging_pair();
 
         // One script through all four constants: pooling and minting
@@ -681,6 +704,28 @@ mod tests {
         );
         assert_eq!(shipped, vec![None, None], "MIN_POOL 4 wants four windows");
         assert_eq!(swept, vec![None, Some(1)], "a pool of 2 should have minted");
+    }
+
+    #[test]
+    fn the_configured_pool_is_the_one_that_decides() {
+        // `with_min_pool` is the constructor a configured server goes through,
+        // so the two things worth pinning are that it is `new` when handed the
+        // shipped value -- an unconfigured deployment must not drift -- and
+        // that it is genuinely a different clusterer when handed another. The
+        // same two agreeing windows separate the cases.
+        let script = vec![noisy(0, 0), noisy(0, 1)];
+        assert_eq!(
+            observe_all(OnlineClusterer::with_min_pool(MIN_POOL), &script),
+            observe_all(OnlineClusterer::new(), &script),
+            "the default must be the calibrated clusterer, exactly"
+        );
+
+        let (configured, _) = observe_all(OnlineClusterer::with_min_pool(2), &script);
+        assert_eq!(
+            configured,
+            vec![None, Some(1)],
+            "a configured pool of 2 should have minted where 4 waits"
+        );
     }
 
     #[test]

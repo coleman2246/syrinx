@@ -57,6 +57,8 @@ struct Models {
 /// thread. Four sessions of unshared models cost ~112 MB and no lock.
 pub struct RealDiarizerFactory {
     models: Models,
+    /// The server's `diarize_min_pool`, handed to every session's clusterer.
+    min_pool: usize,
 }
 
 impl RealDiarizerFactory {
@@ -64,7 +66,11 @@ impl RealDiarizerFactory {
     ///
     /// Blocking, and slow enough to matter (both graphs are committed and both
     /// are run), so this belongs at startup and nowhere near a request.
-    pub fn load(dir: &Path) -> Result<Self> {
+    ///
+    /// `min_pool` is carried rather than read from the const so a deployment
+    /// can trade pickup speed against splitting one voice in two; the config
+    /// key's default is that const, and its range is checked at config load.
+    pub fn load(dir: &Path, min_pool: usize) -> Result<Self> {
         let models = Models::resolve(dir)?;
         let dim = models.self_check()?;
         info!(
@@ -72,15 +78,16 @@ impl RealDiarizerFactory {
             embed = %models.embed.display(),
             norm = ?models.norm,
             dim,
+            min_pool,
             "speaker labelling available"
         );
-        Ok(Self { models })
+        Ok(Self { models, min_pool })
     }
 }
 
 impl DiarizerFactory for RealDiarizerFactory {
     fn diarizer(&self) -> Box<dyn Diarizer> {
-        Box::new(RealDiarizer::new(self.models.clone()))
+        Box::new(RealDiarizer::new(self.models.clone(), self.min_pool))
     }
 }
 
@@ -385,13 +392,13 @@ impl State {
 }
 
 impl RealDiarizer {
-    fn new(models: Models) -> Self {
+    fn new(models: Models, min_pool: usize) -> Self {
         Self {
             models,
             state: None,
             framer: Framer::default(),
             assembler: WindowAssembler::default(),
-            clusterer: OnlineClusterer::new(),
+            clusterer: OnlineClusterer::with_min_pool(min_pool),
             last_label: None,
         }
     }

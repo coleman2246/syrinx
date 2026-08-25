@@ -72,6 +72,17 @@ tracks — the one wrinkle in the container story. It rebuilds in seconds
 not carry a local edit at all, bind-mount your own file over
 `/etc/syrinx/config.toml` instead.
 
+Two optional keys live in the same file, for tuning against the meetings this
+server actually sees: `diarize_lag_chunks` (2) is how many 560 ms chunks a
+commit waits for its speaker label, and `diarize_min_pool` (4) is how many
+agreeing 1.5 s windows it takes to mint a new speaker. Lower is quicker and
+less sure in both cases — a shorter wait costs attribution at the start of a
+turn, a smaller pool risks splitting one person across two labels. **Speaker
+labels** in the README has the measurements behind the defaults. Unlike a
+model file, a value out of range here does stop the server: it is a typo in a
+config the operator just edited, and the failure that helps is the one at
+startup with the key named in it.
+
 The image is built with `--features cuda,diarize`, so nothing else changes: no
 new runtime dependency — the diarizer drives the same ONNX Runtime the ASR
 already loads — and about 6% of one core per session on top of the ASR.

@@ -13,7 +13,13 @@ use syrinx_proto::{Mode, ServerMessage};
 /// How many chunks a commit is held so its speaker label can settle. The
 /// diarizer needs more audio context than the transducer does; calibrated by
 /// the spike, which wants a 1.5 s embedding window against 560 ms chunks.
-const LAG_CHUNKS: usize = 2;
+///
+/// `pub` because it is the default of the `diarize_lag_chunks` config key,
+/// which reads it here rather than repeating the 2 next to a copy of this
+/// paragraph. A deployment can tune the key against its own meetings; this is
+/// the value the spike measured, and the one every session runs at unless the
+/// configuration says otherwise.
+pub const LAG_CHUNKS: usize = 2;
 
 /// Consecutive diarizer failures before the session stops asking. An occasional
 /// hiccup is survivable; a diarizer that fails every chunk is dead weight on a
@@ -41,11 +47,16 @@ pub struct Session {
     /// no held commit can still consult are dropped as commits leave.
     chunk_labels: VecDeque<(u64, Option<u32>)>,
     held: VecDeque<HeldCommit>,
+    /// This session's lag depth, in chunks. Held rather than read from
+    /// [`LAG_CHUNKS`] so a deployment can tune it; every session built by
+    /// [`Session::new`] carries exactly that constant.
+    lag_chunks: usize,
 }
 
 impl Session {
-    /// Build a session. A `diarizer` makes it a labelling session, which costs
-    /// [`LAG_CHUNKS`] of added latency on every commit.
+    /// Build a session at the calibrated lag depth. A `diarizer` makes it a
+    /// labelling session, which costs [`LAG_CHUNKS`] of added latency on every
+    /// commit.
     ///
     /// `Session` trusts its caller on mode gating: it will label a live-mode
     /// session if handed a diarizer, and must never be handed one, because live
@@ -57,6 +68,25 @@ impl Session {
         backend: &dyn AsrBackend,
         session_id: String,
         diarizer: Option<Box<dyn Diarizer>>,
+    ) -> Self {
+        Self::with_lag(mode, backend, session_id, diarizer, LAG_CHUNKS)
+    }
+
+    /// The same, at a configured lag depth -- the server's
+    /// `diarize_lag_chunks`, whose default is [`LAG_CHUNKS`]. `new` delegates
+    /// here, so the depth reaches the field from one place rather than two.
+    ///
+    /// `lag_chunks` is only consulted while a diarizer is alive, so a session
+    /// without one is unaffected by any value. A depth of 0 releases every
+    /// commit in the call that produced its text, labelled from that chunk
+    /// alone: the fastest setting, and the one that leaves the most turn
+    /// starts attributed to whoever was speaking before.
+    pub fn with_lag(
+        mode: Mode,
+        backend: &dyn AsrBackend,
+        session_id: String,
+        diarizer: Option<Box<dyn Diarizer>>,
+        lag_chunks: usize,
     ) -> Self {
         Self {
             mode,
@@ -70,6 +100,7 @@ impl Session {
             chunks_seen: 0,
             chunk_labels: VecDeque::new(),
             held: VecDeque::new(),
+            lag_chunks,
         }
     }
 
@@ -198,7 +229,7 @@ impl Session {
     /// for a label that is never coming.
     fn lag(&self) -> u64 {
         if self.diarizer.is_some() {
-            LAG_CHUNKS as u64
+            self.lag_chunks as u64
         } else {
             0
         }

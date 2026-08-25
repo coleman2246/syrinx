@@ -159,6 +159,24 @@ talking, not four seconds of meeting. Unlabelled text still appears, joining
 the turn already open, and a label trails its text by about a second, which is
 the server holding two chunks back so the diarizer can catch up.
 
+Both of those numbers are settings, in case your meetings disagree with the
+recordings they were measured on:
+
+```toml
+diarize_lag_chunks = 2    # chunks a commit waits for its label
+diarize_min_pool = 4      # agreeing windows before a new speaker is minted
+```
+
+Dropping the lag to 1 hands text over half a second sooner and pays for it at
+the start of a turn, where the label is still the previous speaker's; 0 turns
+the wait off altogether. Dropping the pool to 3 gives a quiet participant a
+number three quarters of a second earlier, and risks the split this whole
+design is arranged to avoid — on the 87-minute meeting a pool of 3 found six
+speakers in a room of five, and a pool of 2 found twenty in a room of four.
+Both keys are optional, both are refused at startup if they are wildly out of
+range, and neither is environment-overridable, for the same reason
+`diarize_model_dir` is not.
+
 What has *not* been measured is the caveat worth carrying. No split (one
 person acquiring a second label) and no merge (two people sharing one)
 occurred on any meeting tested — but those were AMI recordings made through

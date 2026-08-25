@@ -27,3 +27,12 @@ max_sessions = 4
 # every startup, which is not what to hand somebody who never wanted the
 # feature.
 #diarize_model_dir = "/models/diarize"
+
+# The two calibrated numbers behind those labels, shown at their defaults and
+# commented because the defaults are what was measured. The first is how many
+# 560 ms chunks a commit waits for its label; the second is how many agreeing
+# 1.5 s windows mint a new speaker. Lower is quicker and less sure in both
+# cases, and out of range is refused at startup rather than at the first
+# meeting. README, "Speaker labels", has the measurements.
+#diarize_lag_chunks = 2
+#diarize_min_pool = 4

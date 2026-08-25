@@ -8,7 +8,7 @@ use anyhow::anyhow;
 use syrinx_proto::{Mode, ServerMessage};
 use syrinx_server::asr::mock::MockBackend;
 use syrinx_server::diarize::{Diarizer, MockDiarizer};
-use syrinx_server::session::Session;
+use syrinx_server::session::{LAG_CHUNKS, Session};
 
 /// Tiny chunks: these tests count chunks, never samples.
 const CHUNK: usize = 16;
@@ -20,10 +20,17 @@ const WORDS: [&str; 8] = [
     "one", "two", "three", "four", "five", "six", "seven", "eight",
 ];
 
-/// A transcript-mode session over a scripted backend.
+/// A transcript-mode session over a scripted backend, at the shipped lag.
 fn over(backend: MockBackend, diarizer: Option<Box<dyn Diarizer>>) -> Session {
     let backend = backend.with_chunk_samples(CHUNK);
     Session::new(Mode::Transcript, &backend, "sid".into(), diarizer)
+}
+
+/// The same at a configured lag depth -- `diarize_lag_chunks`, as `ws.rs`
+/// passes it.
+fn at_lag(words: &[&str], diarizer: Option<Box<dyn Diarizer>>, lag: usize) -> Session {
+    let backend = MockBackend::new(words).with_chunk_samples(CHUNK);
+    Session::with_lag(Mode::Transcript, &backend, "sid".into(), diarizer, lag)
 }
 
 /// The common case: one scripted word per chunk from the backend, one scripted
@@ -77,6 +84,45 @@ fn with_a_diarizer_a_commit_waits_out_the_lag() {
     );
     assert!(push(&mut s).is_empty(), "nor the second");
     assert_eq!(push(&mut s), vec![("alpha ".into(), Some(1))]);
+}
+
+#[test]
+fn the_lag_depth_is_what_the_session_was_built_with() {
+    // `diarize_lag_chunks` reaches the wire as two things at once: how long the
+    // first commit waits, and how wide a window votes on its label. One script
+    // shows both, because the speaker changes at the second chunk -- so a
+    // deeper lag delays the commit *and* lets the new speaker outvote the old.
+    let script = [Some(1), Some(2), Some(2), Some(2)];
+    let first_commit = |lag: usize| {
+        let mut s = at_lag(&WORDS, diarizer(&script), lag);
+        (0..4).find_map(|chunk| push(&mut s).first().map(|(_, speaker)| (chunk, *speaker)))
+    };
+
+    assert_eq!(
+        first_commit(0),
+        Some((0, Some(1))),
+        "no wait at all, labelled from its own chunk"
+    );
+    assert_eq!(
+        first_commit(1),
+        Some((1, Some(1))),
+        "one chunk of window, and a tie goes to the earlier one"
+    );
+    assert_eq!(first_commit(2), Some((2, Some(2))), "the calibrated depth");
+    assert_eq!(first_commit(3), Some((3, Some(2))), "deeper still");
+}
+
+#[test]
+fn an_unconfigured_session_runs_at_the_calibrated_depth() {
+    // The default has to be the behaviour from before the key existed, chunk
+    // for chunk: a deployment that says nothing about lag must not be able to
+    // tell that there is now something to say.
+    let script = [Some(1), Some(2), Some(2)];
+    let run = |mut s: Session| (0..3).map(|_| push(&mut s)).collect::<Vec<_>>();
+    assert_eq!(
+        run(session(&WORDS, diarizer(&script))),
+        run(at_lag(&WORDS, diarizer(&script), LAG_CHUNKS))
+    );
 }
 
 #[test]
