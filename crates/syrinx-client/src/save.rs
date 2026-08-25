@@ -185,8 +185,10 @@ fn render_stamped_flat(segments: &[Segment], format: Format) -> String {
 /// Render `Timestamped` or `Labelled` once a label is present: one line per
 /// turn, split further on a silence gap or, for `Labelled`, a source change
 /// -- the same rule `StreamWriter` uses to continue a line, so a saved file
-/// and a streamed one agree. The speaker only appears on the line that opens
-/// its turn; a line reopened later by a silence gap does not repeat it.
+/// and a streamed one agree. Every line names the speaker whose turn it
+/// belongs to, including one merely reopened after a pause: these formats
+/// are one record per line, and something reading the file back -- an LLM
+/// asked who said what, a grep -- has only the line in front of it.
 ///
 /// Turn boundaries come from `turns` itself, so this and the GUI's paragraph
 /// view can never disagree about where one starts; only the further split
@@ -200,22 +202,25 @@ fn render_stamped(segments: &[Segment], format: Format) -> String {
 
     turns(&filtered)
         .into_iter()
-        .flat_map(|(_, segs)| lines_in_turn(segs, format))
-        .map(|(opens_turn, segs)| render_line(&segs, opens_turn, format))
+        .flat_map(|(speaker, segs)| {
+            lines_in_turn(segs, format)
+                .into_iter()
+                .map(move |line| render_line(&line, speaker, format))
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 /// Split one turn's segments into physical lines on a silence gap or, for
-/// `Labelled`, a source change. Only the first line carries `true` --
-/// `render_line` only names the speaker there, since a line reopened later
-/// by a gap is still the same turn.
+/// `Labelled`, a source change. Every line belongs to the same turn, and so
+/// to the same speaker: which line came first no longer changes how it is
+/// rendered.
 ///
 /// The source check is a guard rather than the mechanism: `turns` already
 /// ends a turn at a source change, so no turn reaching here spans two. It is
 /// kept because `StreamWriter::continues_line` states the same rule, and the
 /// two are meant to be readable as one.
-fn lines_in_turn(segs: Vec<&Segment>, format: Format) -> Vec<(bool, Vec<&Segment>)> {
+fn lines_in_turn(segs: Vec<&Segment>, format: Format) -> Vec<Vec<&Segment>> {
     let mut lines: Vec<Vec<&Segment>> = Vec::new();
     for seg in segs {
         let breaks = match lines.last().and_then(|l| l.last()) {
@@ -231,24 +236,23 @@ fn lines_in_turn(segs: Vec<&Segment>, format: Format) -> Vec<(bool, Vec<&Segment
             lines.last_mut().unwrap().push(seg);
         }
     }
-    lines.into_iter().enumerate().map(|(i, segs)| (i == 0, segs)).collect()
+    lines
 }
 
-/// One rendered line: its stamp, source (`Labelled`) and, if it opens a
-/// turn, the speaker -- then the text, spliced across the segments sharing
-/// the line the same way a stream continuation splices them (the interior
-/// spacing between fragments is kept; only the outer edges are trimmed).
-fn render_line(segs: &[&Segment], opens_turn: bool, format: Format) -> String {
+/// One rendered line: its stamp, source (`Labelled`) and `speaker` -- the
+/// speaker of the turn the line belongs to, not merely the one its first
+/// segment happened to carry, so a line opened by an unlabelled fragment is
+/// still attributed to whoever is talking -- then the text, spliced across
+/// the segments sharing the line the same way a stream continuation splices
+/// them (the interior spacing between fragments is kept; only the outer
+/// edges are trimmed).
+fn render_line(segs: &[&Segment], speaker: Option<u32>, format: Format) -> String {
     let first = segs[0];
     let source_part = match (format, &first.source) {
         (Format::Labelled, Some(src)) => format!("[{src}] "),
         _ => String::new(),
     };
-    let speaker_prefix = if opens_turn {
-        first.speaker.map(|n| format!("Speaker {n}: ")).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let speaker_prefix = speaker.map(|n| format!("Speaker {n}: ")).unwrap_or_default();
     // Only the first segment is ever trimmed: fully, if it is also the last
     // (matching the pre-turns single-line-per-segment convention); from the
     // left only otherwise, since `StreamWriter` writes every continuation
@@ -853,12 +857,109 @@ mod tests {
     fn plain_does_not_break_a_turn_on_a_silence_gap() {
         // A turn is a speaker run, not a time window: unlike Timestamped and
         // Labelled, Plain has no stamps to go stale, so nothing about a
-        // pause should split one speaker's paragraph in two.
+        // pause should split one speaker's paragraph in two. The speaker is
+        // named once, at the top of the paragraph -- the other half of the
+        // format split that the next test states.
         let segs = [
             seg_spk(0.0, "hello ", Some(1)),
             seg_spk(65.0, "world", Some(1)),
         ];
         assert_eq!(render(&segs, "", Format::Plain), "Speaker 1: hello world");
+    }
+
+    #[test]
+    fn a_silence_gap_within_a_turn_repeats_the_speaker() {
+        // The stamped formats used to leave the speaker off a line reopened
+        // by a pause, on the grounds that the turn had already been named.
+        // But a pause mid-turn is the ordinary shape of a meeting, so most
+        // lines came out with a time and nobody attached to them. A stamped
+        // line is a record on its own, and the record has to say who.
+        let segs = [
+            seg_spk(0.0, "hello", Some(1)),
+            seg_spk(65.0, "still there", Some(1)),
+        ];
+        assert_eq!(
+            render(&segs, "", Format::Timestamped),
+            "[00:00] Speaker 1: hello\n[01:05] Speaker 1: still there"
+        );
+    }
+
+    #[test]
+    fn labelled_repeats_the_speaker_after_a_gap_as_well() {
+        // Same rule as Timestamped: the source label never stood in for the
+        // speaker, and one microphone can carry several people.
+        let mut first = seg_spk(0.0, "hello", Some(1));
+        first.source = Some("Yeti".into());
+        let mut then = seg_spk(65.0, "still there", Some(1));
+        then.source = Some("Yeti".into());
+        assert_eq!(
+            render(&[first, then], "", Format::Labelled),
+            "[00:00] [Yeti] Speaker 1: hello\n[01:05] [Yeti] Speaker 1: still there"
+        );
+    }
+
+    #[test]
+    fn a_line_reopened_by_an_unlabelled_fragment_names_the_turn_anyway() {
+        // The diarizer says nothing about stretches it has not heard enough
+        // of, so the fragment that happens to follow a pause often carries
+        // no label of its own. `turns` already counts it as part of the turn
+        // -- the line it opens is attributed to that turn's speaker.
+        let segs = [
+            seg_spk(0.0, "hello", Some(1)),
+            seg_spk(65.0, "still there", None),
+        ];
+        assert_eq!(
+            render(&segs, "", Format::Timestamped),
+            "[00:00] Speaker 1: hello\n[01:05] Speaker 1: still there"
+        );
+    }
+
+    #[test]
+    fn lines_before_any_speaker_is_known_stay_unattributed() {
+        // A voice needs a few seconds before it is given a number, so the
+        // opening of a session arrives unlabelled. There is nothing to
+        // attribute it to yet, and the streamed file it must agree with is
+        // append-only -- the first label to arrive cannot be applied
+        // backwards over lines already written.
+        let segs = [
+            seg_spk(0.0, "hello", None),
+            seg_spk(65.0, "we ship Thursday", Some(1)),
+        ];
+        assert_eq!(
+            render(&segs, "", Format::Timestamped),
+            "[00:00] hello\n[01:05] Speaker 1: we ship Thursday"
+        );
+    }
+
+    #[test]
+    fn a_pause_mid_turn_is_attributed_the_same_way_saved_and_streamed() {
+        // Two independent renderers state the same rule, so this is what
+        // catches them drifting: an unlabelled opening, a gap mid-turn, and
+        // a gap the diarizer could not label either side of.
+        let segs = [
+            seg_spk(0.0, "hello", None),
+            seg_spk(65.0, "we ship Thursday", Some(1)),
+            seg_spk(130.0, "or Friday", Some(1)),
+            seg_spk(200.0, " probably", None),
+        ];
+        let saved = render(&segs, "", Format::Timestamped);
+        assert_eq!(
+            saved,
+            "[00:00] hello\n[01:05] Speaker 1: we ship Thursday\n\
+             [02:10] Speaker 1: or Friday\n[03:20] Speaker 1: probably"
+        );
+
+        let dir = tmp("stream-parity-gap");
+        let p = dir.join("t.txt");
+        let mut w = crate::stream::StreamWriter::open(&p, Format::Timestamped).unwrap();
+        for s in &segs {
+            w.append(s).unwrap();
+        }
+        drop(w);
+        let streamed = std::fs::read_to_string(&p).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(saved, streamed);
     }
 
     #[test]

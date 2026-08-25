@@ -219,9 +219,9 @@ Speaker 1  Then Friday.
 
 A speaker change starts a new paragraph; unlabeled commits attach to the
 current paragraph without breaking it (they are usually short connective
-fragments). **Save as…** and `stream_to` write the same shape —
-`Speaker 2: text` per turn — since the streamed file is what the LLM
-consumes.
+fragments). **Save as…** and `stream_to` write the same attribution — the
+streamed file is what the LLM consumes — though where it goes differs by
+format, below.
 
 Composition with the existing formats, when labels are present:
 
@@ -238,6 +238,23 @@ Composition with the existing formats, when labels are present:
   source's session mints its own independent Speaker 1..N, and the source
   label is what distinguishes them. (For meetings this hardly matters —
   diarization is aimed at a single mixed capture.)
+
+How often the prefix appears follows from what a line means in each format.
+**timestamped** and **labelled** are one record per line — a line breaks on
+a pause of `NEW_LINE_AFTER_SILENCE`, and whatever reads the file back has
+that line and nothing else — so **every** line names a speaker, including
+one merely reopened by a pause inside a turn. **plain** is prose, where the
+paragraph is the record: the speaker is named once where the turn starts,
+because repeating it every time somebody drew breath would wreck the
+reading.
+
+The name is the turn's, not just the labelling commit's: a line opened by
+an unlabeled fragment inside an established turn carries that turn's
+speaker, which is already what the paragraph view claims about it. The
+exception is the start of a session, before any voice has been given a
+number — there is nothing honest to attribute those lines to, and the
+streamed file is append-only, so the first label to arrive is never applied
+backwards over what is already on disk.
 
 ## Testing
 

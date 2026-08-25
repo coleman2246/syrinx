@@ -122,6 +122,29 @@ mode = "transcribe"
 diarize = true
 ```
 
+### In the saved file
+
+Both **Save as…** and `stream_to` carry the labels through. Where the name
+goes depends on what a line means in the format:
+
+```
+[12:04] Speaker 1: We should ship on Thursday if the build is green.
+[12:09] Speaker 2: The build won't be green by Thursday.
+[12:11] Speaker 2: Marketing already announced it.
+```
+
+`timestamped` and `labelled` name a speaker on **every** line, including the
+one that opens after a pause in the middle of somebody's turn — as at 12:11
+above. Each line is a record on its own, and an LLM handed the file afterwards
+reads lines, not paragraphs. `plain` is prose and names the speaker once,
+where the turn starts, because repeating it every time somebody drew breath
+would wreck the reading.
+
+The one thing no format can attribute is the start of a session, before any
+voice has been given a number. Those lines arrive bare and stay that way: the
+streamed file is written as it is spoken, so the first label to arrive is
+never applied backwards over what is already on disk.
+
 ### Asking is not receiving
 
 `diarize = true` is a request, and the handshake answers it honestly rather

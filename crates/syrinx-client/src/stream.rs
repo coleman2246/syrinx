@@ -40,9 +40,10 @@ pub struct StreamWriter {
 struct Last {
     at: f64,
     source: Option<String>,
-    /// The last *labelled* speaker seen: an unlabelled fragment does not
+    /// The speaker whose turn is open: an unlabelled fragment does not
     /// overwrite it, so a short connective segment the diarizer could not
-    /// call stays attached to the turn already open.
+    /// call stays attached to the turn already open. A change of source
+    /// clears it -- see `turn_speaker`, which computes it.
     speaker: Option<u32>,
 }
 
@@ -114,11 +115,7 @@ impl StreamWriter {
             out.push_str(text);
         }
 
-        // The turn's speaker carries forward across an unlabelled fragment:
-        // only a labelled one ever changes it.
-        let speaker = seg
-            .speaker
-            .or_else(|| self.last.as_ref().and_then(|l| l.speaker));
+        let speaker = self.turn_speaker(seg);
         self.last = Some(Last {
             at: seg.at,
             source: seg.source.clone(),
@@ -161,18 +158,11 @@ impl StreamWriter {
     }
 
     /// The stamp, source and speaker, where relevant, that open a line.
-    ///
-    /// The speaker only appears when this fragment opens its turn: a line
-    /// reopened by a silence gap within the same speaker's turn does not
-    /// repeat it.
     fn line_prefix(&self, seg: &Segment) -> String {
-        let speaker_prefix = if self.opens_turn(seg) {
-            seg.speaker
-                .map(|n| format!("Speaker {n}: "))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let speaker_prefix = self
+            .line_speaker(seg)
+            .map(|n| format!("Speaker {n}: "))
+            .unwrap_or_default();
         match (self.format, &seg.source) {
             (Format::Plain, _) => speaker_prefix,
             (Format::Labelled, Some(src)) => {
@@ -182,8 +172,50 @@ impl StreamWriter {
         }
     }
 
+    /// Who, if anyone, is named at the start of a line, which is not the
+    /// same question in every format.
+    ///
+    /// `Timestamped` and `Labelled` are one record per line: whatever reads
+    /// the file back -- an LLM asked who said what, a grep, a person
+    /// scrolling -- has the line and nothing else, so every line names its
+    /// speaker, including one merely reopened after a pause mid-turn.
+    /// `Plain` is prose, where the paragraph is the record: only the line
+    /// that opens a turn is named, since repeating "Speaker 1: " every time
+    /// somebody drew breath would wreck the reading.
+    fn line_speaker(&self, seg: &Segment) -> Option<u32> {
+        if matches!(self.format, Format::Plain) {
+            return if self.opens_turn(seg) { seg.speaker } else { None };
+        }
+        self.turn_speaker(seg)
+    }
+
+    /// The speaker whose turn `seg` belongs to: its own label, or the one
+    /// carried by the turn already open when it has none -- usually a short
+    /// connective the diarizer could not call, which is still that person
+    /// talking.
+    ///
+    /// Reset by a change of source, mirroring `save::turns`: speaker numbers
+    /// are per-session and separate mode runs a session per source, so the
+    /// mic's Speaker 1 says nothing about the system audio's.
+    ///
+    /// Before any speaker has been identified there is nothing honest to
+    /// attribute a line to, and the file is append-only, so those opening
+    /// lines stay unattributed rather than borrowing the first label to
+    /// arrive.
+    fn turn_speaker(&self, seg: &Segment) -> Option<u32> {
+        if seg.speaker.is_some() {
+            return seg.speaker;
+        }
+        let last = self.last.as_ref()?;
+        if last.source != seg.source {
+            return None;
+        }
+        last.speaker
+    }
+
     /// Whether `seg` opens a new speaker's turn, as opposed to continuing
     /// (or merely resuming, after a pause, within) the turn already open.
+    /// `Plain`'s rule; the stamped formats name every line regardless.
     fn opens_turn(&self, seg: &Segment) -> bool {
         match &self.last {
             None => seg.speaker.is_some(),
@@ -429,7 +461,9 @@ mod tests {
     fn plain_does_not_break_a_turn_on_a_silence_gap() {
         // Plain has no stamp to go stale, so unlike Timestamped/Labelled a
         // pause between fragments from the same speaker must not start a
-        // new line -- only a speaker change does.
+        // new line -- only a speaker change does. Nothing is repeated here
+        // because nothing was reopened: the other half of the format split
+        // that `a_silence_gap_within_a_turn_repeats_the_speaker` states.
         let p = scratch("spk-plain-gap");
         let mut w = StreamWriter::open(&p, Format::Plain).unwrap();
         w.append(&seg_spk(0.0, "hello ", Some(1))).unwrap();
@@ -442,17 +476,100 @@ mod tests {
     }
 
     #[test]
-    fn a_silence_gap_within_a_turn_does_not_repeat_the_speaker() {
-        // The pause reopens the line, but not the turn: the speaker already
-        // named it, and repeating "Speaker 1:" on every fragment after a
-        // pause would be noise.
+    fn a_silence_gap_within_a_turn_repeats_the_speaker() {
+        // This used to assert the opposite, on the grounds that the turn had
+        // already been named. But a pause mid-turn is the ordinary shape of
+        // a meeting -- somebody talks, thinks, carries on -- so in practice
+        // most stamped lines came out with a time and nobody attached to
+        // them. A stamped line is a record on its own, and the record has to
+        // say who.
         let p = scratch("spk-gap");
         let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
         w.append(&seg_spk(0.0, "hello", Some(1))).unwrap();
         w.append(&seg_spk(65.0, "still there", Some(1))).unwrap();
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
-            "[00:00] Speaker 1: hello\n[01:05] still there"
+            "[00:00] Speaker 1: hello\n[01:05] Speaker 1: still there"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn labelled_repeats_the_speaker_after_a_gap_as_well() {
+        // Same rule as Timestamped: the source label never stood in for the
+        // speaker, and one microphone can carry several people.
+        let p = scratch("spk-gap-labelled");
+        let mk = |at: f64, text: &str, speaker: Option<u32>| Segment {
+            at,
+            text: text.into(),
+            source: Some("Yeti".into()),
+            speaker,
+        };
+        let mut w = StreamWriter::open(&p, Format::Labelled).unwrap();
+        w.append(&mk(0.0, "hello", Some(1))).unwrap();
+        w.append(&mk(65.0, "still there", Some(1))).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "[00:00] [Yeti] Speaker 1: hello\n[01:05] [Yeti] Speaker 1: still there"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_line_reopened_by_an_unlabelled_fragment_names_the_turn_anyway() {
+        // The diarizer says nothing about stretches it has not heard enough
+        // of, so the fragment that happens to follow a pause often carries
+        // no label of its own. It is still that person talking -- which is
+        // what the paragraph view already claims -- so the line says so too.
+        let p = scratch("spk-gap-none");
+        let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
+        w.append(&seg_spk(0.0, "hello", Some(1))).unwrap();
+        w.append(&seg_spk(65.0, "still there", None)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "[00:00] Speaker 1: hello\n[01:05] Speaker 1: still there"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn lines_before_any_speaker_is_known_stay_unattributed() {
+        // A voice needs a few seconds before it is given a number, so the
+        // opening of a session arrives unlabelled. There is nothing to
+        // attribute it to yet, and the file is append-only -- the first
+        // label to arrive cannot be applied backwards over what is already
+        // on disk.
+        let p = scratch("spk-leading");
+        let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
+        w.append(&seg_spk(0.0, "hello", None)).unwrap();
+        w.append(&seg_spk(65.0, "we ship Thursday", Some(1))).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "[00:00] hello\n[01:05] Speaker 1: we ship Thursday"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_new_source_does_not_inherit_the_previous_one_s_speaker() {
+        // Numbering is per-session and separate mode runs a session per
+        // source, so the mic's Speaker 1 and the system's Speaker 1 are two
+        // different people. Carrying a label across that boundary would put
+        // one of them in the other's mouth. `save::turns` forgets the
+        // numbering there for the same reason.
+        let p = scratch("spk-source");
+        let mk = |at: f64, text: &str, src: &str, speaker: Option<u32>| Segment {
+            at,
+            text: text.into(),
+            source: Some(src.into()),
+            speaker,
+        };
+        let mut w = StreamWriter::open(&p, Format::Labelled).unwrap();
+        w.append(&mk(0.0, "we ship Thursday", "Mic", Some(1))).unwrap();
+        w.append(&mk(0.6, "hmm", "System audio", None)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "[00:00] [Mic] Speaker 1: we ship Thursday\n[00:00] [System audio] hmm"
         );
         let _ = std::fs::remove_file(&p);
     }
