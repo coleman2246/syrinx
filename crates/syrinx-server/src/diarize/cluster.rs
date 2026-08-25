@@ -77,6 +77,16 @@ impl OnlineClusterer {
     /// matched no known speaker and there is not yet enough agreeing evidence
     /// to call it a new one. Pooling a window is not an assignment.
     pub fn observe(&mut self, embedding: &[f32]) -> Option<u32> {
+        if let Some(first) = self.centroids.first() {
+            // Cosine zips, so a width that changes mid-session truncates in
+            // silence and mislabels everything after it. Free in release, a
+            // panic anywhere a test or a dev build can see it.
+            debug_assert_eq!(
+                embedding.len(),
+                first.vector.len(),
+                "embedding width changed mid-session"
+            );
+        }
         let embedding = l2_normalize(embedding);
 
         if let Some((index, similarity)) = self.nearest(&embedding)
@@ -308,6 +318,18 @@ mod tests {
         assert!(second[..MIN_POOL - 1].iter().all(Option::is_none));
         // The first speaker keeps label 1 once the second exists.
         assert_eq!(c.observe(&noisy(0, 99)), Some(1));
+    }
+
+    /// A release test build compiles the guard out, and this test with it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "embedding width changed mid-session")]
+    fn a_changed_embedding_width_is_caught_before_it_mislabels() {
+        let mut c = OnlineClusterer::new();
+        for _ in 0..MIN_POOL {
+            c.observe(&voice(0));
+        }
+        c.observe(&[1.0; DIM + 1]);
     }
 
     #[test]
