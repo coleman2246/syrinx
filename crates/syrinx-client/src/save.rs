@@ -70,15 +70,22 @@ pub fn stamp(seconds: f64) -> String {
     }
 }
 
-/// Group segments into turns: a maximal run whose speaker matches the last
-/// labelled one. An unlabelled segment attaches to the turn already open
-/// rather than starting a fresh one -- usually it is a short connective
-/// fragment the diarizer could not call.
+/// Group segments into turns: a maximal run of one source whose speaker
+/// matches the last labelled one. An unlabelled segment attaches to the turn
+/// already open rather than starting a fresh one -- usually it is a short
+/// connective fragment the diarizer could not call.
+///
+/// A change of source always opens a turn, whatever the labels say. Speaker
+/// numbers are only meaningful within one session, and separate mode runs a
+/// session per source, so the mic's "Speaker 1" and the system's "Speaker 1"
+/// are two different people who happen to have been numbered first. Grouping
+/// on the number alone spliced them into a single paragraph under one
+/// heading.
 ///
 /// Exposed so anything that needs to know where a turn starts -- the GUI's
 /// paragraph view, which coalesces a turn regardless of any pause within it,
 /// and `render` below, which additionally splits a turn back into lines on a
-/// silence gap or a source change -- shares one rule for it.
+/// silence gap -- shares one rule for it.
 ///
 /// Segments rather than the plan's sketched rendered `String`: `render`
 /// below needs the raw segments to format each of `Plain`/`Timestamped`/
@@ -87,8 +94,18 @@ pub fn stamp(seconds: f64) -> String {
 pub fn turns(segments: &[Segment]) -> Vec<(Option<u32>, Vec<&Segment>)> {
     let mut out: Vec<(Option<u32>, Vec<&Segment>)> = Vec::new();
     let mut last_speaker: Option<u32> = None;
+    let mut last_source: Option<&Option<String>> = None;
     for seg in segments {
-        let opens_turn = out.is_empty() || (seg.speaker.is_some() && seg.speaker != last_speaker);
+        let source_changed = last_source.is_some_and(|last| *last != seg.source);
+        // The previous source's numbering says nothing about this one, so it
+        // is forgotten rather than carried across the boundary: otherwise the
+        // new source's own "Speaker 1" would match it and open no turn.
+        if source_changed {
+            last_speaker = None;
+        }
+        let opens_turn = out.is_empty()
+            || source_changed
+            || (seg.speaker.is_some() && seg.speaker != last_speaker);
         match (opens_turn, out.last_mut()) {
             (false, Some((_, segs))) => segs.push(seg),
             _ => out.push((seg.speaker, vec![seg])),
@@ -96,6 +113,7 @@ pub fn turns(segments: &[Segment]) -> Vec<(Option<u32>, Vec<&Segment>)> {
         if seg.speaker.is_some() {
             last_speaker = seg.speaker;
         }
+        last_source = Some(&seg.source);
     }
     out
 }
@@ -192,6 +210,11 @@ fn render_stamped(segments: &[Segment], format: Format) -> String {
 /// `Labelled`, a source change. Only the first line carries `true` --
 /// `render_line` only names the speaker there, since a line reopened later
 /// by a gap is still the same turn.
+///
+/// The source check is a guard rather than the mechanism: `turns` already
+/// ends a turn at a source change, so no turn reaching here spans two. It is
+/// kept because `StreamWriter::continues_line` states the same rule, and the
+/// two are meant to be readable as one.
 fn lines_in_turn(segs: Vec<&Segment>, format: Format) -> Vec<(bool, Vec<&Segment>)> {
     let mut lines: Vec<Vec<&Segment>> = Vec::new();
     for seg in segs {
@@ -671,6 +694,57 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].0, None);
         assert_eq!(t[0].1.len(), 2);
+    }
+
+    #[test]
+    fn two_sources_numbered_the_same_are_two_turns() {
+        // Regression: separate mode runs a session per source, each minting
+        // its own Speaker 1, and merge_states interleaves them into one list.
+        // Grouping on the number alone concatenated two different people's
+        // words into a single paragraph under one heading.
+        let mut mic = seg_spk(0.0, "we ship Thursday", Some(1));
+        mic.source = Some("Mic".into());
+        let mut system = seg_spk(0.6, "no we don't", Some(1));
+        system.source = Some("System audio".into());
+
+        let segs = [mic, system];
+        let t = turns(&segs);
+        assert_eq!(t.len(), 2, "a source change ends the turn");
+        assert_eq!(t[0].1.len(), 1);
+        assert_eq!(t[1].1.len(), 1);
+    }
+
+    #[test]
+    fn a_new_source_does_not_inherit_the_previous_one_s_numbering() {
+        // The second source opens unlabelled and only then produces its own
+        // Speaker 1. If the previous source's 1 were still remembered, that
+        // labelled fragment would match it, open no turn, and the turn would
+        // stay reported as unlabelled.
+        let mut mic = seg_spk(0.0, "we ship Thursday", Some(1));
+        mic.source = Some("Mic".into());
+        let mut system_first = seg_spk(0.6, "hmm", None);
+        system_first.source = Some("System audio".into());
+        let mut system_then = seg_spk(1.0, "no we don't", Some(1));
+        system_then.source = Some("System audio".into());
+
+        let segs = [mic, system_first, system_then];
+        let t = turns(&segs);
+        assert_eq!(t.len(), 3);
+        assert_eq!(t[1].0, None, "the new source's opening fragment");
+        assert_eq!(t[2].0, Some(1), "its own Speaker 1, freshly announced");
+    }
+
+    #[test]
+    fn plain_keeps_two_sources_apart_even_sharing_a_number() {
+        // What the bug actually looked like: one heading over both halves.
+        let mut mic = seg_spk(0.0, "we ship Thursday", Some(1));
+        mic.source = Some("Mic".into());
+        let mut system = seg_spk(0.6, "no we don't", Some(1));
+        system.source = Some("System audio".into());
+        assert_eq!(
+            render(&[mic, system], "", Format::Plain),
+            "Speaker 1: we ship Thursday\nSpeaker 1: no we don't"
+        );
     }
 
     #[test]

@@ -125,22 +125,22 @@ diarize = true
 ### Asking is not receiving
 
 `diarize = true` is a request, and the handshake answers it honestly rather
-than refusing the session. A client can ask and not receive — a server built
-without the feature, models missing or unreadable, a mode with no transcript to
-label — and the session then runs unlabelled, because a transcript without
-speaker labels is worth incomparably more than no transcript at all. The GUI
-says so under the status line, once a session is running: *Speaker labels
-unavailable on this server*.
+than refusing the session. Two things on the server can turn it down: it was
+built without the feature, or it could not read the models. Either way the
+session runs on unlabelled, because a transcript without speaker labels is
+worth incomparably more than no transcript at all. The GUI says so under the
+status line, once a session is running — *Speaker labels unavailable on this
+server* — and the server logs which of the two it was at `error!`, being the
+only end that knows.
 
-Which of those it was is a question only the server can answer, so it logs the
-two it knows about — no feature compiled in, or models it could not read — at
-`error!` on its own side. The third needs no log at either end: a client that
-asked for labels in a mode with no transcript already knows what it asked for.
+**`type` and `both` never ask in the first place**, so none of that applies to
+them and no notice appears. Labels are there to be read beside the words, and
+these modes put the words at the cursor, where a `Speaker 2:` prefix would
+land in the middle of whatever you are working in.
 
-**The typing modes never see labels.** `type` and `both` put text at the
-cursor, where a `Speaker 2:` prefix would land in the middle of whatever you
-are working in, so those sessions drop the request before it is sent whatever
-the config says. `transcribe` is the only mode that asks.
+Worth knowing in `both`, which does keep a transcript: that transcript will be
+unlabelled however the server is configured, and nothing in the interface will
+say why, because nothing went wrong. `transcribe` is the mode that asks.
 
 ### What to expect
 
