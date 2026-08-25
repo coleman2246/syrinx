@@ -6,7 +6,7 @@
 //! Ported from `spike/diarize/src/vad.rs`, validated there against AMI
 //! meetings and speaker-verification pairs.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, ensure};
 use ort::{session::Session, value::Tensor};
 
 use super::session;
@@ -31,16 +31,27 @@ pub struct Vad {
     session: Session,
     state: Vec<f32>,
     context: Vec<f32>,
+    /// Samples carried over from the previous [`Vad::run`] call because they
+    /// did not fill a whole 512-sample frame -- the same idea as `context`,
+    /// just at the caller's boundary instead of silero's. `RealDiarizer`
+    /// (Task 13) calls `run` once per ASR chunk (8960 samples = 17.5
+    /// frames); without this, the trailing 256 samples of every single
+    /// chunk would be silently dropped instead of joining the next one.
+    remainder: Vec<f32>,
+    gate: Gate,
 }
 
 impl Vad {
     pub fn new(path: &str) -> Result<Self> {
-        // One thread: silero is far too small for intra-op parallelism to pay
-        // for its own synchronisation, and this runs 500 times a second.
+        // One thread: silero is far too small for intra-op parallelism to
+        // pay for its own synchronisation, and one 512-sample frame is
+        // 32 ms, so this runs about 31 times a second per stream.
         Ok(Self {
             session: session(path, 1)?,
             state: vec![0.0; STATE],
             context: vec![0.0; CONTEXT],
+            remainder: Vec::new(),
+            gate: Gate::default(),
         })
     }
 
@@ -58,37 +69,47 @@ impl Vad {
             "sr" => sr,
         ])?;
 
-        let (_, next) = out["stateN"].try_extract_tensor::<f32>()?;
+        // `SessionOutputs`' `Index<&str>` panics on a missing name. The model
+        // file is user config (`diarize_model_dir`), so a wrong or
+        // differently-exported one must fail this one `push` with an `Err`,
+        // not unwind the session task -- session.rs's strike-out design
+        // exists precisely so a diarizer fault degrades the speaker labels,
+        // never the transcript, and that only holds if `Diarizer::push` can
+        // actually return the error instead of panicking past it.
+        let (_, next) = out
+            .get("stateN")
+            .ok_or_else(|| anyhow!("silero model has no \"stateN\" output"))?
+            .try_extract_tensor::<f32>()?;
         self.state.copy_from_slice(next);
-        let (_, p) = out["output"].try_extract_tensor::<f32>()?;
+
+        let (_, p) = out
+            .get("output")
+            .ok_or_else(|| anyhow!("silero model has no \"output\" output"))?
+            .try_extract_tensor::<f32>()?;
+        ensure!(!p.is_empty(), "silero's \"output\" tensor was empty");
         Ok(p[0])
     }
 
-    /// One speech/non-speech decision per 512-sample frame of `samples`.
+    /// One speech/non-speech decision per 512-sample frame accumulated from
+    /// `samples` and whatever was left over from the previous call.
+    ///
+    /// Hysteresis state ([`Gate`]) and the frame remainder both live on
+    /// `self`, so calling this repeatedly with successive chunks of one
+    /// stream is equivalent to calling it once with the whole stream
+    /// concatenated -- in particular, a turn that starts in one chunk and
+    /// continues into the next is not treated as two turns.
     pub fn run(&mut self, samples: &[f32]) -> Result<Vec<bool>> {
-        let frames = samples.len() / FRAME;
-        let mut voiced = Vec::with_capacity(frames);
-        let mut speaking = false;
-        let mut hangover = 0usize;
+        let mut buf = std::mem::take(&mut self.remainder);
+        buf.extend_from_slice(samples);
 
+        let frames = buf.len() / FRAME;
+        let mut voiced = Vec::with_capacity(frames);
         for f in 0..frames {
-            let p = self.prob(&samples[f * FRAME..(f + 1) * FRAME])?;
-            if speaking {
-                if p < LEAVE {
-                    if hangover == 0 {
-                        speaking = false;
-                    } else {
-                        hangover -= 1;
-                    }
-                } else {
-                    hangover = HANGOVER_FRAMES;
-                }
-            } else if p >= ENTER {
-                speaking = true;
-                hangover = HANGOVER_FRAMES;
-            }
-            voiced.push(speaking);
+            let p = self.prob(&buf[f * FRAME..(f + 1) * FRAME])?;
+            voiced.push(self.gate.step(p));
         }
+
+        self.remainder = buf.split_off(frames * FRAME);
         Ok(voiced)
     }
 }
@@ -110,9 +131,45 @@ fn with_context(context: &[f32], frame: &[f32]) -> Vec<f32> {
     buf
 }
 
+/// Speech/non-speech hysteresis: enter at `ENTER`, leave only after
+/// `HANGOVER_FRAMES` consecutive frames below `LEAVE`. Pulled out of
+/// [`Vad::run`] as a plain state machine -- no `Session`, no buffer -- for
+/// the same reason `with_context` was: this is the actual onset/hangover
+/// policy, and it deserves a unit test that isn't also exercising an ONNX
+/// session.
+#[derive(Default)]
+struct Gate {
+    speaking: bool,
+    hangover: usize,
+}
+
+impl Gate {
+    /// Feed one frame's speech probability; returns whether that frame
+    /// counts as speech after applying the hysteresis.
+    fn step(&mut self, p: f32) -> bool {
+        if self.speaking {
+            if p < LEAVE {
+                if self.hangover == 0 {
+                    self.speaking = false;
+                } else {
+                    self.hangover -= 1;
+                }
+            } else {
+                self.hangover = HANGOVER_FRAMES;
+            }
+        } else if p >= ENTER {
+            self.speaking = true;
+            self.hangover = HANGOVER_FRAMES;
+        }
+        self.speaking
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------- with_context
 
     #[test]
     fn context_is_prepended_and_the_result_is_576_wide() {
@@ -138,5 +195,42 @@ mod tests {
         let next_context = &buf[buf.len() - CONTEXT..];
 
         assert_eq!(next_context, &frame[FRAME - CONTEXT..]);
+    }
+
+    // -------------------------------------------------------------- Gate
+
+    #[test]
+    fn a_probability_below_enter_does_not_onset_from_silence() {
+        let mut gate = Gate::default();
+        assert!(!gate.step(0.4));
+    }
+
+    #[test]
+    fn once_speaking_a_probability_between_leave_and_enter_sustains() {
+        let mut gate = Gate::default();
+        assert!(gate.step(0.9), "0.9 is above ENTER, so this onsets");
+        assert!(
+            gate.step(0.4),
+            "0.4 is above LEAVE (0.35) so an already-open turn stays open, \
+             even though 0.4 alone would not have onset it from silence"
+        );
+    }
+
+    #[test]
+    fn a_four_frame_dip_bridges_and_a_fifth_ends_the_turn() {
+        let mut gate = Gate::default();
+        assert!(gate.step(0.9), "onset");
+
+        for n in 1..=HANGOVER_FRAMES {
+            assert!(
+                gate.step(0.0),
+                "dip frame {n}/{HANGOVER_FRAMES} is within the hangover \
+                 budget and must still read as speaking"
+            );
+        }
+        assert!(
+            !gate.step(0.0),
+            "the hangover budget is exhausted; the turn ends on this frame"
+        );
     }
 }

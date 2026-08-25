@@ -22,7 +22,11 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 use std::sync::Arc;
 
 pub const NUM_BINS: usize = 80;
-pub const SAMPLE_RATE: f32 = 16_000.0;
+/// Tied to [`syrinx_proto::SAMPLE_RATE`], not redeclared as a separate
+/// 16 kHz literal: everything upstream (capture, resampling, the ASR
+/// backend) already agrees on that constant, and this module has no reason
+/// to be the one place a future rate change gets missed.
+pub const SAMPLE_RATE: f32 = syrinx_proto::SAMPLE_RATE as f32;
 pub const FRAME_LEN: usize = 400; // 25 ms
 pub const FRAME_SHIFT: usize = 160; // 10 ms
 const FFT_LEN: usize = 512;
@@ -45,6 +49,7 @@ pub enum Norm {
     Mean,
     /// Subtract mean and divide by standard deviation (NeMo `per_feature`).
     MeanVar,
+    /// No normalisation: the model consumes raw log-mel energies as-is.
     None,
 }
 

@@ -9,10 +9,11 @@
 //! constructor argument, and the filename guess survives only as a
 //! documented convenience in [`Embedder::from_path`].
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use ort::{session::Session, value::Tensor, value::ValueType};
 
 use super::session;
+use crate::diarize::cluster::l2_normalize;
 use crate::diarize::fbank::{Fbank, NUM_BINS, Norm};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,7 +34,7 @@ pub struct Embedder {
     layout: Layout,
     norm: Norm,
     fbank: Fbank,
-    pub dim: usize,
+    dim: usize,
 }
 
 impl Embedder {
@@ -72,17 +73,23 @@ impl Embedder {
 
         // TitaNet exposes its 16k-way training classifier alongside the
         // embedding; the embedding is always the narrower output.
+        //
+        // `shape[1] > 0` excludes a dynamic axis: ONNX reports one as -1,
+        // and casting that to `usize` wraps to `usize::MAX`, which would
+        // otherwise either "win" a `min_by_key` tie against every other
+        // dynamic output or -- worse -- get picked as the embedding with a
+        // nonsensical multi-exabyte `dim`.
         let (output, dim) = session
             .outputs()
             .iter()
             .filter_map(|o| match o.dtype() {
-                ValueType::Tensor { shape, .. } if shape.len() == 2 => {
+                ValueType::Tensor { shape, .. } if shape.len() == 2 && shape[1] > 0 => {
                     Some((o.name().to_string(), shape[1] as usize))
                 }
                 _ => None,
             })
             .min_by_key(|(_, dim)| *dim)
-            .ok_or_else(|| anyhow::anyhow!("{path}: no 2-D output to read an embedding from"))?;
+            .ok_or_else(|| anyhow!("{path}: no 2-D output to read an embedding from"))?;
 
         Ok(Self {
             session,
@@ -109,16 +116,47 @@ impl Embedder {
         Self::new(path, threads, guess_norm(path))
     }
 
+    /// The embedding's dimensionality (192 for the production ERes2Net
+    /// model), read once from the ONNX output shape at construction.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Embed a single window. The common case for `RealDiarizer` (Task 13),
+    /// where one `push` completes at most one voiced window; a thin wrapper
+    /// over [`Embedder::embed_batch`] with a batch of one.
+    pub fn embed(&mut self, window: &[f32]) -> Result<Vec<f32>> {
+        let mut rows = self.embed_batch(&[window])?;
+        Ok(rows.pop().expect("embed_batch(1 window) returns 1 row"))
+    }
+
     /// Embed a batch of equal-length windows, L2-normalised, one row each.
-    pub fn embed_batch(&mut self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+    ///
+    /// Every window must be the same length -- the fbank frame count is
+    /// derived once, from the first window, and reused for the whole batch;
+    /// mismatched lengths are rejected rather than silently truncated or
+    /// left to panic on a slice-length mismatch downstream. A window
+    /// shorter than one fbank frame ([`crate::diarize::fbank::FRAME_LEN`],
+    /// 400 samples / 25 ms at 16 kHz) yields zero frames and an empty
+    /// feature tensor, which the embedding model will reject -- callers
+    /// should not offer the embedder anything shorter than that.
+    pub fn embed_batch(&mut self, windows: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
         if windows.is_empty() {
             return Ok(Vec::new());
         }
         let batch = windows.len();
-        let frames = Fbank::num_frames(windows[0].len());
+        let window_len = windows[0].len();
+        if let Some(bad) = windows.iter().position(|w| w.len() != window_len) {
+            bail!(
+                "embed_batch: window {bad} has {} samples, window 0 has {window_len}; \
+                 every window in a batch must be the same length",
+                windows[bad].len()
+            );
+        }
+        let frames = Fbank::num_frames(window_len);
 
         let mut packed = vec![0.0f32; batch * frames * NUM_BINS];
-        for (b, w) in windows.iter().enumerate() {
+        for (b, &w) in windows.iter().enumerate() {
             let mut feats = self.fbank.compute(w);
             debug_assert_eq!(feats.len(), frames * NUM_BINS);
             Fbank::normalize(&mut feats, self.norm);
@@ -152,7 +190,14 @@ impl Embedder {
         }
 
         let out = self.session.run(inputs)?;
-        let (shape, data) = out[self.output.as_str()].try_extract_tensor::<f32>()?;
+        // `SessionOutputs`' `Index<&str>` panics on a missing name; see the
+        // matching comment in `vad.rs::prob` for why a bad or
+        // differently-exported model must fail this call with an `Err`
+        // instead.
+        let (shape, data) = out
+            .get(self.output.as_str())
+            .ok_or_else(|| anyhow!("embedding model has no output named \"{}\"", self.output))?
+            .try_extract_tensor::<f32>()?;
         let dim = shape[1] as usize;
         // A single non-finite value would spread through an EMA update and
         // poison that centroid for the rest of the run, silently. Better to
@@ -181,16 +226,6 @@ fn guess_norm(path: &str) -> Norm {
     } else {
         Norm::Mean
     }
-}
-
-/// A unit-length copy. `diarize::cluster` carries its own private copy of
-/// this same function (it predates this module and is pure arithmetic with
-/// no `ort` in sight, so there was no reason to disturb its already-reviewed
-/// code to share one); this one exists so `embed_batch` above does not reach
-/// across a feature gate to borrow it.
-fn l2_normalize(v: &[f32]) -> Vec<f32> {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
-    v.iter().map(|x| x / norm).collect()
 }
 
 #[cfg(test)]

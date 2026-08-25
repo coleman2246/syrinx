@@ -230,7 +230,10 @@ impl OnlineClusterer {
 
 /// A unit-length copy. The zero guard keeps a silent window from producing
 /// NaNs that would poison every later comparison.
-fn l2_normalize(v: &[f32]) -> Vec<f32> {
+///
+/// `pub(super)`: `real::embed::Embedder` needs the same normalisation on its
+/// raw ONNX output and shares this copy rather than keeping its own.
+pub(super) fn l2_normalize(v: &[f32]) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
     v.iter().map(|x| x / norm).collect()
 }

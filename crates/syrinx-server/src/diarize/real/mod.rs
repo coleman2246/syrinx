@@ -19,7 +19,7 @@ pub use super::fbank::Norm;
 pub use embed::Embedder;
 pub use vad::{FRAME, Vad};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ort::execution_providers::CPU;
 use ort::session::Session;
 
@@ -34,10 +34,18 @@ use ort::session::Session;
 /// parakeet-rs's own (feature-unified to exactly one `ort` version; the two
 /// features otherwise know nothing about each other).
 fn session(path: &str, threads: usize) -> Result<Session> {
+    // Each `with_*` call returns `Result<SessionBuilder, Error<SessionBuilder>>`
+    // -- the generic error carries the builder back out for potential
+    // recovery -- so `.map_err(<ort::Error>::from)` drops that and gets a
+    // plain `ort::Error`, which is what lets `?` hand off to `anyhow`.
+    // `commit_from_file` takes `&mut self` (unlike the fluent `with_*`
+    // methods, which consume and return `Self`), hence the `mut` binding.
     let mut builder = Session::builder()?
         .with_execution_providers([CPU::default().build()])
         .map_err(<ort::Error>::from)?
         .with_intra_threads(threads)
         .map_err(<ort::Error>::from)?;
-    Ok(builder.commit_from_file(path)?)
+    builder
+        .commit_from_file(path)
+        .with_context(|| format!("loading ONNX model {path}"))
 }
