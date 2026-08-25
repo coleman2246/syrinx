@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use super::{Embedder, Norm, Vad};
 use crate::diarize::cluster::OnlineClusterer;
-use crate::diarize::window::{FRAME, Framer, WindowAssembler};
+use crate::diarize::window::{FRAME, Framer, WINDOW_SAMPLES, WindowAssembler};
 use crate::diarize::{Diarizer, DiarizerFactory};
 
 /// The VAD, by name, in `diarize_model_dir`. Fixed rather than sniffed:
@@ -26,12 +26,14 @@ const VAD_FILE: &str = "silero_vad.onnx";
 /// near-equal alternative.
 const EMBED_FILE: &str = "3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx";
 
-/// ONNX intra-op threads per model. One, because there is one diarizer per
-/// session and the spike measured the whole pipeline single-threaded at ~6% of
-/// a core; letting each of `max_sessions` diarizers spin up its own thread
+/// ONNX intra-op threads for the embedder. One, because there is one diarizer
+/// per session and the spike measured 45 ms per window single-threaded, ~6% of
+/// a core; letting each of `max_sessions` embedders spin up its own thread
 /// pool would trade that for contention with the ASR, which is the work that
-/// actually has to keep up.
-const THREADS: usize = 1;
+/// actually has to keep up. [`Vad::new`] makes the same call for itself, on
+/// stronger grounds: silero is far too small for intra-op parallelism to pay
+/// for its own synchronisation.
+const EMBED_THREADS: usize = 1;
 
 /// Where the models are and how to read them. Cheap to clone -- two paths and
 /// a flag -- which is what a per-session diarizer gets handed.
@@ -83,6 +85,9 @@ impl DiarizerFactory for RealDiarizerFactory {
 }
 
 impl Models {
+    /// Everything that touches the filesystem, and nothing that decides
+    /// anything: the VAD is checked by name, the directory is listed, and
+    /// [`pick_embed`] makes the choice.
     fn resolve(dir: &Path) -> Result<Self> {
         let vad = dir.join(VAD_FILE);
         ensure!(
@@ -93,72 +98,29 @@ impl Models {
             dir.display()
         );
 
-        // The calibrated model, by name, needs no guessing: the design doc
-        // records that 3D-Speaker is trained with plain cepstral mean
-        // normalisation.
-        let embed = dir.join(EMBED_FILE);
-        if embed.is_file() {
-            return Ok(Self {
-                vad,
-                embed,
-                norm: Norm::Mean,
-            });
-        }
-
-        // Otherwise take the one other ONNX file in the directory, but only if
-        // its name says which family it is -- normalisation is a property of
-        // the training recipe that the file itself does not record, and
-        // guessing it wrong produces embeddings that separate nobody without
-        // failing anywhere.
-        let (mut known, mut unknown) = (Vec::new(), Vec::new());
         let entries = std::fs::read_dir(dir).with_context(|| {
             format!("reading the diarization model directory {}", dir.display())
         })?;
+        let mut names = Vec::new();
         for entry in entries {
-            let path = entry
-                .with_context(|| format!("listing {}", dir.display()))?
-                .path();
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            if path.extension().is_none_or(|e| e != "onnx") || name == VAD_FILE {
-                continue;
-            }
-            match norm_for(&name) {
-                Some(norm) => known.push((path, norm, name)),
-                None => unknown.push(name),
-            }
+            let entry = entry.with_context(|| format!("listing {}", dir.display()))?;
+            names.push(entry.file_name().to_string_lossy().to_string());
         }
 
-        match known.len() {
-            1 => {
-                let (embed, norm, name) = known.remove(0);
-                warn!(
-                    "{}: using {name} for speaker embeddings ({norm:?} normalisation, \
-                     from its name) -- the calibrated model is {EMBED_FILE}",
-                    dir.display()
-                );
-                Ok(Self { vad, embed, norm })
-            }
-            0 => bail!(
-                "{}: no speaker-embedding model. Expected {EMBED_FILE}, or one file \
-                 whose name identifies its family (3dspeaker/eres2net, wespeaker, \
-                 nemo/titanet) so its feature normalisation is known. Found: {unknown:?}",
+        let (name, norm) = pick_embed(&names)
+            .with_context(|| format!("choosing an embedding model in {}", dir.display()))?;
+        if name != EMBED_FILE {
+            warn!(
+                "{}: using {name} for speaker embeddings ({norm:?} normalisation, from \
+                 its name) -- the calibrated model is {EMBED_FILE}",
                 dir.display()
-            ),
-            n => bail!(
-                "{}: {n} candidate embedding models ({}); leave exactly one, or name \
-                 the chosen one {EMBED_FILE}",
-                dir.display(),
-                known
-                    .iter()
-                    .map(|(_, _, name)| name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            );
         }
+        Ok(Self {
+            vad,
+            embed: dir.join(name),
+            norm,
+        })
     }
 
     /// Load both models and run them, returning the embedding width.
@@ -216,8 +178,11 @@ impl Models {
             voiced.len()
         );
 
-        let mut embedder = Embedder::new(&path(&self.embed), THREADS, self.norm)?;
-        let window = speech_like(24_000);
+        let mut embedder = Embedder::new(&path(&self.embed), EMBED_THREADS, self.norm)?;
+        // Exactly the window a session will hand it, so the shape checked here
+        // is the shape that runs -- an embedder that rejects the production
+        // frame count should fail at startup, not on someone's first meeting.
+        let window = speech_like(WINDOW_SAMPLES);
         let embedding = embedder
             .embed(&window)
             .context("embedding a window of synthesised speech")?;
@@ -241,11 +206,61 @@ impl Models {
     }
 }
 
+/// Which embedding model in a directory listing to use, and how to normalise
+/// its features -- the four-outcome decision behind [`Models::resolve`], with
+/// the filesystem left on the other side of it.
+///
+/// Pulled out for the same reason `vad`'s `take_frames` and `Gate` were: the
+/// arithmetic-free half is where the interesting cases are, and it should be
+/// testable without a directory to build first.
+///
+/// The rules, in order: the calibrated model wins by name; otherwise exactly
+/// one other ONNX file whose name identifies its family wins; zero or several
+/// is an error that says what to do about it. Guessing is what this refuses --
+/// normalisation is a property of the training recipe that the ONNX file does
+/// not record, and the wrong answer produces embeddings that separate nobody
+/// without failing anywhere.
+fn pick_embed(names: &[impl AsRef<str>]) -> Result<(String, Norm)> {
+    // The calibrated model needs no guessing: the design doc records that
+    // 3D-Speaker is trained with plain cepstral mean normalisation.
+    if names.iter().any(|n| n.as_ref() == EMBED_FILE) {
+        return Ok((EMBED_FILE.to_string(), Norm::Mean));
+    }
+
+    let candidates = names
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|n| n.ends_with(".onnx") && *n != VAD_FILE);
+    let (known, unknown): (Vec<_>, Vec<_>) = candidates.partition(|n| norm_for(n).is_some());
+
+    match known.as_slice() {
+        [only] => Ok((
+            (*only).to_string(),
+            norm_for(only).expect("partitioned on being recognised"),
+        )),
+        [] => bail!(
+            "no speaker-embedding model. Expected {EMBED_FILE}, or one file whose name \
+             identifies its family (3dspeaker/eres2net, wespeaker, nemo/titanet) so its \
+             feature normalisation is known. Found: {unknown:?}",
+        ),
+        several => bail!(
+            "{} candidate embedding models ({}); leave exactly one, or name the chosen \
+             one {EMBED_FILE}",
+            several.len(),
+            several.join(", ")
+        ),
+    }
+}
+
 /// The normalisation a model family's recipe used, from its filename.
 ///
-/// The same convenience [`Embedder::from_path`] documents, and the same
-/// caveat: it is a naming convention, not a fact about the file. A name this
-/// does not recognise turns the feature off loudly rather than picking one.
+/// The one such mapping in the tree, on purpose: `embed.rs` used to carry a
+/// second, looser copy that defaulted an unrecognised name to `Mean`, which is
+/// the silently-wrong outcome its own doc comment warned about. This is a
+/// naming convention rather than a fact about the file, so a name it does not
+/// recognise turns the feature off loudly instead of picking one. Matching is
+/// case-insensitive: `Titanet-Large.onnx` is the same model as
+/// `titanet-large.onnx`.
 fn norm_for(name: &str) -> Option<Norm> {
     let name = name.to_ascii_lowercase();
     if name.contains("nemo") || name.contains("titanet") {
@@ -357,7 +372,7 @@ impl State {
     fn load(models: &Models) -> Result<Self> {
         Ok(Self {
             vad: Vad::new(&models.vad.to_string_lossy())?,
-            embedder: Embedder::new(&models.embed.to_string_lossy(), THREADS, models.norm)?,
+            embedder: Embedder::new(&models.embed.to_string_lossy(), EMBED_THREADS, models.norm)?,
         })
     }
 }
@@ -377,6 +392,14 @@ impl RealDiarizer {
 
 impl Diarizer for RealDiarizer {
     fn push(&mut self, audio: &[f32]) -> Result<Option<u32>> {
+        // The lazy load has to fail *before* the framer sees this chunk, and
+        // that ordering is load-bearing rather than incidental: the framer
+        // mirrors a remainder that only exists once the VAD does, so consuming
+        // a chunk the VAD never saw would offset every later frame index by
+        // however much audio arrived before the models failed to load. Any
+        // tidying that groups the two uses of `audio` together breaks this
+        // silently -- the `ensure!` below would not fire, because both sides
+        // stay internally consistent while describing different audio.
         if self.state.is_none() {
             self.state = Some(State::load(&self.models).context("loading the diarization models")?);
         }
@@ -436,6 +459,64 @@ mod tests {
         // produces embeddings that look fine and separate nobody.
         assert_eq!(norm_for("model.onnx"), None);
         assert_eq!(norm_for("embedding.onnx"), None);
+    }
+
+    #[test]
+    fn the_calibrated_model_wins_by_name() {
+        // Even in the directory the spike left behind, which holds all three
+        // candidates: the name that was measured is not up for a vote.
+        let listing = [
+            VAD_FILE,
+            "wespeaker_en_voxceleb_resnet34_LM.onnx",
+            EMBED_FILE,
+            "nemo_en_titanet_small.onnx",
+            "checksum.txt",
+        ];
+        assert_eq!(
+            pick_embed(&listing).unwrap(),
+            (EMBED_FILE.to_string(), Norm::Mean)
+        );
+    }
+
+    #[test]
+    fn one_recognisable_model_is_taken_with_its_own_normalisation() {
+        let listing = [VAD_FILE, "Titanet-Large.onnx", "notes.md"];
+        assert_eq!(
+            pick_embed(&listing).unwrap(),
+            ("Titanet-Large.onnx".to_string(), Norm::MeanVar),
+            "the mapping is case-insensitive, so a capitalised checkpoint \
+             still gets NeMo's per-feature normalisation"
+        );
+    }
+
+    #[test]
+    fn a_directory_with_no_embedding_model_says_what_is_missing() {
+        // The VAD alone is not enough, and neither is an unrecognisable name:
+        // both leave the operator needing to know which file to add or rename.
+        let err = pick_embed(&[VAD_FILE, "model.onnx"]).expect_err("nothing recognisable");
+        let message = format!("{err:#}");
+        assert!(message.contains(EMBED_FILE), "{message}");
+        assert!(message.contains("model.onnx"), "{message}");
+    }
+
+    #[test]
+    fn two_candidates_are_ambiguous_rather_than_arbitrary() {
+        // Picking one silently would make the labels depend on directory
+        // order, so this refuses -- and names both files, since the fix is to
+        // remove or rename one of them.
+        let err = pick_embed(&[
+            VAD_FILE,
+            "wespeaker_en_voxceleb_resnet34_LM.onnx",
+            "nemo_en_titanet_small.onnx",
+        ])
+        .expect_err("two recognisable candidates");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("wespeaker_en_voxceleb_resnet34_LM.onnx"),
+            "{message}"
+        );
+        assert!(message.contains("nemo_en_titanet_small.onnx"), "{message}");
+        assert!(message.contains(EMBED_FILE), "{message}");
     }
 
     #[test]

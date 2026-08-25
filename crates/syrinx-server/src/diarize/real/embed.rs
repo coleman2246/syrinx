@@ -6,8 +6,12 @@
 //! property of the training recipe. Ported from `spike/diarize/src/embed.rs`,
 //! with one change required by that spike's review: normalisation used to be
 //! guessed from the model's filename there; here it is an explicit
-//! constructor argument, and the filename guess survives only as a
-//! documented convenience in [`Embedder::from_path`].
+//! constructor argument. The filename convention survives, but in exactly one
+//! place -- `diarizer::norm_for`, which resolves a model directory once at
+//! startup and refuses names it does not recognise. There is deliberately no
+//! guessing constructor on this type: a second copy of that mapping is a
+//! second answer to "which recipe is this?", and the wrong answer produces
+//! embeddings that separate nobody without failing anywhere.
 
 use anyhow::{Result, anyhow, bail};
 use ort::{session::Session, value::Tensor, value::ValueType};
@@ -101,19 +105,6 @@ impl Embedder {
             fbank: Fbank::new(),
             dim,
         })
-    }
-
-    /// [`Embedder::new`], with `norm` guessed from the filename.
-    ///
-    /// A convenience, not the contract: it exists so a model directory laid
-    /// out the way `spike/diarize` expected it (`*nemo*`/`*titanet*` for
-    /// NeMo-style models, anything else for WeSpeaker/3D-Speaker) can be
-    /// loaded with one call. Anything that matters -- a differently-named
-    /// checkpoint, a fourth model family -- should call
-    /// [`Embedder::new`] directly with the normalisation it actually needs
-    /// rather than rely on this guess.
-    pub fn from_path(path: &str, threads: usize) -> Result<Self> {
-        Self::new(path, threads, guess_norm(path))
     }
 
     /// The embedding's dimensionality (192 for the production ERes2Net
@@ -216,39 +207,9 @@ impl Embedder {
     }
 }
 
-/// The filename convention `from_path` guesses normalisation from: NeMo's
-/// preprocessor normalises per feature, WeSpeaker and 3D-Speaker apply plain
-/// CMN, and neither fact is visible in the ONNX graph itself.
-fn guess_norm(path: &str) -> Norm {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    if name.contains("nemo") || name.contains("titanet") {
-        Norm::MeanVar
-    } else {
-        Norm::Mean
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn from_path_picks_meanvar_for_nemo_and_titanet_names() {
-        for name in [
-            "nemo_titanet.onnx",
-            "titanet-large.onnx",
-            "some-nemo-v2.onnx",
-        ] {
-            assert_eq!(guess_norm(name), Norm::MeanVar, "{name}");
-        }
-    }
-
-    #[test]
-    fn from_path_picks_mean_for_everything_else() {
-        for name in ["wespeaker.onnx", "3dspeaker_eres2net.onnx", "model.onnx"] {
-            assert_eq!(guess_norm(name), Norm::Mean, "{name}");
-        }
-    }
 
     #[test]
     fn l2_normalize_produces_a_unit_vector() {

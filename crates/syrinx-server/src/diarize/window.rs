@@ -2,24 +2,24 @@
 //!
 //! Ported from `spike/diarize/src/main.rs::windows()`, the reference the AMI
 //! numbers in the design doc were measured against. Pure arithmetic -- no
-//! models, no `ort`, no feature gate -- for the same reason
-//! [`fbank`](crate::diarize::fbank) has none: this is where the alignment bugs
-//! live, so the default `cargo test` should be catching them, not only the
-//! `diarize` build.
+//! models, no `ort`, no feature gate -- for the same reason [`super::fbank`]
+//! has none: this is where the alignment bugs live, so the default
+//! `cargo test` should be catching them, not only the `diarize` build.
 //!
-//! Two pieces, because they fail differently.
-//! [`Framer`](crate::diarize::window::Framer) answers "which samples do the
-//! VAD's flags describe?", which is a question about the *stream*;
-//! [`WindowAssembler`](crate::diarize::window::WindowAssembler) answers "is
-//! there a window's worth of one person talking yet?", which is about the
-//! *speech*.
+//! Two pieces, because they fail differently. [`Framer`] answers "which
+//! samples do the VAD's flags describe?", which is a question about the
+//! *stream*; [`WindowAssembler`] answers "is there a window's worth of one
+//! person talking yet?", which is about the *speech*.
 
 use std::collections::VecDeque;
 
-/// Samples per VAD frame: 32 ms at 16 kHz. Silero v5 accepts nothing else
-/// (see [`crate::diarize::real::Vad`] for why), and this module counts in the
-/// same frames, so the two share one definition rather than agreeing by
-/// coincidence.
+/// Samples per VAD frame: 32 ms at 16 kHz. Silero v5 accepts nothing else --
+/// `real::vad` records why -- and this module counts in the same frames, so
+/// the two share one definition rather than agreeing by coincidence.
+///
+/// Named in prose rather than linked, here and below: `real` is behind the
+/// `diarize` feature and this module is not, so a link would dangle in the
+/// default build, which is the one CI runs.
 pub const FRAME: usize = 512;
 
 /// Voiced frames per embedding window and per hop: the spike's calibrated 1.5 s
@@ -29,7 +29,10 @@ pub const FRAME: usize = 512;
 /// counts every published number was measured with.
 const WINDOW_FRAMES: usize = 47;
 const HOP_FRAMES: usize = 23;
-const WINDOW_SAMPLES: usize = WINDOW_FRAMES * FRAME;
+/// Samples in one completed window. Public because the startup self-check
+/// probes the embedder with exactly this length: the shape it proves should be
+/// the shape a session runs.
+pub const WINDOW_SAMPLES: usize = WINDOW_FRAMES * FRAME;
 const HOP_SAMPLES: usize = HOP_FRAMES * FRAME;
 
 /// Voiced frames further apart than this start the window over instead of
@@ -59,15 +62,24 @@ pub struct Framed {
 
 /// Splits a stream of chunks into whole VAD frames, carrying the remainder.
 ///
-/// This repeats, deliberately, what [`crate::diarize::real::Vad::run`] does
-/// with its own remainder -- and it has to, because the flags that call
-/// returns index the *concatenated* stream rather than the chunk handed to it:
+/// This repeats, deliberately, what `real::Vad::run` does with its own
+/// remainder -- and it has to, because the flags that call returns index the
+/// *concatenated* stream rather than the chunk handed to it:
 /// an ASR chunk is 8960 samples, which is 17.5 frames, so from the second
 /// chunk onwards `voiced[0]` describes a frame that began in the chunk before.
 /// The diarizer needs the audio those flags describe, so it splits the stream
-/// the same way here. Two copies of one piece of arithmetic is the price of
-/// the VAD owning its own remainder; the caller checks the frame counts agree
-/// on every chunk rather than trusting them to.
+/// the same way here.
+///
+/// The alternative considered was giving that remainder one owner -- `Vad`
+/// holding a `Framer` and returning the frames it decided on alongside the
+/// flags -- which would make disagreement impossible rather than detectable.
+/// It was not taken because the two are not really one piece of state: the VAD
+/// consumes a chunk into its remainder *before* its first inference, so a
+/// mid-chunk failure leaves the model's own position ahead of the frames it
+/// managed to decide, and the diarizer has to track the stream even for chunks
+/// the VAD never reported on. Two independent counts that must agree, checked
+/// on every chunk, catch that class of bug where a single shared count would
+/// quietly absorb it.
 #[derive(Default)]
 pub struct Framer {
     carry: Vec<f32>,
@@ -133,9 +145,13 @@ impl WindowAssembler {
                 continue;
             }
             let index = framed.first_frame + i;
+            // saturating: frames arrive in order, so this is a plain
+            // subtraction in practice -- but a caller that ever handed over an
+            // out-of-order chunk would get an underflow panic in the middle of
+            // a session, and reading it as "no gap" is the safe answer.
             if self
                 .last
-                .is_some_and(|previous| index - previous > MAX_GAP_FRAMES)
+                .is_some_and(|previous| index.saturating_sub(previous) > MAX_GAP_FRAMES)
             {
                 self.voiced.clear();
             }
@@ -292,19 +308,23 @@ mod tests {
         assert_eq!(completed, 2, "one window, then one more a hop later");
     }
 
+    /// The gap rule's exact boundary, from both sides, since `>` and `>=` are
+    /// one keystroke apart and the spike's comparison is `>`: a distance of
+    /// MAX_GAP_FRAMES between two voiced frames still splices them, and one
+    /// frame further is the first that does not. A test that jumps well past
+    /// the boundary would pass against either comparison.
     #[test]
-    fn a_gap_within_the_budget_keeps_accumulating() {
-        let mut a = WindowAssembler::default();
-        a.push(&frames(0, 1, 1.0), &[true]);
-
-        // Exactly MAX_GAP_FRAMES apart still splices -- the rule breaks on
-        // *further* than that, which is the spike's comparison.
-        a.push(&frames(MAX_GAP_FRAMES, 1, 1.0), &[true]);
-        assert_eq!(
-            a.voiced.len(),
-            2 * FRAME,
-            "both frames are still accumulated"
-        );
+    fn the_gap_boundary_is_where_the_spike_put_it() {
+        for (distance, kept) in [(MAX_GAP_FRAMES, 2), (MAX_GAP_FRAMES + 1, 1)] {
+            let mut a = WindowAssembler::default();
+            a.push(&frames(0, 1, 1.0), &[true]);
+            a.push(&frames(distance, 1, 1.0), &[true]);
+            assert_eq!(
+                a.voiced.len(),
+                kept * FRAME,
+                "at a distance of {distance} frames the accumulator should hold {kept}"
+            );
+        }
     }
 
     #[test]
@@ -315,10 +335,13 @@ mod tests {
             &frames(0, WINDOW_FRAMES - 1, 1.0),
             &[true; WINDOW_FRAMES - 1],
         );
+        let last_voiced = WINDOW_FRAMES - 2;
 
         // ...then a silence long enough that splicing across it would build a
-        // window out of two different turns.
-        let resumed = a.push(&frames(WINDOW_FRAMES + MAX_GAP_FRAMES, 1, 2.0), &[true]);
+        // window out of two different turns. Measured from the last voiced
+        // frame, which is what the rule compares against.
+        let resumes_at = last_voiced + MAX_GAP_FRAMES + 1;
+        let resumed = a.push(&frames(resumes_at, 1, 2.0), &[true]);
         assert!(resumed.is_empty());
         assert_eq!(
             a.voiced.len(),
@@ -330,7 +353,7 @@ mod tests {
         // WINDOW_FRAMES of it, not a splice across the silence.
         let mut out = Vec::new();
         for i in 1..WINDOW_FRAMES {
-            out.extend(a.push(&frames(WINDOW_FRAMES + MAX_GAP_FRAMES + i, 1, 2.0), &[true]));
+            out.extend(a.push(&frames(resumes_at + i, 1, 2.0), &[true]));
         }
         assert_eq!(out.len(), 1);
         assert!(out[0].iter().all(|&x| x == 2.0));
@@ -344,14 +367,15 @@ mod tests {
         // splice the audio either side of it together.
         let mut a = WindowAssembler::default();
         a.push(&frames(0, 10, 1.0), &[true; 10]);
+        let last_voiced = 9;
 
-        a.push(&frames(10 + MAX_GAP_FRAMES + 1, 1, 2.0), &[true]);
+        a.push(&frames(last_voiced + MAX_GAP_FRAMES + 1, 1, 2.0), &[true]);
         assert_eq!(a.voiced.len(), FRAME, "the audio either side was spliced");
     }
 
     #[test]
     fn a_flag_without_audio_behind_it_is_ignored() {
-        // chunks_exact truncates to the audio that is actually there: a
+        // as_chunks truncates to the audio that is actually there: a
         // mismatch is the caller's bug to report, never a panic in here.
         let mut a = WindowAssembler::default();
         let out = a.push(&frames(0, 1, 1.0), &[true; 4]);

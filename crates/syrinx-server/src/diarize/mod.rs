@@ -10,12 +10,13 @@ pub mod cluster;
 /// needs no `ort` itself, so there is no reason to hide it behind the
 /// `diarize` feature and lose its CI coverage.
 pub mod fbank;
-/// Voiced audio into embedding windows. Unconditional for the same reason
-/// `fbank` is: pure arithmetic, and the place stream alignment goes wrong.
+// `window` and `real` carry their own summaries in their `//!` headers rather
+// than here. Not a style wobble: an outer doc comment on a `mod` line moves
+// the whole module's doc block into *this* module's link scope, so every
+// `[`Framer`]` in the file's own header silently stops resolving. Modules
+// whose headers link to their own items are documented in the file.
 pub mod window;
 
-/// The real ONNX-backed VAD and embedding wrappers. Optional so the default
-/// build needs no `ort`, mirroring `asr::parakeet`'s `cuda` gate.
 #[cfg(feature = "diarize")]
 pub mod real;
 
