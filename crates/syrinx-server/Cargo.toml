@@ -17,6 +17,13 @@ axum = { version = "0.8", features = ["ws", "multipart"] }
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 toml = "0.9"
+# The Kaldi-compatible fbank front end (diarize::fbank) needs an FFT. Not
+# optional: fbank is pure arithmetic, unconditionally compiled so it gets
+# every-PR CI coverage rather than only the diarize feature build's, so
+# rustfft has to be a plain dependency too. It's also what parakeet-rs pulls
+# in transitively (as realfft's dependency) at the same major version, so
+# this does not add a second FFT implementation to the tree.
+rustfft = "6"
 
 # The real GPU backend is optional so `cargo test` stays fast and CUDA-free.
 # CI runs the default feature set; the GPU path is built with --features cuda.
@@ -35,16 +42,12 @@ libc = { version = "0.2", optional = true }
 # parakeet-rs's own `ort` spec settle the link strategy when `cuda` and
 # `diarize` are both on.
 ort = { version = "2.0.0-rc.13", optional = true }
-# Hand-rolled Kaldi-compatible fbank (real::fbank) needs an FFT; rustfft is
-# also what parakeet-rs pulls in transitively (as realfft's dependency), so
-# this does not add a second FFT implementation to the tree.
-rustfft = { version = "6", optional = true }
 
 [features]
 default = []
 cuda = ["dep:parakeet-rs", "dep:libc"]
 # cuda stays as-is; the two are independent.
-diarize = ["dep:ort", "dep:rustfft"]
+diarize = ["dep:ort"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.30"

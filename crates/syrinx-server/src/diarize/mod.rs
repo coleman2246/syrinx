@@ -5,6 +5,11 @@
 //! in CI with [`MockDiarizer`], with no models anywhere near the tests.
 
 pub mod cluster;
+/// The Kaldi-compatible fbank front end. Pure arithmetic, unconditional like
+/// `cluster` -- `real::embed::Embedder` is its only in-crate consumer, but it
+/// needs no `ort` itself, so there is no reason to hide it behind the
+/// `diarize` feature and lose its CI coverage.
+pub mod fbank;
 
 /// The real ONNX-backed VAD and embedding wrappers. Optional so the default
 /// build needs no `ort`, mirroring `asr::parakeet`'s `cuda` gate.

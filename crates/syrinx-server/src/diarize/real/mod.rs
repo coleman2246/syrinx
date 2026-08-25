@@ -5,13 +5,18 @@
 //! Gated behind the `diarize` feature so the default build stays free of
 //! `ort`. [`super::Diarizer`] is implemented on top of these two structs by
 //! `RealDiarizer` (Task 13); this module only owns the model sessions.
+//!
+//! The fbank front end these wrap lives one level up, at
+//! [`super::fbank`]: it is pure arithmetic with no `ort` in it, so it is
+//! not gated here and gets CI coverage in the default build too.
 
 mod embed;
-mod fbank;
 mod vad;
 
+/// Re-exported for convenience: callers of this module's `Embedder::new`
+/// need `Norm` without reaching past it into `diarize::fbank` themselves.
+pub use super::fbank::Norm;
 pub use embed::Embedder;
-pub use fbank::{Norm, SAMPLE_RATE};
 pub use vad::{FRAME, Vad};
 
 use anyhow::Result;

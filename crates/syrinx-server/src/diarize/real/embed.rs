@@ -12,8 +12,8 @@
 use anyhow::{Result, bail};
 use ort::{session::Session, value::Tensor, value::ValueType};
 
-use super::fbank::{Fbank, NUM_BINS, Norm};
 use super::session;
+use crate::diarize::fbank::{Fbank, NUM_BINS, Norm};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Layout {

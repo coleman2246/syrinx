@@ -10,6 +10,13 @@
 //! Ported from `spike/diarize/src/fbank.rs` unchanged: the arithmetic here is
 //! validated, not merely plausible, so it is ported byte-for-byte rather than
 //! rewritten.
+//!
+//! Pure arithmetic -- no models, no `ort`, no feature gate, same reasoning as
+//! its sibling `cluster.rs`. This is the component most likely to fail
+//! silently rather than loudly (a wrong bin still "looks like" a spectrum),
+//! so it is the one that most wants every-PR CI coverage rather than only
+//! the `diarize`-feature build's. `real::embed::Embedder` (feature-gated,
+//! needs `ort`) is this module's only consumer inside the crate.
 
 use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 use std::sync::Arc;
