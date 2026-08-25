@@ -19,7 +19,7 @@ mod vad;
 /// Re-exported for convenience: callers of this module's `Embedder::new`
 /// need `Norm` without reaching past it into `diarize::fbank` themselves.
 pub use super::fbank::Norm;
-pub use diarizer::{RealDiarizer, RealDiarizerFactory};
+pub use diarizer::{RealDiarizer, RealDiarizerFactory, norm_for};
 pub use embed::Embedder;
 pub use vad::Vad;
 

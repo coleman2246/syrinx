@@ -52,3 +52,15 @@ diarize = ["dep:ort"]
 [dev-dependencies]
 tokio-tungstenite = "0.30"
 hound = "3.5"
+
+# The evaluation harness needs `ort`, so it must not be built by a default
+# `cargo check --all-targets`. `required-features` is cargo's own mechanism for
+# that -- the example is skipped rather than compiled into an error message --
+# which is why this one is declared here while `gpu_probe` keeps its
+# `#[cfg(not(feature = "cuda"))] fn main`. A multi-file example is a directory
+# with a `main.rs`; the path is spelled out because declaring the target at all
+# turns cargo's inference off.
+[[example]]
+name = "diarize_probe"
+path = "examples/diarize_probe/main.rs"
+required-features = ["diarize"]

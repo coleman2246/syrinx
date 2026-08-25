@@ -290,15 +290,21 @@ harness, README model-download section mirroring the ASR one. Turn it on.
 
 ## Spike results
 
-**Date:** 2026-08-24. **Verdict: go.** Code in `spike/diarize`.
+**Date:** 2026-08-24. **Verdict: go.** Measured in `spike/diarize`, which has
+since graduated into the tree: the pipeline is `syrinx-server`'s own
+`diarize` module, and the harness that produced every number below is
+`crates/syrinx-server/examples/diarize_probe` (`cargo run --release -p
+syrinx-server --features diarize --example diarize_probe -- <subcommand>`).
+The subcommand names are unchanged, so each citation below still names the
+command that reproduces it.
 
 ### What was run
 
-`spike/diarize` implements the whole design end to end — silero VAD, sliding
-voiced windows, a hand-rolled Kaldi-compatible fbank, an ONNX speaker
-embedder, and the clusterer from "Stage 3" above — over wav files, scored
-against the AMI manual annotations (v1.6.2, word-level times, so pauses
-inside a turn are not counted as speech).
+The pipeline runs the whole design end to end — silero VAD, sliding voiced
+windows, a hand-rolled Kaldi-compatible fbank, an ONNX speaker embedder, and
+the clusterer from "Stage 3" above — over wav files, scored against the AMI
+manual annotations (v1.6.2, word-level times, so pauses inside a turn are not
+counted as speech).
 
 Recordings, all AMI `Mix-Headset` at 16 kHz mono (corpus CC-BY-4.0):
 

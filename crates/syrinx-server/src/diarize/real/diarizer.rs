@@ -146,7 +146,7 @@ impl Models {
     /// roughly one voice (measured: ERes2Net puts two synthesised speakers at
     /// cosine 0.81, against 0.97 for one; WeSpeaker at 0.91 against 0.93 --
     /// too close to assert on). Separability needs real voices, which is what
-    /// `spike/diarize verify` and the evaluation harness are for.
+    /// the `diarize_probe` example's `verify` and `separability` are for.
     fn self_check(&self) -> Result<usize> {
         let path = |p: &Path| p.to_string_lossy().to_string();
         let mut vad = Vad::new(&path(&self.vad))?;
@@ -261,7 +261,14 @@ fn pick_embed(names: &[impl AsRef<str>]) -> Result<(String, Norm)> {
 /// recognise turns the feature off loudly instead of picking one. Matching is
 /// case-insensitive: `Titanet-Large.onnx` is the same model as
 /// `titanet-large.onnx`.
-fn norm_for(name: &str) -> Option<Norm> {
+///
+/// `pub` for `examples/diarize_probe`, which compares model families against
+/// each other and so names each file on the command line rather than resolving
+/// a directory. Keeping it the only mapping matters more there than anywhere:
+/// the probe is where a model's numbers are measured, and measuring one under
+/// the wrong normalisation would put a wrong number in the design doc.
+#[doc(hidden)]
+pub fn norm_for(name: &str) -> Option<Norm> {
     let name = name.to_ascii_lowercase();
     if name.contains("nemo") || name.contains("titanet") {
         Some(Norm::MeanVar)

@@ -1,14 +1,21 @@
-//! AMI ground truth and the three measurements the spec actually asks for.
+//! AMI ground truth and the three measurements the design doc asks for.
 //!
 //! Reference turns come from the AMI manual annotations' word-level
 //! alignments rather than the transcriber's `segments`, because segments
 //! include the pauses inside a turn and would count silence as speech.
+//!
+//! Ported unchanged from `spike/diarize/src/reference.rs`: every number in the
+//! design doc's "Spike results" was produced by this scoring code, so it moves
+//! into the tree as it was rather than being rewritten around the tree's
+//! types. Nothing here is production code -- the server never scores itself
+//! against an annotation -- which is why it lives beside the probe instead of
+//! in `src/diarize`.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
-/// Everything is scored on a 10 ms grid — the fbank frame rate, and finer
-/// than the ~1 s boundary accuracy the spec cares about.
+/// Everything is scored on a 10 ms grid -- the fbank frame rate, and finer
+/// than the ~1 s boundary accuracy the design cares about.
 pub const FRAME_MS: f32 = 0.01;
 
 /// A hypothesis label must hold this share of a speaker's frames before it
@@ -91,7 +98,7 @@ pub struct Metrics {
     /// Labels that significantly cover more than one real speaker.
     pub merges: usize,
     /// Dominant label per reference speaker in each third of the meeting;
-    /// the spec's "does Speaker 2 stay Speaker 2 in hour three" question.
+    /// the design's "does Speaker 2 stay Speaker 2 in hour three" question.
     pub thirds: Vec<[Option<u32>; 3]>,
     /// Seconds of single-speaker reference speech per speaker. A speaker with
     /// only a few seconds cannot be split or merged meaningfully, and saying
@@ -100,7 +107,7 @@ pub struct Metrics {
 }
 
 /// Score a per-frame hypothesis against the reference, ignoring frames where
-/// two or more people talk at once — overlap is explicitly out of scope.
+/// two or more people talk at once -- overlap is explicitly out of scope.
 pub fn score(hyp: &[Option<u32>], reference: &Reference) -> Metrics {
     let n = reference.frames.len().min(hyp.len());
     let nspk = reference.names.len();
@@ -204,7 +211,7 @@ pub fn window_speaker(reference: &Reference, t0: f32, t1: f32) -> Option<usize> 
 }
 
 /// Frames of each reference speaker carrying each hypothesis label, in
-/// seconds — the raw picture behind splits and merges.
+/// seconds -- the raw picture behind splits and merges.
 pub fn overlap_matrix(hyp: &[Option<u32>], reference: &Reference) -> (Vec<u32>, Vec<Vec<f32>>) {
     let n = reference.frames.len().min(hyp.len());
     let nspk = reference.names.len();
@@ -237,7 +244,7 @@ pub fn overlap_matrix(hyp: &[Option<u32>], reference: &Reference) -> (Vec<u32>, 
 }
 
 /// Times at which the person speaking changes. Silence and overlap do not
-/// end a turn — the speaker is whoever last held the floor alone — so a pause
+/// end a turn -- the speaker is whoever last held the floor alone -- so a pause
 /// mid-sentence is not counted as a boundary the diarizer had to find.
 fn changes<T: PartialEq + Copy>(seq: impl Iterator<Item = Option<T>>) -> Vec<f32> {
     let mut out = Vec::new();
@@ -282,7 +289,7 @@ pub struct Boundaries {
     /// react to this turn at all", so short turns it never labels dominate it.
     pub recall: (f32, f32, f32),
     /// Emitted change -> nearest reference change. Answers "when the diarizer
-    /// starts a new paragraph, is there really a new speaker there" — the
+    /// starts a new paragraph, is there really a new speaker there" -- the
     /// direction the transcript's readability depends on.
     pub precision: (f32, f32, f32),
 }

@@ -15,21 +15,33 @@
 //! Pure arithmetic. No models, no `ort`, no feature gate -- which is what lets
 //! the whole of the labelling policy be tested in CI on synthetic embeddings.
 
+// The four constants are `#[doc(hidden)] pub` rather than private for one
+// reason: `examples/diarize_probe` overrides them one at a time, and it is
+// external to this crate, so a private const would force it to keep its own
+// copy of the other three. A stale copy there would attribute a sweep's
+// numbers to constants the server no longer ships, which is precisely the
+// failure the probe exists to prevent. Hidden from the docs because they are
+// still not a configuration surface -- see [`OnlineClusterer::with_params`].
+
 /// Cosine similarity above which an embedding joins its nearest centroid.
 /// 0.45, not the 0.6 the design first guessed: the spike measured
 /// same-speaker windows at a median cosine of 0.52, so 0.6 rejects most true
 /// matches.
-const T_ASSIGN: f32 = 0.45;
+#[doc(hidden)]
+pub const T_ASSIGN: f32 = 0.45;
 /// Mutually agreeing orphan windows before a new speaker is minted. Not a
 /// free parameter: at 2 the spike minted 20 labels for a 4-speaker meeting,
 /// and 3 still failed an 87-minute one.
-const MIN_POOL: usize = 4;
+#[doc(hidden)]
+pub const MIN_POOL: usize = 4;
 /// How much one window moves a centroid. Small: a centroid is its history,
 /// not its last sentence. Insensitive across 0.02-0.20 in the spike.
-const EMA_ALPHA: f32 = 0.05;
+#[doc(hidden)]
+pub const EMA_ALPHA: f32 = 0.05;
 /// Centroids closer than this are duplicates; the newer retires. Below 0.65
 /// this retires genuinely different speakers into one.
-const T_RETIRE: f32 = 0.80;
+#[doc(hidden)]
+pub const T_RETIRE: f32 = 0.80;
 
 /// One speaker's running identity.
 struct Centroid {
@@ -53,6 +65,13 @@ pub struct OnlineClusterer {
     /// become a new speaker.
     pool: Vec<Vec<f32>>,
     next_label: u32,
+    /// The four thresholds, held rather than read from the consts so that the
+    /// probe can sweep them. Every shipped clusterer is built by
+    /// [`OnlineClusterer::new`] and carries exactly the consts above.
+    t_assign: f32,
+    t_retire: f32,
+    alpha: f32,
+    min_pool: usize,
 }
 
 impl Default for OnlineClusterer {
@@ -63,10 +82,30 @@ impl Default for OnlineClusterer {
 
 impl OnlineClusterer {
     pub fn new() -> Self {
+        Self::with_params(T_ASSIGN, T_RETIRE, EMA_ALPHA, MIN_POOL)
+    }
+
+    /// A clusterer with the thresholds overridden. **Not a configuration
+    /// surface**: shipped behaviour is [`OnlineClusterer::new`]'s, which is
+    /// the calibrated constants above and the only construction the server
+    /// ever performs.
+    ///
+    /// This exists for `examples/diarize_probe`'s sweep, which re-measures
+    /// those constants against annotated meetings and therefore has to vary
+    /// them without forking the algorithm -- a sweep against a second copy of
+    /// this code would answer a question about the copy. `new` delegates here
+    /// so there is one assignment of the constants to the fields rather than
+    /// two that have to agree.
+    #[doc(hidden)]
+    pub fn with_params(t_assign: f32, t_retire: f32, alpha: f32, min_pool: usize) -> Self {
         Self {
             centroids: Vec::new(),
             pool: Vec::new(),
             next_label: 1,
+            t_assign,
+            t_retire,
+            alpha,
+            min_pool,
         }
     }
 
@@ -90,11 +129,12 @@ impl OnlineClusterer {
         let embedding = l2_normalize(embedding);
 
         if let Some((index, similarity)) = self.nearest(&embedding)
-            && similarity >= T_ASSIGN
+            && similarity >= self.t_assign
         {
+            let alpha = self.alpha;
             let centroid = &mut self.centroids[index];
             for (x, e) in centroid.vector.iter_mut().zip(&embedding) {
-                *x = (1.0 - EMA_ALPHA) * *x + EMA_ALPHA * e;
+                *x = (1.0 - alpha) * *x + alpha * e;
             }
             centroid.vector = l2_normalize(&centroid.vector);
             let label = centroid.label;
@@ -107,7 +147,7 @@ impl OnlineClusterer {
         }
 
         self.pool.push(embedding);
-        if self.pool.len() < MIN_POOL {
+        if self.pool.len() < self.min_pool {
             return None;
         }
 
@@ -125,7 +165,7 @@ impl OnlineClusterer {
         // has a label. Minting here would split that speaker.
         if self
             .nearest(&mean)
-            .is_some_and(|(_, similarity)| similarity >= T_ASSIGN)
+            .is_some_and(|(_, similarity)| similarity >= self.t_assign)
         {
             self.pool.clear();
             return None;
@@ -158,13 +198,14 @@ impl OnlineClusterer {
     /// pair means it is not yet that evidence.
     ///
     /// Every-pair comparison, which is fine at this size: the pool never
-    /// exceeds `MIN_POOL` (4) entries, since reaching it either mints,
-    /// clears, or evicts the oldest.
+    /// exceeds the pool threshold (4 as shipped) entries, since reaching it
+    /// either mints, clears, or evicts the oldest.
     fn pool_agrees(&self) -> bool {
-        self.pool
-            .iter()
-            .enumerate()
-            .all(|(i, a)| self.pool[i + 1..].iter().all(|b| cosine(a, b) >= T_ASSIGN))
+        self.pool.iter().enumerate().all(|(i, a)| {
+            self.pool[i + 1..]
+                .iter()
+                .all(|b| cosine(a, b) >= self.t_assign)
+        })
     }
 
     fn pool_mean(&self) -> Vec<f32> {
@@ -202,7 +243,7 @@ impl OnlineClusterer {
                     .find(|&j| {
                         live(j)
                             && cosine(&self.centroids[i].vector, &self.centroids[j].vector)
-                                >= T_RETIRE
+                                >= self.t_retire
                     })
                     .map(|j| (i, j))
             })
@@ -234,6 +275,58 @@ impl OnlineClusterer {
         }
         label
     }
+
+    // ------------------------------------------------------- diagnostics
+    //
+    // Three questions a caller cannot answer from `observe`'s return values,
+    // and which `examples/diarize_probe` reports for every configuration it
+    // scores. Hidden from the docs and used by nothing the server runs: the
+    // shipped contract is still one label per embedding.
+
+    /// Labels ever minted, retired ones included. Against
+    /// [`OnlineClusterer::active`] this separates "found five speakers" from
+    /// "found nine and retired four of them".
+    #[doc(hidden)]
+    pub fn minted(&self) -> u32 {
+        self.next_label - 1
+    }
+
+    /// Centroids still attracting windows.
+    #[doc(hidden)]
+    pub fn active(&self) -> usize {
+        self.centroids
+            .iter()
+            .filter(|c| c.retired_into.is_none())
+            .count()
+    }
+
+    /// Cosine similarity between every pair of live centroids, closest pair
+    /// first.
+    ///
+    /// The head of this list against `T_ASSIGN` is the margin the clusterer
+    /// had left -- how much room a meeting with more people in it would still
+    /// have. It is the measurement behind the design doc's warning that at
+    /// five speakers the two closest centroids sit at 0.519, above `T_ASSIGN`,
+    /// and that eight is untested.
+    #[doc(hidden)]
+    pub fn crowding(&self) -> Vec<(u32, u32, f32)> {
+        let live: Vec<&Centroid> = self
+            .centroids
+            .iter()
+            .filter(|c| c.retired_into.is_none())
+            .collect();
+        let mut pairs: Vec<(u32, u32, f32)> = live
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| {
+                live[i + 1..]
+                    .iter()
+                    .map(move |b| (a.label, b.label, cosine(&a.vector, &b.vector)))
+            })
+            .collect();
+        pairs.sort_by(|a, b| b.2.total_cmp(&a.2));
+        pairs
+    }
 }
 
 /// A unit-length copy. The zero guard keeps a silent window from producing
@@ -248,7 +341,15 @@ pub(super) fn l2_normalize(v: &[f32]) -> Vec<f32> {
 
 /// Cosine similarity, which for unit-length inputs is just the dot product.
 /// Every vector this module compares has been normalised first.
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
+///
+/// `pub`, unlike [`l2_normalize`]'s `pub(super)`, because the consumer is
+/// outside the crate: `examples/diarize_probe` measures how far apart two
+/// voices are before any clustering happens, and that number is only
+/// comparable to `T_ASSIGN` if it is the same similarity the clusterer
+/// decides with. `Embedder::embed` returns unit vectors, so the caller's
+/// contract is met.
+#[doc(hidden)]
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
@@ -502,6 +603,47 @@ mod tests {
         // A genuinely new voice takes the next label, not the free one.
         let labels: Vec<Option<u32>> = (0..MIN_POOL).map(|_| c.observe(&voice(7))).collect();
         assert_eq!(labels.last(), Some(&Some(3)));
+    }
+
+    #[test]
+    fn the_swept_constructor_at_the_constants_is_the_shipped_one() {
+        // What the probe's sweep rests on: the cell at the calibrated
+        // constants has to be the configuration the server actually runs, or
+        // every number in the design doc's tables belongs to some other
+        // clusterer. Delegation makes that true by construction; this pins it,
+        // because the failure mode is a later edit reading a const directly in
+        // one method and the field in another.
+        let (_, second, between) = converging_pair();
+
+        // One script through all four constants: pooling and minting
+        // (MIN_POOL), assignment (T_ASSIGN), a centroid dragged into another
+        // one window at a time (EMA_ALPHA) until it retires (T_RETIRE), and a
+        // fresh voice afterwards to show the freed label is not reused.
+        let mut script: Vec<Vec<f32>> = (0..MIN_POOL as u32).map(|i| noisy(0, i)).collect();
+        script.push(noisy(1, 50));
+        script.push(noisy(0, 10));
+        script.extend(std::iter::repeat_n(second.clone(), MIN_POOL));
+        script.extend(std::iter::repeat_n(between, 100));
+        script.push(second);
+        script.extend(std::iter::repeat_n(voice(7), MIN_POOL));
+
+        let run = |mut c: OnlineClusterer| {
+            let labels: Vec<Option<u32>> = script.iter().map(|e| c.observe(e)).collect();
+            (labels, c.live_labels())
+        };
+        let shipped = run(OnlineClusterer::new());
+        let swept = run(OnlineClusterer::with_params(
+            T_ASSIGN, T_RETIRE, EMA_ALPHA, MIN_POOL,
+        ));
+        assert_eq!(shipped, swept);
+
+        // And the script is worth comparing: an equivalence that held only
+        // because nothing happened would pass this test while proving nothing.
+        let (labels, live) = shipped;
+        assert_eq!(live, vec![1, 3], "speaker 2 should have retired into 1");
+        for expected in [None, Some(1), Some(2), Some(3)] {
+            assert!(labels.contains(&expected), "{expected:?} never came up");
+        }
     }
 
     #[test]

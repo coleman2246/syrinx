@@ -123,6 +123,11 @@ impl Embedder {
 
     /// Embed a batch of equal-length windows, L2-normalised, one row each.
     ///
+    /// Not on the session's path, which has one window at a time and no next
+    /// one to batch it with: the caller is `examples/diarize_probe`, which
+    /// embeds a whole meeting before scoring it and is the reason this is
+    /// worth having at all.
+    ///
     /// Every window must be the same length -- the fbank frame count is
     /// derived once, from the first window, and reused for the whole batch;
     /// mismatched lengths are rejected rather than silently truncated or
