@@ -631,7 +631,10 @@ impl App {
                             ui.weak("  nothing is playing audio right now");
                         }
                     });
-                if ui.button("⟳").on_hover_text("Rescan sources").clicked() {
+                // Latin text, not a glyph: the geometric and icon ranges are
+                // not reliably covered by the bundled fonts on Windows, where
+                // they render as missing-glyph boxes.
+                if ui.button("Rescan").on_hover_text("Rescan sources").clicked() {
                     self.refresh_sources();
                 }
             });
@@ -984,7 +987,9 @@ impl App {
             // Streaming is a property of the next session, so it can be
             // changed while one is running without disturbing it.
             let streaming = self.state.stream_to.is_some();
-            let label = if streaming { "Streaming ⏺" } else { "Stream…" };
+            // The word already carries the state, so the record dot was
+            // redundant -- and it rendered as a box on Windows.
+            let label = if streaming { "Streaming" } else { "Stream…" };
             let hover = match &self.state.stream_to {
                 Some(p) => format!("Appending to {p}\nClick to stop"),
                 None => "Append the transcript to a file as you speak, so\n\
