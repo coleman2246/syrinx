@@ -3,8 +3,8 @@
 //! v5 carries a single `state` tensor between calls instead of v4's separate
 //! `h`/`c` pair, and it only accepts 512-sample frames at 16 kHz -- feeding it
 //! anything else produces silently wrong probabilities rather than an error.
-//! Ported from `spike/diarize/src/vad.rs`, validated there against AMI
-//! meetings and speaker-verification pairs.
+//! Ported from the go/no-go spike -- deleted, `git log -- 'spike/diarize'` --
+//! which validated it against AMI meetings and speaker-verification pairs.
 
 use anyhow::{Result, anyhow, ensure};
 use ort::{session::Session, value::Tensor};

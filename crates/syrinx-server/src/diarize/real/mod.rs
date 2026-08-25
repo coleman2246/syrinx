@@ -1,7 +1,8 @@
 //! ONNX-backed VAD and speaker-embedding wrappers.
 //!
-//! Ported from `spike/diarize/src/{vad,fbank,embed}.rs`, which validated this
-//! pipeline end-to-end against speaker-verification pairs and AMI meetings.
+//! Ported from the go/no-go spike -- deleted, `git log -- 'spike/diarize'` --
+//! which validated this pipeline end-to-end against speaker-verification pairs
+//! and AMI meetings, and whose harness survives as `examples/diarize_probe`.
 //! Gated behind the `diarize` feature so the default build stays free of
 //! `ort`, mirroring `asr::parakeet`'s `cuda` gate. [`super::Diarizer`] is
 //! implemented on top of these two structs by [`RealDiarizer`], which owns

@@ -21,6 +21,14 @@ services:
     volumes:
       # Read-only: the service loads models and has no business writing there.
       - ${SYRINX_MODELS:-/srv/syrinx/models}:/models:ro
+      # The diarization models ride in this same mount, at $SYRINX_MODELS/diarize,
+      # so speaker labels need no second volume: the ASR loader opens its four
+      # files by name and an extra subdirectory beside them is invisible to it.
+      # Keeping them elsewhere on the host is a second read-only mount at the
+      # same container path:
+      #   - ${SYRINX_DIARIZE_MODELS:-/srv/syrinx/diarize}:/models/diarize:ro
+      # Either way docker/config.toml has to name the directory; see the note
+      # there for why that cannot come from the environment.
 
     # Published on every interface by default: this is a LAN service, and other
     # machines on the LAN are the reason it exists. Access is gated on the

@@ -9,6 +9,12 @@
 # Models are volume-mounted, never copied in. They are 2.5 GB and change on a
 # different schedule from the code; baking them in would mean rebuilding and
 # repulling gigabytes to change a line of Rust.
+#
+# `diarize` is compiled in alongside `cuda` so speaker labelling is a matter of
+# mounting 29 MB of models and naming them in the config, not of rebuilding the
+# image. It costs nothing when unconfigured -- no model is loaded and no session
+# is labelled -- and it adds no runtime dependency, since it drives the same
+# ONNX Runtime the ASR already links.
 
 # ---------------------------------------------------------------- build stage
 # ort 2.0.0-rc.13 requires Rust 1.88.
@@ -32,7 +38,7 @@ RUN mkdir -p crates/syrinx-proto/src crates/syrinx-audio/src crates/syrinx-clien
  && echo 'fn main() {}' > crates/syrinx-server/src/main.rs \
  && echo 'fn main() {}' > crates/syrinx-cli/src/main.rs \
  && echo 'fn main() {}' > crates/syrinx-gui/src/main.rs \
- && cargo build --release -p syrinx-server --features cuda \
+ && cargo build --release -p syrinx-server --features cuda,diarize \
  && rm -rf crates
 
 # Now the real sources. Only syrinx-server and what it depends on: the GUI
@@ -45,7 +51,7 @@ COPY crates/syrinx-cli crates/syrinx-cli
 COPY crates/syrinx-gui crates/syrinx-gui
 # Touch so cargo does not trust the placeholder timestamps.
 RUN touch crates/*/src/lib.rs crates/*/src/main.rs 2>/dev/null; \
-    cargo build --release -p syrinx-server --features cuda
+    cargo build --release -p syrinx-server --features cuda,diarize
 
 # -------------------------------------------------------------- runtime stage
 # `cudnn` in the tag matters: ONNX Runtime's CUDA provider needs cuDNN 9, and

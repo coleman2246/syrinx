@@ -1,7 +1,9 @@
 //! Voiced audio into embedding windows: the diarizer's bookkeeping half.
 //!
-//! Ported from `spike/diarize/src/main.rs::windows()`, the reference the AMI
-//! numbers in the design doc were measured against. Pure arithmetic -- no
+//! Ported from the go/no-go spike's `windows()`, the reference the AMI numbers
+//! in the design doc were measured against. The spike itself is gone -- `git
+//! log -- 'spike/diarize'` for it -- and `examples/diarize_probe` is what
+//! reproduces those numbers now. Pure arithmetic -- no
 //! models, no `ort`, no feature gate -- for the same reason [`super::fbank`]
 //! has none: this is where the alignment bugs live, so the default
 //! `cargo test` should be catching them, not only the `diarize` build.

@@ -39,6 +39,47 @@ rsync -a --info=progress2 ~/models/nemotron-.../ gpu-host:/srv/syrinx/models/
 Four files: `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`,
 `tokenizer.model`. See the README for what the model is and its licence.
 
+### Speaker labels (optional)
+
+Skip this unless you want meeting transcripts tagged Speaker 1, Speaker 2 —
+see **Speaker labels** in the README for what they are and what to expect. Two
+more models, 29 MB, in a `diarize` subdirectory of the one you just filled:
+
+```bash
+sudo mkdir -p /srv/syrinx/models/diarize && cd /srv/syrinx/models/diarize
+sudo curl -fL# -o silero_vad.onnx \
+  https://github.com/snakers4/silero-vad/raw/v6.2.1/src/silero_vad/data/silero_vad.onnx
+sudo curl -fL# -O https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx
+```
+
+A subdirectory rather than a second volume: the mount is already there, it is
+already read-only, and the ASR loader opens its four files by name and never
+notices a neighbour. `docker/compose.yaml` carries the second-mount line for
+anyone who keeps these somewhere else.
+
+Then uncomment one line in `docker/config.toml`:
+
+```toml
+diarize_model_dir = "/models/diarize"
+```
+
+That line cannot come from `docker/.env`: only the settings that vary per
+deployment are environment-overridable, and this one says how the service
+behaves. Which means enabling speaker labels edits a file this repository
+tracks — the one wrinkle in the container story. It rebuilds in seconds
+(`config.toml` is copied in the last layers, so no Rust is recompiled), and
+`git stash` before a `git pull` if the edit ever conflicts. If you would rather
+not carry a local edit at all, bind-mount your own file over
+`/etc/syrinx/config.toml` instead.
+
+The image is built with `--features cuda,diarize`, so nothing else changes: no
+new runtime dependency — the diarizer drives the same ONNX Runtime the ASR
+already loads — and about 6% of one core per session on top of the ASR.
+
+Check the startup log either way. It says `speaker labelling available` with
+the two paths if it worked, and an `error!` line naming the file it could not
+read if it did not; it never refuses to start over this.
+
 ## 3. Configure
 
 ```bash

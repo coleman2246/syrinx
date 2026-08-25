@@ -324,7 +324,7 @@ hand-picked run.
 ### The front-end had to be validated first
 
 A wrong fbank does not fail loudly — it produces embeddings that look
-plausible and separate nobody. `diarize-spike verify` checks each model
+plausible and separate nobody. `diarize_probe verify` checks each model
 against the same-speaker / different-speaker wav pairs shipped in the
 sherpa-onnx release. All three candidates cleared it (same-speaker mean
 0.66, different-speaker mean 0.15–0.29, no overlap between the
@@ -339,7 +339,7 @@ context from the previous frame prepended to the new 512. Feeding it a bare
 ### The embeddings are better than the design assumed, at a lower threshold
 
 Measured over windows the reference marks as a single clean speaker
-(`diarize-spike separability`, ES2002a, 1.5 s windows):
+(`diarize_probe separability`, ES2002a, 1.5 s windows):
 
 | Model | same-speaker p50 | different-speaker p50 | best split | pairs wrong |
 |---|---|---|---|---|
@@ -446,7 +446,7 @@ inside 1 s; the worst case anywhere, ES2002a at Opus 24 kbps, is 1.01 s and
 something else — short turns the diarizer never labels at all, which is the
 miss rate, not a boundary error.
 
-**Cost**, single-threaded, measured by `diarize-spike bench`: silero VAD
+**Cost**, single-threaded, measured by `diarize_probe bench`: silero VAD
 0.079 ms per 32 ms frame (0.2% of a core), ERes2Net 45 ms per window at a
 0.75 s hop (6.0% of a core). Total ≈6% of one core per session, which
 matches the "a few percent of one core" claim in the CPU-budget note above.

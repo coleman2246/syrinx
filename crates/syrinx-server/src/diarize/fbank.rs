@@ -6,10 +6,10 @@
 //! order of operations: DC removal, pre-emphasis, Povey window, power
 //! spectrum, HTK-mel triangles, natural log. A mismatch here does not fail
 //! loudly; it yields embeddings that look plausible and separate nobody,
-//! which is what `spike/diarize`'s `verify` subcommand existed to catch.
-//! Ported from `spike/diarize/src/fbank.rs` unchanged: the arithmetic here is
-//! validated, not merely plausible, so it is ported byte-for-byte rather than
-//! rewritten.
+//! which is what the `verify` subcommand of `examples/diarize_probe` exists to
+//! catch. Ported unchanged from the go/no-go spike -- deleted, `git log --
+//! 'spike/diarize'` -- because the arithmetic here is validated, not merely
+//! plausible, so it moves byte-for-byte rather than being rewritten.
 //!
 //! Pure arithmetic -- no models, no `ort`, no feature gate, same reasoning as
 //! its sibling `cluster.rs`. This is the component most likely to fail

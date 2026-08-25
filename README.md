@@ -63,9 +63,112 @@ way. Set `mode = "transcribe"` for a transcript instead, or `"both"`.
   asks the client to delete text, because it is typing into arbitrary
   applications where that would be destructive.
 - **transcript** — running transcript in a GUI the user can save. The client owns
-  the buffer, so the server may revise it.
+  the buffer, so the server may revise it. The only mode that can carry speaker
+  labels; see **Speaker labels** below.
 - **bulk** — offline file transcription over HTTP, using the more accurate
   non-streaming model.
+
+## Speaker labels
+
+In transcribe mode the server can tell voices apart and tag each turn
+**Speaker 1**, **Speaker 2**, and so on — enough to read back a meeting and
+follow who said what. The labels are anonymous by construction: they come from
+the sound of a voice, and nothing here ever learns a name. Putting names to
+them is a job for an LLM given the finished transcript, which does it from
+what people say about each other and is far better at it than anything
+acoustic.
+
+Off at both ends by default. The server needs two more ONNX models, 29 MB
+together:
+
+```bash
+mkdir -p ~/models/diarize && cd ~/models/diarize
+
+# Voice activity detection -- is anyone speaking? 2.2 MB, MIT.
+curl -fL# -o silero_vad.onnx \
+  https://github.com/snakers4/silero-vad/raw/v6.2.1/src/silero_vad/data/silero_vad.onnx
+
+# Speaker embeddings -- are these two stretches the same voice? 26.5 MB,
+# Apache-2.0.
+curl -fL# -O https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx
+```
+
+`speaker-recongition-models` is spelled that way upstream. It is their typo,
+it is load-bearing in the URL, and correcting it gets a 404.
+
+The **server** needs two things, and one without the other does nothing: the
+directory in its config, and the feature compiled in. A binary built without
+it ignores the models entirely, and a plain `cargo build` produces exactly
+that binary.
+
+```toml
+diarize_model_dir = "/home/you/models/diarize"
+```
+
+```bash
+cargo build --release -p syrinx-server --features diarize   # or cuda,diarize
+```
+
+Spelled out in full: the shell expanded the `~` in the download above, and the
+server will not — it takes `model_dir` and `diarize_model_dir` exactly as
+written. Nor is there an environment override for this one, unlike the token
+and the model directory. It decides how the service behaves rather than where
+it is deployed, and those settings belong in a file somebody can review.
+
+Then, in the **client's** config:
+
+```toml
+mode = "transcribe"
+diarize = true
+```
+
+### Asking is not receiving
+
+`diarize = true` is a request, and the handshake answers it honestly rather
+than refusing the session. A client can ask and not receive — a server built
+without the feature, models missing or unreadable, a mode with no transcript to
+label — and the session then runs unlabelled, because a transcript without
+speaker labels is worth incomparably more than no transcript at all. The GUI
+says so once connected, under the transcript: *Speaker labels unavailable on
+this server*. The server logs *why* on its own side at `error!`, because that
+is the only end that knows which of those it was.
+
+**The typing modes never see labels.** `type` and `both` put text at the
+cursor, where a `Speaker 2:` prefix would land in the middle of whatever you
+are working in, so those sessions drop the request before it is sent whatever
+the config says. `transcribe` is the only mode that asks.
+
+### What to expect
+
+The labels are stable, which is the property that matters: over an 87-minute
+meeting every speaker kept the label they started with — no renumbering, no
+drift. A transcript whose Speaker 3 stops meaning the same person halfway
+down is worse than one with no labels at all.
+
+Short interjections arrive unlabelled, and that is the design rather than a
+gap in it. When the diarizer has not heard enough of a voice to be sure, it
+says nothing instead of attributing "yeah" or "okay" to whoever was already
+talking. The same goes for the opening seconds of a session, before it has
+heard anyone twice. Unlabelled text still appears — it joins the turn already
+open — and a label trails its text by about a second, which is the server
+holding two chunks back so the diarizer can catch up.
+
+What has *not* been measured is the caveat worth carrying. No split (one
+person acquiring a second label) and no merge (two people sharing one)
+occurred on any meeting tested — but those were AMI recordings made through
+close-talking headset microphones, which are cleaner than a conference call
+arriving over a laptop speakerphone. Expect worse on worse audio. The
+embedding model is English, trained on VoxCeleb, and overlapping speech is
+given to one of the speakers rather than separated.
+
+See [`docs/specs/`](docs/specs/) for what was measured, on which meetings, and
+what those numbers do not establish.
+
+**Licences:** silero-vad is MIT. The embedding model is Apache-2.0, from the
+[3D-Speaker](https://github.com/modelscope/3D-Speaker) project, distributed
+through the sherpa-onnx model zoo. Both permit commercial use, both are
+separate from the licence on this code, and — like the ASR model — neither is
+in this repository nor in the container image.
 
 ## Status
 
@@ -101,6 +204,10 @@ The token comes from the environment: baking one into a layer publishes it to
 anyone who can pull the image, and committing one publishes it to anyone who
 can read this repository. Models are volume-mounted read-only — they are 2.5 GB
 and change on a different schedule from the code.
+
+The image is built with speaker labelling compiled in, and it stays dormant
+until a `diarize` subdirectory of that mount holds the two models and
+`docker/config.toml` names it. See [docs/deploying.md](docs/deploying.md).
 
 The container runs unprivileged with a read-only root filesystem, all
 capabilities dropped, and `no-new-privileges`.
@@ -431,8 +538,10 @@ Every dependency is permissive — MIT, Apache-2.0, BSD, ISC, Zlib, Unicode-3.0
 or Unlicense — so all of them are GPL-3 compatible. Checked rather than
 assumed: nothing in the tree needed a second look.
 
-**The model is licensed separately and is not covered by this.** It is NVIDIA's,
-under the [NVIDIA Open Model License
+**The models are licensed separately and are not covered by this.** The ASR
+model is NVIDIA's, under the [NVIDIA Open Model License
 Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/),
-which permits commercial use. Weights are neither in this repository nor in the
-container image, so nothing here redistributes them.
+which permits commercial use. The two optional speaker-labelling models are MIT
+(silero-vad) and Apache-2.0 (3D-Speaker ERes2Net). No weights are in this
+repository or in the container image, so nothing here redistributes any of
+them.

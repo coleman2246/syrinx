@@ -4,10 +4,11 @@
 //! alignments rather than the transcriber's `segments`, because segments
 //! include the pauses inside a turn and would count silence as speech.
 //!
-//! Ported unchanged from `spike/diarize/src/reference.rs`: every number in the
-//! design doc's "Spike results" was produced by this scoring code, so it moves
-//! into the tree as it was rather than being rewritten around the tree's
-//! types. Nothing here is production code -- the server never scores itself
+//! Ported unchanged from the go/no-go spike -- `git log --follow` on this file
+//! reaches it -- because every number in the design doc's "Spike results" was
+//! produced by this scoring code, so it moves into the tree as it was rather
+//! than being rewritten around the tree's types. Nothing here is production
+//! code -- the server never scores itself
 //! against an annotation -- which is why it lives beside the probe instead of
 //! in `src/diarize`.
 

@@ -16,3 +16,14 @@ idle_unload_secs = 300
 # Refuse to load rather than win an allocation race against the cameras.
 vram_floor_mib = 1024
 max_sessions = 4
+
+# Speaker labels. Uncomment to turn them on, having put silero_vad.onnx and the
+# embedding model in a `diarize` subdirectory of the mounted models directory
+# (see docs/deploying.md). The image is already built with the feature, so this
+# line and the two model files are the whole of it -- but the line has to be
+# here rather than in the environment, because this setting says how the service
+# behaves and only the deployment-varying ones are overridable. It is commented
+# rather than set because a directory named here and not present is an error at
+# every startup, which is not what to hand somebody who never wanted the
+# feature.
+#diarize_model_dir = "/models/diarize"

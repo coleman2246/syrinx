@@ -3,12 +3,12 @@
 //! The three candidate model families disagree about feature layout and
 //! normalisation, and nothing in the ONNX file says which is which -- the
 //! layout is readable from the input shape, but the normalisation is a
-//! property of the training recipe. Ported from `spike/diarize/src/embed.rs`,
-//! with one change required by that spike's review: normalisation used to be
-//! guessed from the model's filename there; here it is an explicit
-//! constructor argument. The filename convention survives, but in exactly one
-//! place -- `diarizer::norm_for`, which resolves a model directory once at
-//! startup and refuses names it does not recognise. There is deliberately no
+//! property of the training recipe. Ported from the go/no-go spike -- deleted,
+//! `git log -- 'spike/diarize'` -- with one change its review required:
+//! normalisation used to be guessed from the model's filename there; here it
+//! is an explicit constructor argument. The filename convention survives, but
+//! in exactly one place -- `diarizer::norm_for`, which resolves a model
+//! directory once at startup and refuses names it does not recognise. There is deliberately no
 //! guessing constructor on this type: a second copy of that mapping is a
 //! second answer to "which recipe is this?", and the wrong answer produces
 //! embeddings that separate nobody without failing anywhere.
