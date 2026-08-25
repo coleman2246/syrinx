@@ -388,6 +388,12 @@ tag, so that is what every number in this section was measured with. The
 | `MIN_POOL` | 4 | 2 is catastrophic; 3 fails the long meeting |
 | `LAG_CHUNKS` | 2 | ≈1.12 s, covers the p90 label delay |
 
+The last two later became server config keys — `diarize_min_pool` and
+`diarize_lag_chunks` — defaulting to the values above, so a deployment can
+trade latency and pickup speed against the stability measured here. The
+numbers in this section are the measurements, not the only settings that
+will ever run.
+
 `MIN_POOL` deserves emphasis, because it is the design's "reluctant create"
 rule earning its keep. All figures here are at the chosen model, window
 (1.5 s), `T_assign` (0.45) and `T_retire` (0.80):
