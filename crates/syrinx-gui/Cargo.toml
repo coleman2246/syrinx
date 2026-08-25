@@ -21,3 +21,8 @@ rfd = "0.16"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.189"
+
+# Gives syrinx-gui.exe its own icon in Explorer, which the viewport icon set at
+# runtime cannot do. Windows-only, so nothing else pays for it -- see build.rs.
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1.31"

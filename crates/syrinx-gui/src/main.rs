@@ -85,11 +85,15 @@ fn run() -> Result<()> {
     let config = Config::load(None)?;
     ensure_daemon()?;
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([480.0, 380.0])
+        .with_min_inner_size([400.0, 280.0])
+        .with_title("Syrinx");
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([480.0, 380.0])
-            .with_min_inner_size([400.0, 280.0])
-            .with_title("Syrinx"),
+        viewport: match window_icon() {
+            Some(icon) => viewport.with_icon(icon),
+            None => viewport,
+        },
         ..Default::default()
     };
 
@@ -102,6 +106,32 @@ fn run() -> Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The icon the window, the taskbar and alt-tab show.
+///
+/// Built into the binary with `include_bytes!` rather than read from disk, for
+/// the same reason the tray icon next door is generated rather than shipped
+/// (see `icon_for` in syrinx-client): there is no asset pipeline here, and a
+/// file loaded at runtime is one more thing an install can turn out to be
+/// missing.
+///
+/// Decoding is allowed to fail. An icon is decoration and the window is the
+/// product, so a PNG this build cannot read costs the window its icon and
+/// nothing else -- the same trade the diarizer makes when a fault degrades the
+/// speaker labels rather than the transcript.
+///
+/// The decoder is eframe's own, which spares this crate a dependency: `image`
+/// with its `png` feature is already non-optional in eframe, so the code to
+/// read a PNG is linked in whether or not this calls it.
+fn window_icon() -> Option<egui::IconData> {
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")) {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            tracing::warn!("the window icon did not decode, carrying on without one: {e}");
+            None
+        }
+    }
 }
 
 /// Start a daemon if none is listening, and wait for its socket.
@@ -1179,6 +1209,16 @@ mod tests {
     fn an_address_without_a_scheme_is_refused() {
         assert!(normalise_server("192.168.1.10").is_err());
         assert!(normalise_server("dictate.example.com").is_err());
+    }
+
+    #[test]
+    fn the_window_icon_decodes() {
+        // `window_icon` swallows a decode failure on purpose, so a truncated
+        // or re-rendered asset would quietly cost every window its icon and
+        // fail nothing. This is the only place that would ever notice.
+        let icon = window_icon().expect("the built-in PNG should decode");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
     }
 
 }
