@@ -122,6 +122,64 @@ impl SessionState {
     }
 }
 
+/// Fold several concurrent sessions into one view.
+///
+/// Segments carry their own timings, so ordering them by time reconstructs what
+/// was actually said in what order across sources -- which is the point of
+/// separate mode. The flat transcript follows that same order, so what is read
+/// back is a conversation rather than one speaker and then the other.
+///
+/// Lives here rather than in either front-end because both need it and the
+/// answer must be the same: the daemon folds its sessions on every tick and
+/// again to save, and `syrinx start --separate` folds its own at the end. It
+/// touches nothing but `SessionState`, so neither of those is a concern of the
+/// other's.
+///
+/// Every field is folded across all the states rather than taken from the
+/// first. `error` especially: a second source whose session failed has to be
+/// reported, or a run comes back successful having recorded half of what was
+/// asked for.
+pub fn merge_states(states: &[SessionState]) -> SessionState {
+    if states.len() == 1 {
+        return states[0].clone();
+    }
+    let mut out = SessionState {
+        // Active if any session is; the aggregate is running until all stop.
+        status: states
+            .iter()
+            .map(|s| s.status)
+            .find(|s| s.is_active())
+            .unwrap_or_default(),
+        model: states.iter().find_map(|s| s.model.clone()),
+        chunk_ms: states.iter().find_map(|s| s.chunk_ms),
+        // Any session that got labels is enough to say so; separate mode
+        // runs one session per source and only the non-typing ones request
+        // diarization, so an all-false merge would wrongly blame the server.
+        diarize: states.iter().any(|s| s.diarize),
+        // Likewise for the request itself: in separate mode the primary
+        // source keeps whatever mode the user picked while every other
+        // source is forced to Transcribe, so it alone can be the one asking.
+        diarize_requested: states.iter().any(|s| s.diarize_requested),
+        error: states.iter().find_map(|s| s.error.clone()),
+        // Levels come from the first source; a merged spectrum would say less
+        // than one real one.
+        levels: states.first().map(|s| s.levels.clone()).unwrap_or_default(),
+        rms: states.first().map(|s| s.rms).unwrap_or(0.0),
+        last_fragment: states
+            .iter()
+            .map(|s| s.last_fragment.clone())
+            .find(|f| !f.is_empty())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+
+    let mut segments: Vec<Segment> = states.iter().flat_map(|s| s.segments.clone()).collect();
+    segments.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
+    out.transcript = crate::save::render(&segments, "", crate::save::Format::Labelled);
+    out.segments = segments;
+    out
+}
+
 /// Parameters for a run.
 #[derive(Debug)]
 pub struct SessionOptions {
@@ -556,6 +614,23 @@ mod tests {
         let n = l.len();
         l.dedup();
         assert_eq!(l.len(), n);
+    }
+
+    #[test]
+    fn a_merge_reports_an_error_from_any_session() {
+        // `syrinx start --separate` bails on the merged state's error. The
+        // CLI's own copy of this fold took every field from the first session
+        // alone, so a run whose second source never connected exited
+        // successfully having recorded half of what was asked for.
+        let failed = SessionState {
+            error: Some("connecting to the server: refused".into()),
+            ..Default::default()
+        };
+        let merged = merge_states(&[SessionState::default(), failed]);
+        assert_eq!(
+            merged.error.as_deref(),
+            Some("connecting to the server: refused")
+        );
     }
 
     #[test]

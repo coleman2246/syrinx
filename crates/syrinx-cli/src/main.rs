@@ -453,7 +453,11 @@ fn run(
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    let final_state = merge_cli_states(&handles);
+    // The daemon's fold, not a second one: separate mode's transcript must
+    // read the same however dictation was started.
+    let final_state = syrinx_client::session::merge_states(
+        &handles.iter().map(|h| h.state()).collect::<Vec<_>>(),
+    );
     state::clear_pid(&pid_path);
     state::refresh_waybar(cfg.waybar_signal);
 
@@ -716,25 +720,6 @@ fn run_transcribe(
         None => println!("{text}"),
     }
     Ok(())
-}
-
-/// Merge several concurrent sessions into one view, ordered by time.
-fn merge_cli_states(
-    handles: &[syrinx_client::SessionHandle],
-) -> syrinx_client::SessionState {
-    let states: Vec<_> = handles.iter().map(|h| h.state()).collect();
-    if states.len() == 1 {
-        return states[0].clone();
-    }
-    let mut segments: Vec<syrinx_client::session::Segment> =
-        states.iter().flat_map(|s| s.segments.clone()).collect();
-    // Ordering by time reconstructs what was said in what order across
-    // sources, which is the point of transcribing them separately.
-    segments.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
-    let mut out = states.into_iter().next().unwrap_or_default();
-    out.transcript = save::render(&segments, "", save::Format::Labelled);
-    out.segments = segments;
-    out
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@
 use crate::ipc::{self, DaemonState, Request, Response};
 use crate::mode::OutputMode;
 use crate::save;
-use crate::session::{SessionHandle, SessionOptions};
+use crate::session::{SessionHandle, SessionOptions, merge_states};
 use crate::tray::{TrayCommand, TrayState};
 use crate::{Config, choose_source, list_sources};
 use anyhow::{Context, Result};
@@ -1007,54 +1007,6 @@ impl DaemonRuntime {
         self.generation += 1;
         self.stop_overlay();
     }
-}
-
-/// Fold several concurrent sessions into one view.
-///
-/// Segments carry their own timings, so ordering them by time reconstructs what
-/// was actually said in what order across sources -- which is the point of
-/// separate mode. The flat transcript follows that same order so a viewer reads
-/// a conversation rather than one speaker then the other.
-fn merge_states(states: &[crate::session::SessionState]) -> crate::session::SessionState {
-    if states.len() == 1 {
-        return states[0].clone();
-    }
-    let mut out = crate::session::SessionState {
-        // Active if any session is; the aggregate is running until all stop.
-        status: states
-            .iter()
-            .map(|s| s.status)
-            .find(|s| s.is_active())
-            .unwrap_or_default(),
-        model: states.iter().find_map(|s| s.model.clone()),
-        chunk_ms: states.iter().find_map(|s| s.chunk_ms),
-        // Any session that got labels is enough to say so; separate mode
-        // runs one session per source and only the non-typing ones request
-        // diarization, so an all-false merge would wrongly blame the server.
-        diarize: states.iter().any(|s| s.diarize),
-        // Likewise for the request itself: in separate mode the primary
-        // source keeps whatever mode the user picked while every other
-        // source is forced to Transcribe, so it alone can be the one asking.
-        diarize_requested: states.iter().any(|s| s.diarize_requested),
-        error: states.iter().find_map(|s| s.error.clone()),
-        // Levels come from the first source; a merged spectrum would say less
-        // than one real one.
-        levels: states.first().map(|s| s.levels.clone()).unwrap_or_default(),
-        rms: states.first().map(|s| s.rms).unwrap_or(0.0),
-        last_fragment: states
-            .iter()
-            .map(|s| s.last_fragment.clone())
-            .find(|f| !f.is_empty())
-            .unwrap_or_default(),
-        ..Default::default()
-    };
-
-    let mut segments: Vec<crate::session::Segment> =
-        states.iter().flat_map(|s| s.segments.clone()).collect();
-    segments.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
-    out.transcript = crate::save::render(&segments, "", crate::save::Format::Labelled);
-    out.segments = segments;
-    out
 }
 
 #[cfg(test)]
