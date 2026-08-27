@@ -325,6 +325,64 @@ fn speech_like(n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Consecutive embedding windows the embedder may fail before `RealDiarizer`
+/// calls itself broken.
+///
+/// Three, and not five to match the session's strikes, because the two count
+/// different things and stack: each of these failures is also a chunk the
+/// session warns about, so the whole episode is at most three plus five lines.
+/// Three consecutive windows is a little over two seconds of *voiced* audio,
+/// which is enough that a failure with a cause outside the model -- a failed
+/// allocation under memory pressure is the plausible one -- does not cost a
+/// session its labels. Nothing else transient can reach here: audio arrives as
+/// `pcm_s16le_to_f32` output, so a non-finite embedding is the model's doing
+/// and will not stop being the model's doing.
+const MAX_WINDOW_FAILURES: u32 = 3;
+
+/// Whether the embedder is still worth asking, counted in windows.
+///
+/// A latch, not a policy. It answers one question -- can this diarizer still
+/// produce a label? -- and once the answer is no it stays no. What to *do*
+/// about a diarizer that keeps failing is not decided here: that is
+/// `session.rs`, which counts consecutive failed chunks and retires the
+/// diarizer after five of them, and it stays the only place that decides it.
+///
+/// The two counts are deliberately different quantities. The session's is
+/// chunks, because a chunk is what it hands over and a warning is what a
+/// failed one costs. This one is windows, because a window is what the
+/// embedder is actually asked for. Counting windows here is what lets the
+/// chunk count downstream terminate; see `RealDiarizer`'s failure notes.
+#[derive(Default)]
+struct Fuse {
+    /// Failed windows since the last one that embedded.
+    consecutive: u32,
+    /// The failure that blew it. Set once, at [`MAX_WINDOW_FAILURES`] in a
+    /// row, and never cleared.
+    terminal: Option<String>,
+}
+
+impl Fuse {
+    /// The failure this blew on, or `None` while the embedder is still worth
+    /// asking.
+    fn blown(&self) -> Option<&str> {
+        self.terminal.as_deref()
+    }
+
+    /// A window that embedded: whatever came before it was a blip.
+    fn passed(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// A window that did not, returning how many that makes in a row.
+    fn failed(&mut self, e: &anyhow::Error) -> u32 {
+        self.consecutive += 1;
+        if self.consecutive >= MAX_WINDOW_FAILURES {
+            self.terminal.get_or_insert_with(|| format!("{e:#}"));
+        }
+        self.consecutive
+    }
+}
+
 /// One session's speaker attribution.
 ///
 /// Per [`Diarizer::push`]: one ASR chunk in, at most one label out. The chunk
@@ -343,17 +401,24 @@ fn speech_like(n: usize) -> Vec<f32> {
 /// before it, and a window the clusterer cannot place, which makes the
 /// previous answer stale.
 ///
-/// **On failure:** every error path here is fail-once-fail-always but one, and
-/// that distinction matters because `session.rs` warns per failure and only
-/// falls silent after five *consecutive* ones. Model loading, a graph missing
-/// an output, and a VAD/framing disagreement all fail identically on every
-/// chunk, so they strike out inside three seconds and log five lines. The
-/// exception is a non-finite embedding, which is raised per window: chunks
-/// between windows still return `Ok`, resetting the count, so an embedder
-/// producing NaNs would warn roughly once a second for the life of the session
-/// without ever reaching five in a row. Nothing here can produce that
-/// on well-formed audio, and the alternative -- a diarizer that retires itself
-/// -- would duplicate a policy that deliberately lives in one place.
+/// **On failure:** `session.rs` warns per failed chunk and retires the
+/// diarizer after five *consecutive* ones, so every error path here has to be
+/// able to reach five in a row. Model loading, a graph missing an output, and
+/// a VAD/framing disagreement all fail identically on every chunk, so they
+/// strike out inside three seconds and log five lines.
+///
+/// Embedding was the path that could not, and `Fuse` is why it now can. It
+/// fails per *window*, and only about three chunks in four complete one under
+/// continuous speech -- 17.5 frames arrive per chunk against a 23-frame hop --
+/// so the chunks in between answered `Ok` and reset the session's count. An
+/// embedder producing non-finite vectors warned roughly once a second for the
+/// length of the meeting and never retired. The fuse counts the quantity that
+/// fault actually has, consecutive failed windows, and once it blows this
+/// diarizer stops answering at all: every later push fails, so the session's
+/// five strikes land within five chunks and the episode costs at most eight
+/// warnings rather than one a second. Retiring the diarizer is still the
+/// session's decision, in the one place it lives; all this reports is that
+/// there is nothing left to ask.
 pub struct RealDiarizer {
     models: Models,
     /// Built on the first `push`, not in `diarizer()`.
@@ -374,6 +439,10 @@ pub struct RealDiarizer {
     /// `None` while the clusterer is still undecided -- before the first
     /// speaker is minted, and after any window it could not place.
     last_label: Option<u32>,
+    /// Whether the embedder is still worth asking. See the failure notes
+    /// above: this is what makes a per-window fault visible to a session that
+    /// counts chunks.
+    fuse: Fuse,
 }
 
 /// The loaded models, once the first chunk has paid for them.
@@ -400,12 +469,39 @@ impl RealDiarizer {
             assembler: WindowAssembler::default(),
             clusterer: OnlineClusterer::with_min_pool(min_pool),
             last_label: None,
+            fuse: Fuse::default(),
         }
+    }
+
+    /// What a window the embedder could not place costs: one mark against the
+    /// fuse, and the error back to the caller with the count in it, in the
+    /// shape `session.rs` already logs failures in.
+    ///
+    /// Split out of `push` so the failure path can be driven without a model.
+    /// The only thing left on the other side of it is the `embed` call itself.
+    fn window_failed(&mut self, e: anyhow::Error) -> anyhow::Error {
+        let n = self.fuse.failed(&e);
+        e.context(format!(
+            "embedding a voiced window ({n} of {MAX_WINDOW_FAILURES} in a row)"
+        ))
     }
 }
 
 impl Diarizer for RealDiarizer {
     fn push(&mut self, audio: &[f32]) -> Result<Option<u32>> {
+        // A blown fuse answers before anything else, the lazy load and the
+        // framer included. Failing every chunk is the whole point: it is what
+        // turns a fault the embedder raises per window into one the session
+        // sees per chunk, so its consecutive count can reach the end. Nothing
+        // below is worth doing on the way -- the stream position the framer
+        // keeps is only of use to a diarizer that might answer again.
+        if let Some(why) = self.fuse.blown() {
+            bail!(
+                "the embedder failed {MAX_WINDOW_FAILURES} windows in a row and is out \
+                 of service; the last of them: {why}"
+            );
+        }
+
         // The lazy load has to fail *before* the framer sees this chunk, and
         // that ordering is load-bearing rather than incidental: the framer
         // mirrors a remainder that only exists once the VAD does, so consuming
@@ -435,7 +531,11 @@ impl Diarizer for RealDiarizer {
         );
 
         for window in self.assembler.push(&framed, &voiced) {
-            let embedding = state.embedder.embed(&window)?;
+            let embedding = match state.embedder.embed(&window) {
+                Ok(embedding) => embedding,
+                Err(e) => return Err(self.window_failed(e)),
+            };
+            self.fuse.passed();
             // An undecided clusterer overwrites a known label with None on
             // purpose: it has just seen 1.5 s of speech it cannot place, so
             // the previous answer is stale rather than still true.
@@ -538,6 +638,79 @@ mod tests {
         let err = Models::resolve(Path::new("/nonexistent-diarize-models"))
             .expect_err("no directory, so no VAD");
         assert!(err.to_string().contains(VAD_FILE), "{err}");
+    }
+
+    // ----------------------------------------------------------------- fuse
+
+    #[test]
+    fn a_window_that_embeds_wipes_the_slate() {
+        // Only *consecutive* failures say anything about the model. The
+        // failures this has to survive have causes outside it -- a failed
+        // allocation under memory pressure -- and a session that still gets
+        // an embedding out of every other window is still labelling.
+        let mut fuse = Fuse::default();
+        for _ in 0..MAX_WINDOW_FAILURES * 3 {
+            fuse.failed(&anyhow::anyhow!("a blip"));
+            fuse.passed();
+        }
+        assert!(fuse.blown().is_none(), "a blip retired the embedder");
+    }
+
+    #[test]
+    fn windows_that_keep_failing_blow_the_fuse_for_good() {
+        let mut fuse = Fuse::default();
+        for i in 1..MAX_WINDOW_FAILURES {
+            assert_eq!(fuse.failed(&anyhow::anyhow!("window {i}")), i);
+            assert!(fuse.blown().is_none(), "blown after only {i}");
+        }
+        fuse.failed(&anyhow::anyhow!("the last straw"));
+        assert_eq!(fuse.blown(), Some("the last straw"));
+
+        // A latch: a later window that embeds does not buy the model its job
+        // back, and the reason recorded is the one that ended it rather than
+        // whatever happened last.
+        fuse.passed();
+        fuse.failed(&anyhow::anyhow!("something else"));
+        assert_eq!(fuse.blown(), Some("the last straw"));
+    }
+
+    #[test]
+    fn a_blown_fuse_fails_every_push_after_it() {
+        // The point of the latch, and the half of it that lives in `push`:
+        // `session.rs` counts consecutive failed *chunks*, so a diarizer that
+        // has concluded it is broken has to fail at chunk granularity for that
+        // count to reach five. `tests/diarize.rs` has the other half -- a
+        // diarizer failing every chunk is dropped within five of them.
+        //
+        // No models are involved, and that is itself the contract: the check
+        // comes before the lazy load, so a diarizer that will never answer
+        // again does not commit two ONNX graphs in order to say so. Paths that
+        // cannot load prove it -- if the check moved below the load, the error
+        // would be about the missing file instead.
+        let mut d = RealDiarizer::new(
+            Models {
+                vad: PathBuf::from("/nonexistent/silero_vad.onnx"),
+                embed: PathBuf::from("/nonexistent/embed.onnx"),
+                norm: Norm::Mean,
+            },
+            2,
+        );
+        for _ in 0..MAX_WINDOW_FAILURES {
+            let _ = d.window_failed(anyhow::anyhow!("embedding 0 is not finite at dimension 3"));
+        }
+
+        // Five chunks, because five consecutive failures is what the session
+        // needs, and every one of them has to be a failure.
+        for chunk in 1..=5 {
+            let err = d
+                .push(&[0.0; 8960])
+                .expect_err("a blown fuse never answers again");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("out of service") && message.contains("not finite"),
+                "chunk {chunk} failed for the wrong reason: {message}"
+            );
+        }
     }
 
     #[test]
