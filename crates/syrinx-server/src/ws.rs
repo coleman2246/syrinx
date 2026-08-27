@@ -221,6 +221,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
             }
             Message::Text(t) => match serde_json::from_str::<ClientMessage>(&t) {
+                // Both end the session. `session.flush` reads like a
+                // non-terminal drain and is not one; the contract on
+                // `ClientMessage::SessionFlush` says why, and building the
+                // non-terminal version starts with a `Session` method that
+                // releases the lag buffer without draining the ASR stream.
                 Ok(ClientMessage::SessionStop) | Ok(ClientMessage::SessionFlush) => {
                     let _ = audio_tx.send(AudioEvent::Finish).await;
                     break;

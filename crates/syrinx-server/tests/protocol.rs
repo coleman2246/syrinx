@@ -243,6 +243,65 @@ async fn sessions_beyond_capacity_are_refused_with_a_retryable_error() {
 }
 
 #[tokio::test]
+async fn session_flush_ends_the_session_exactly_like_stop() {
+    // `session.flush` was specified as "emit what you have, keep going" and has
+    // never been that -- the server drains and closes, the same as
+    // `session.stop`. The contract now says so, and this pins it: the day a
+    // non-terminal flush is built, this test is what makes it a deliberate
+    // protocol change rather than a quiet one nobody notices.
+    let url = spawn_server(4, None).await;
+    let mut ws = connect(&url, Some(TOKEN)).await.unwrap();
+
+    ws.send(text(&ClientMessage::SessionStart {
+        mode: Mode::Transcript,
+        sample_rate: 16000,
+        encoding: Encoding::PcmS16le,
+        language: None,
+        vocabulary: None,
+        diarize: false,
+    }))
+    .await
+    .unwrap();
+    assert!(matches!(
+        next_msg(&mut ws).await.unwrap(),
+        ServerMessage::SessionReady { .. }
+    ));
+
+    for _ in 0..2 {
+        ws.send(one_chunk()).await.unwrap();
+    }
+    ws.send(text(&ClientMessage::SessionFlush)).await.unwrap();
+    // Audio after the flush, which a client believing the old contract would
+    // have kept sending. The reader has already left its loop, so this frame is
+    // never transcribed -- the mock's third word is what its absence proves.
+    let _ = ws.send(one_chunk()).await;
+
+    let mut commits = Vec::new();
+    let mut closed = false;
+    while let Some(m) = next_msg(&mut ws).await {
+        match m {
+            ServerMessage::TranscriptCommit { text, .. } => commits.push(text),
+            ServerMessage::SessionClosed { .. } => {
+                closed = true;
+                break;
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    assert!(closed, "flush must close the session, the same as stop");
+    assert_eq!(
+        commits,
+        vec!["alpha ".to_string(), "beta ".to_string()],
+        "flush emits what was buffered and nothing sent after it"
+    );
+    assert!(
+        next_msg(&mut ws).await.is_none(),
+        "the socket is closed, not merely quiet"
+    );
+}
+
+#[tokio::test]
 async fn transcribe_session_requesting_labels_gets_them_when_a_factory_is_configured() {
     let factory: Arc<dyn DiarizerFactory> = Arc::new(ScriptedFactory(vec![Some(1), Some(1), Some(1)]));
     let url = spawn_server(4, Some(factory)).await;

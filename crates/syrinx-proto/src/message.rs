@@ -21,7 +21,21 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "is_false")]
         diarize: bool,
     },
-    /// Force emission of buffered audio without ending the session.
+    /// Ends the session, exactly like [`ClientMessage::SessionStop`].
+    ///
+    /// It was written to mean "force emission of buffered audio without ending
+    /// the session", and the server has never done that: `ws` routes both to
+    /// the same terminal drain. The documentation is what changed, because a
+    /// non-terminal flush cannot be assembled from what `Session` exposes. It
+    /// would have to release the lag buffer holding commits back while their
+    /// speaker labels settle, *without* also draining the ASR stream -- and
+    /// draining is one-way, since the transducer is flushed by feeding it
+    /// silence that cannot afterwards be taken back out of its context.
+    ///
+    /// Worth building the day a client wants "give me what you have, I am still
+    /// talking", which a labelling session now makes a real capability. Nothing
+    /// sends this today, and `syrinx-server/tests/protocol.rs` pins the
+    /// terminal behaviour so contract and code cannot drift apart again.
     #[serde(rename = "session.flush")]
     SessionFlush,
     #[serde(rename = "session.stop")]
