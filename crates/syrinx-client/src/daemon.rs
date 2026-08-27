@@ -169,7 +169,18 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         // viewers read as "this daemon does not track revisions" -- behind
         // immediately.
         generation: 1,
-        text: Default::default(),
+        text: TranscriptCache {
+            // Seeded per process, so revisions are unique across daemons and
+            // not merely within one. A viewer holds its last revision
+            // through a disconnection; if a replacement daemon started
+            // counting from one again, it could in principle reach the
+            // number that viewer is still holding and be taken for the
+            // transcript the viewer already has -- which would leave a dead
+            // session's words on screen as though they were live. Numbering
+            // from the pid means no two daemons ever share a revision.
+            revision: (std::process::id() as u64) << 32,
+            ..Default::default()
+        },
     };
 
     // Resolve the source up front so viewers show what would actually be used
