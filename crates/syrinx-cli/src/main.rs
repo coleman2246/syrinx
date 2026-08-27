@@ -307,6 +307,30 @@ fn main() -> Result<()> {
     }
 }
 
+/// Where one separately-transcribed source's stream goes: its own file beside
+/// `base` when several sources are in play, `base` itself when there is only
+/// one.
+///
+/// Separate mode runs a session per source, and every session opens its own
+/// `StreamWriter`. Pointing them all at one file tears the records, in every
+/// format: no writer is ever shown another's fragments, so none knows to break
+/// the line for a source it cannot see, and they all open on the same empty
+/// file, so none writes the newline that would have separated them. One
+/// person's continuation lands on the end of another's sentence. See
+/// `two_writers_on_one_file_tear_the_records` in the client's stream.rs.
+///
+/// A file each, named the way `save::save_per_source` names them, so streaming
+/// a conversation and then saving it split land on the same files rather than
+/// on two conventions for one idea. A lone source keeps the path it asked for:
+/// it has nobody to collide with, and renaming its file would buy nothing.
+fn stream_path_for(base: &Path, source: &str, sources: usize) -> PathBuf {
+    if sources > 1 {
+        save::path_for_source(base, source)
+    } else {
+        base.to_path_buf()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     config: Option<PathBuf>,
@@ -351,13 +375,18 @@ fn run(
     let stream_target = stream
         .map(|p| (p, format))
         .or_else(|| cfg.stream_path().map(|p| (p, format)));
-    if let Some((path, _)) = &stream_target {
+    // Separate mode names a file per source below, and says so there; this is
+    // the single combined file the other mode writes.
+    if let Some((path, _)) = &stream_target
+        && !separate
+    {
         info!("appending the transcript to {}", path.display());
     }
 
     state::write_pid(&pid_path, std::process::id() as i32)?;
     state::refresh_waybar(cfg.waybar_signal);
 
+    let source_count = chosen.len();
     // Separate mode is one session per source; combined is one session fed by
     // a mix. Only the first source may type, since several streams typing into
     // one cursor interleave into nonsense.
@@ -381,7 +410,12 @@ fn run(
             .into_iter()
             .enumerate()
             .map(|(i, s)| {
-                let label = Some(s.short_label());
+                let name = s.short_label();
+                let stream = stream_target.as_ref().map(|(base, format)| {
+                    let p = stream_path_for(base, &name, source_count);
+                    info!("appending {name}'s transcript to {}", p.display());
+                    (p, *format)
+                });
                 syrinx_client::session::start(
                     SessionOptions {
                         url: cfg.url.clone(),
@@ -389,9 +423,9 @@ fn run(
                         sources: vec![s],
                         mode: if i == 0 { mode } else { OutputMode::Transcribe },
                         diarize: cfg.diarize,
-                        label,
+                        label: Some(name),
                         inject: cfg.inject,
-                        stream: stream_target.clone(),
+                        stream,
                         external_audio: None,
                     },
                     || {},
@@ -752,5 +786,69 @@ mod format_tests {
         ] {
             assert_eq!(save::Format::from(arg), want);
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn several_separate_sources_each_get_their_own_file() {
+        // `--separate --stream meeting.txt` used to hand every session the
+        // same path. Each opens its own StreamWriter and none is ever shown
+        // another's fragments, so the records tore: one person's continuation
+        // landing on the end of another's sentence.
+        let base = Path::new("/tmp/meeting.txt");
+        assert_eq!(
+            stream_path_for(base, "Mic", 2),
+            Path::new("/tmp/meeting-mic.txt")
+        );
+        assert_eq!(
+            stream_path_for(base, "System audio", 2),
+            Path::new("/tmp/meeting-system-audio.txt")
+        );
+    }
+
+    #[test]
+    fn a_lone_source_keeps_the_path_it_asked_for() {
+        // Nobody to collide with, and renaming the file every single-source
+        // run has always written would be a break for nothing.
+        assert_eq!(
+            stream_path_for(Path::new("/tmp/notes.txt"), "Mic", 1),
+            Path::new("/tmp/notes.txt")
+        );
+    }
+
+    #[test]
+    fn the_files_streamed_to_are_the_files_a_split_save_writes() {
+        // Streaming a conversation and then saving it with --split has to
+        // land on one set of files rather than two conventions for one idea.
+        // Checked against `save_per_source` running for real, not against the
+        // names spelled out above, so this states the invariant rather than
+        // today's answer and cannot drift with it.
+        let dir = std::env::temp_dir().join(format!("syrinx-cli-split-{}", std::process::id()));
+        let base = dir.join("meeting.txt");
+        let seg = |at: f64, text: &str, source: &str| syrinx_client::session::Segment {
+            at,
+            text: text.into(),
+            source: Some(source.into()),
+            speaker: None,
+        };
+        let saved = save::save_per_source(
+            &base,
+            &[
+                seg(0.0, "we ship Thursday", "Mic"),
+                seg(1.0, "no we don't", "System audio"),
+            ],
+            save::Format::Labelled,
+        )
+        .unwrap();
+        let streamed: Vec<PathBuf> = ["Mic", "System audio"]
+            .iter()
+            .map(|s| stream_path_for(&base, s, 2))
+            .collect();
+        assert_eq!(saved, streamed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
