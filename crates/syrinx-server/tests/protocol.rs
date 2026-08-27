@@ -276,18 +276,27 @@ async fn session_flush_ends_the_session_exactly_like_stop() {
     // never transcribed -- the mock's third word is what its absence proves.
     let _ = ws.send(one_chunk()).await;
 
-    let mut commits = Vec::new();
-    let mut closed = false;
-    while let Some(m) = next_msg(&mut ws).await {
-        match m {
-            ServerMessage::TranscriptCommit { text, .. } => commits.push(text),
-            ServerMessage::SessionClosed { .. } => {
-                closed = true;
-                break;
+    // Bounded, because the failure this test exists to catch is a flush that
+    // keeps the session open -- and an unbounded read of a session that never
+    // closes hangs rather than fails. A hang in CI is a timeout with no message
+    // on it; the deadline turns the same regression into a named assertion.
+    let (commits, closed) = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut commits = Vec::new();
+        let mut closed = false;
+        while let Some(m) = next_msg(&mut ws).await {
+            match m {
+                ServerMessage::TranscriptCommit { text, .. } => commits.push(text),
+                ServerMessage::SessionClosed { .. } => {
+                    closed = true;
+                    break;
+                }
+                other => panic!("unexpected message: {other:?}"),
             }
-            other => panic!("unexpected message: {other:?}"),
         }
-    }
+        (commits, closed)
+    })
+    .await
+    .expect("flush must end the session; the server left it open");
 
     assert!(closed, "flush must close the session, the same as stop");
     assert_eq!(
@@ -296,7 +305,10 @@ async fn session_flush_ends_the_session_exactly_like_stop() {
         "flush emits what was buffered and nothing sent after it"
     );
     assert!(
-        next_msg(&mut ws).await.is_none(),
+        tokio::time::timeout(Duration::from_secs(10), next_msg(&mut ws))
+            .await
+            .expect("the socket must close, not linger")
+            .is_none(),
         "the socket is closed, not merely quiet"
     );
 }
