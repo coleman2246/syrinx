@@ -99,8 +99,9 @@ impl Models {
         let vad = dir.join(VAD_FILE);
         ensure!(
             vad.is_file(),
-            "{}: no {VAD_FILE}. The directory must hold silero VAD v5 under \
-             exactly that name, alongside a speaker-embedding model \
+            "{}: no {VAD_FILE}. The directory must hold silero VAD under exactly \
+             that name -- v6.2.1 is what the README fetches, on the 512+64-sample \
+             interface unchanged since v5 -- alongside a speaker-embedding model \
              (ideally {EMBED_FILE}).",
             dir.display()
         );
