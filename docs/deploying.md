@@ -87,6 +87,14 @@ The image is built with `--features cuda,diarize`, so nothing else changes: no
 new runtime dependency — the diarizer drives the same ONNX Runtime the ASR
 already loads — and about 6% of one core per session on top of the ASR.
 
+That core is the entire cost. The runtime in the image is the CUDA build,
+because the ASR needs it, but the diarizer asks it for the CPU execution
+provider explicitly when it opens its two models — pinned there, not left to
+whatever a build with both features happens to default to. Speaker labelling is
+cheap enough to run on a core, and moving it onto the card would make syrinx a
+larger tenant on a GPU that Frigate or Jellyfin may also be using. It adds no
+VRAM, so the floor described under **Sharing a GPU** keeps meaning what it says.
+
 Check the startup log either way. It says `speaker labelling available` with
 the two paths if it worked, and an `error!` line naming the file it could not
 read if it did not; it never refuses to start over this.
