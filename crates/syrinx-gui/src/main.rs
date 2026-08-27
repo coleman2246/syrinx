@@ -85,6 +85,14 @@ fn run() -> Result<()> {
     let config = Config::load(None)?;
     ensure_daemon()?;
 
+    // Checked after the daemon, deliberately. Starting one is useful even
+    // where a window cannot open -- a tray, a hotkey and `syrinx toggle` are
+    // not a window -- and it is what makes the message below true rather
+    // than a guess.
+    if let Some(why) = no_window_here() {
+        anyhow::bail!("{why}");
+    }
+
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([480.0, 380.0])
         .with_min_inner_size([400.0, 280.0])
@@ -132,6 +140,60 @@ fn window_icon() -> Option<egui::IconData> {
             None
         }
     }
+}
+
+/// Why no window can open here, if none can.
+///
+/// Run from a TTY or over SSH, winit answers `neither WAYLAND_DISPLAY nor
+/// WAYLAND_SOCKET nor DISPLAY is set`. That is true, and it names three
+/// variables and no next step -- and it reads as total failure at the one
+/// moment when it is furthest from true: the daemon is started before the
+/// window and outlives it, so dictation is already running by the time this
+/// can be reported.
+///
+/// Read from the environment rather than from what `run_native` hands back.
+/// The environment is what decides the outcome -- with no X11 display and no
+/// Wayland socket there is no backend winit could succeed with -- so
+/// checking it is exact, and it needs no guesses about which error variant
+/// or wording a future eframe will use.
+fn no_window_here() -> Option<String> {
+    // Only Wayland and X11 work this way. Windows and macOS have no such
+    // variables, and a window that fails to open there has some other cause
+    // that this must not claim to explain.
+    if !cfg!(all(unix, not(target_os = "macos"))) {
+        return None;
+    }
+    // Empty counts as unset, which is how the display libraries read it too.
+    let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    no_window_advice(
+        set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET") || set("DISPLAY"),
+        ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"].iter().any(|k| set(k)),
+    )
+}
+
+/// The wording, kept apart from reading the environment so that what a user
+/// is told can be checked without a test reaching into the process it runs
+/// in.
+fn no_window_advice(graphical: bool, ssh: bool) -> Option<String> {
+    if graphical {
+        return None;
+    }
+    let mut why = String::from(
+        "this shell has no graphical session, so there is nowhere to put a window.\n\n\
+         Dictation is running regardless: the daemon started before this and is \
+         listening now. Use the tray icon, the hotkey from your config, or \
+         `syrinx toggle` from a script or key binding.\n\n\
+         For the window, start syrinx-gui from a terminal inside the desktop session.",
+    );
+    if ssh {
+        why.push_str(
+            "\n\nThis is an SSH session, so the window could only ever have opened on \
+             that machine's own screen: Wayland has no equivalent of X11 forwarding, and \
+             there is nothing here to forward. The daemon is on the far machine too, \
+             which is where the microphone is.",
+        );
+    }
+    Some(why)
 }
 
 /// Start a daemon if none is listening, and wait for its socket.
@@ -365,6 +427,46 @@ mod ensure_daemon_tests {
         std::fs::write(&exe, b"").unwrap();
         assert_eq!(daemon_beside(&dir), Some(exe));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_graphical_session_is_left_alone() {
+        // The overwhelmingly common case, including SSH with X11 forwarding
+        // set up, where DISPLAY is present and a window really does open.
+        assert_eq!(no_window_advice(true, false), None);
+        assert_eq!(no_window_advice(true, true), None);
+    }
+
+    #[test]
+    fn a_tty_is_told_that_dictation_is_running_anyway() {
+        // The point of the whole message. winit's version reads as a total
+        // failure, and the daemon has already started by then -- so the one
+        // thing a user most needs to know is the thing it never said.
+        let why = no_window_advice(false, false).expect("a bare TTY has no window");
+        for wanted in ["tray", "syrinx toggle", "desktop session", "hotkey"] {
+            assert!(why.contains(wanted), "missing {wanted:?} from:\n{why}");
+        }
+    }
+
+    #[test]
+    fn an_ssh_session_is_told_the_window_cannot_follow_it() {
+        // Otherwise the advice to "start it inside the desktop session" reads
+        // as though forwarding were merely misconfigured.
+        let why = no_window_advice(false, true).expect("SSH with no display has no window");
+        assert!(why.contains("SSH"), "{why}");
+        assert!(why.contains("forward"), "{why}");
+        // The non-SSH advice is still there: it is additional, not instead.
+        assert!(why.contains("syrinx toggle"), "{why}");
+    }
+
+    #[test]
+    fn the_message_does_not_fall_back_to_naming_variables() {
+        // What it replaces. Three environment variables is what winit said,
+        // and knowing their names has never helped anyone start dictating.
+        let why = no_window_advice(false, true).unwrap();
+        for raw in ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"] {
+            assert!(!why.contains(raw), "{raw} leaked into:\n{why}");
+        }
     }
 
     #[test]
