@@ -696,14 +696,28 @@ impl DaemonRuntime {
 
         let (url, token) = (self.opts.config.url.clone(), self.opts.config.token.clone());
         let inject = self.opts.config.inject;
-        // Shared by every session in separate mode. The file is opened for
-        // append, so each write lands at the end atomically and fragments
-        // interleave in arrival order rather than tearing.
         let stream = self
             .opts
             .config
             .stream_path()
             .map(|p| (p, self.opts.format));
+        // Separate mode runs a session per source, and every session opens
+        // its own StreamWriter. Pointing them all at one file used to be
+        // described as interleaving in arrival order rather than tearing;
+        // it tears. No writer is ever shown another's fragments, so none
+        // knows to break the line for a source it cannot see, and they all
+        // open on the same empty file so none writes the newline that would
+        // have separated them -- two people's words run together on one
+        // line, under two Speaker 1s their own clusterers minted
+        // independently. See `two_writers_on_one_file_tear_the_records` in
+        // stream.rs.
+        //
+        // A file each, named as `save_per_source` names them, so streaming
+        // a conversation and saving it split agree. Only when there is more
+        // than one source: a single writer has nobody to collide with, and
+        // renaming its file would buy nothing.
+        let split_stream = matches!(self.opts.source_mode, crate::mode::SourceMode::Separate)
+            && resolved.len() > 1;
         match self.opts.source_mode {
             crate::mode::SourceMode::Combined => {
                 self.sessions.push(crate::session::start(
@@ -732,7 +746,16 @@ impl DaemonRuntime {
                     } else {
                         OutputMode::Transcribe
                     };
-                    let label = Some(source.short_label());
+                    let name = source.short_label();
+                    let stream = stream.as_ref().map(|(base, format)| {
+                        let p = if split_stream {
+                            save::path_for_source(base, &name)
+                        } else {
+                            base.clone()
+                        };
+                        info!("appending {name}'s transcript to {}", p.display());
+                        (p, *format)
+                    });
                     self.sessions.push(crate::session::start(
                         SessionOptions {
                             url: url.clone(),
@@ -740,9 +763,9 @@ impl DaemonRuntime {
                             sources: vec![source],
                             mode,
                             diarize: self.opts.config.diarize,
-                            label,
+                            label: Some(name),
                             inject,
-                            stream: stream.clone(),
+                            stream,
                             external_audio: None,
                         },
                         || {},

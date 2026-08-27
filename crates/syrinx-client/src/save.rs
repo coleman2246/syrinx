@@ -321,6 +321,27 @@ pub fn slug(name: &str) -> String {
     out.trim_end_matches('-').chars().take(40).collect()
 }
 
+/// Where one source's half of `base` goes: `meeting.txt` and `Yeti` give
+/// `meeting-yeti.txt`.
+///
+/// Shared by the two things that split one requested path into a file per
+/// source -- [`save_per_source`] and separate mode's streaming -- because
+/// they must agree. Streaming a conversation and then saving it split
+/// should land on the same names, not on two conventions for one idea.
+pub fn path_for_source(base: &Path, source: &str) -> PathBuf {
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "transcript".into());
+    let ext = base
+        .extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "txt".into());
+    base.parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("{stem}-{}.{ext}", slug(source)))
+}
+
 /// Save each source to its own file beside `base`, returning the paths.
 pub fn save_per_source(
     base: &Path,
@@ -331,19 +352,10 @@ pub fn save_per_source(
     if groups.is_empty() {
         anyhow::bail!("nothing to save: the transcript is empty");
     }
-    let stem = base
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "transcript".into());
-    let ext = base
-        .extension()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "txt".into());
-    let dir = base.parent().unwrap_or(Path::new("."));
 
     let mut written = Vec::new();
     for (name, segs) in groups {
-        let path = dir.join(format!("{stem}-{}.{ext}", slug(&name)));
+        let path = path_for_source(base, &name);
         let body = render(&segs, "", format);
         // A source that produced nothing is skipped rather than writing an
         // empty file that looks like a failed recording.
@@ -614,6 +626,40 @@ mod tests {
         assert_eq!(groups[0].0, "System", "first heard should come first");
         assert_eq!(groups[0].1.len(), 2);
         assert_eq!(groups[1].0, "Mic");
+    }
+
+    #[test]
+    fn a_source_gets_its_own_file_beside_the_one_asked_for() {
+        let p = path_for_source(Path::new("/tmp/meeting.txt"), "Yeti (RNNoise)");
+        assert_eq!(p, Path::new("/tmp/meeting-yeti-rnnoise.txt"));
+    }
+
+    #[test]
+    fn a_streamed_split_lands_where_a_saved_split_would() {
+        // Separate mode streams through `path_for_source` and saves through
+        // `save_per_source`. Two conventions for one idea would leave a
+        // conversation streamed to one set of files and saved to another.
+        let base = tmp("split-agree").join("meeting.txt");
+        let segs = [
+            seg_src(0.0, "hello", "Mic"),
+            seg_src(1.0, "hi", "System audio"),
+        ];
+        let saved = save_per_source(&base, &segs, Format::Plain).unwrap();
+        let streamed: Vec<PathBuf> = ["Mic", "System audio"]
+            .iter()
+            .map(|s| path_for_source(&base, s))
+            .collect();
+        assert_eq!(saved, streamed);
+        let _ = std::fs::remove_dir_all(tmp("split-agree"));
+    }
+
+    #[test]
+    fn a_path_without_an_extension_still_splits() {
+        // Streaming targets are whatever was typed into a file dialog.
+        assert_eq!(
+            path_for_source(Path::new("notes"), "Mic"),
+            Path::new("notes-mic.txt")
+        );
     }
 
     #[test]

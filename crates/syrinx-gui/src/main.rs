@@ -1138,7 +1138,15 @@ impl App {
             // The word already carries the state, so the record dot was
             // redundant -- and it rendered as a box on Windows.
             let label = if streaming { "Streaming" } else { "Stream…" };
+            // Separate mode writes one file per source beside the chosen
+            // path, so a tooltip naming only that path would name a file
+            // nothing is being written to.
+            let split = self.state.source_mode == SourceMode::Separate
+                && self.state.source_keys.len() > 1;
             let hover = match &self.state.stream_to {
+                Some(p) if split => {
+                    format!("Appending to one file per source beside {p}\nClick to stop")
+                }
                 Some(p) => format!("Appending to {p}\nClick to stop"),
                 None => "Append the transcript to a file as you speak, so\n\
                          nothing is lost if this crashes"

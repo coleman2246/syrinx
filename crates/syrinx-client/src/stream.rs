@@ -593,6 +593,50 @@ mod tests {
     }
 
     #[test]
+    fn two_writers_on_one_file_tear_the_records() {
+        // Why separate mode streams to a file per source instead of sharing
+        // one, and why no rule inside `continues_line` could have fixed it.
+        //
+        // Separate mode runs a session per source and every session opens
+        // its own writer. Neither is ever shown the other's fragments, so
+        // neither can know to break the line for a source it cannot see;
+        // and both open on the same empty file, so neither writes the
+        // newline that would have separated them. What lands is one line
+        // carrying two people's words, with each source's continuations
+        // appended after whichever record happened to be written last.
+        //
+        // Labelled is included deliberately: naming the source on each line
+        // does not save it, because the tearing happens between the lines
+        // rather than within one.
+        let p = scratch("two-writers");
+        let mk = |at: f64, text: &str, src: &str| Segment {
+            at,
+            text: text.into(),
+            source: Some(src.into()),
+            speaker: Some(1),
+        };
+        let mut mic = StreamWriter::open(&p, Format::Labelled).unwrap();
+        let mut sys = StreamWriter::open(&p, Format::Labelled).unwrap();
+        mic.append(&mk(0.0, "we ship Thursday", "Mic")).unwrap();
+        sys.append(&mk(0.3, "no we don't", "System")).unwrap();
+        mic.append(&mk(0.6, " and Friday", "Mic")).unwrap();
+        drop(mic);
+        drop(sys);
+
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(out.lines().count(), 1, "two records, one line: {out:?}");
+        assert!(
+            out.contains("Thursday[00:00] [System]"),
+            "the second record should run straight onto the first: {out:?}"
+        );
+        assert!(
+            out.ends_with("no we don't and Friday"),
+            "the mic's continuation should land after the system's line: {out:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn silence_writes_nothing() {
         // Empty commits would otherwise litter the file with blank lines.
         let p = scratch("silence");
