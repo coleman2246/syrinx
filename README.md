@@ -412,6 +412,22 @@ Every session appends to the same file, so stopping and starting continues
 where you left off, and a crash costs the last sentence rather than the whole
 session — verified against `kill -9` mid-session.
 
+Several sources transcribed separately get a file each, beside the one you
+asked for: `syrinx start --separate --stream notes.txt` on a microphone and
+system audio writes `notes-yeti-rnnoise.txt` and `notes-system-audio.txt`.
+Each source runs its own session with its own writer, and none of them is ever
+shown the others' fragments, so a shared file does not interleave them — it
+tears them, running one person's next few words onto the end of another's
+sentence. A file per source is what makes the records readable at all. The
+names are the ones a split save uses (`--split`, or **Save split** in the
+GUI), so streaming a conversation and then saving it lands on the same files.
+A single source keeps the name you gave it.
+
+Reading the whole conversation back in one piece is still **Save as…**, and it
+is better at it than the shared file ever was: it renders every source into
+one transcript ordered by time, rather than by whichever writer happened to
+reach the disk first.
+
 Only committed text is written. A stamped line continues while speech does and
 breaks on a pause, because the model splits on chunk boundaries rather than
 words: a line per fragment produced "brown fox j" then "umps over the".
