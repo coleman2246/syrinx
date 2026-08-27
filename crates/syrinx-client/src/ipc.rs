@@ -31,7 +31,17 @@ use std::path::PathBuf;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     /// Poll current state.
-    GetState,
+    ///
+    /// `since` is the last [`DaemonState::revision`] this viewer saw. When
+    /// it still matches, the daemon leaves the transcript and its turns out
+    /// of the reply and the viewer keeps the copy it already has -- which is
+    /// what stops a two-hour meeting being serialised, sent and parsed
+    /// thirty times a second to say nothing new. `None` always gets the
+    /// whole thing, which is what an older viewer's request decodes to.
+    GetState {
+        #[serde(default)]
+        since: Option<u64>,
+    },
     Start,
     Stop,
     Toggle,
@@ -87,11 +97,32 @@ pub struct DaemonState {
     pub status: Status,
     pub mode: OutputMode,
     pub transcript: String,
-    /// The same text as timed, sourced, and speaker-labelled fragments -- what
-    /// a viewer needs to render turns without recomputing what `save` already
-    /// knows.
+    /// The same text grouped into turns, as `save::turn_texts` produces them
+    /// -- a speaker and that speaker's prose, ready to render.
+    ///
+    /// Turns rather than the raw segments they are grouped from. A viewer
+    /// needs nothing per-segment: the only thing ever rendered from them was
+    /// the paragraph view, so shipping the grouping ready-made drops the
+    /// `at` and `source` fields nobody reads, collapses roughly nine
+    /// segments into one object, and takes the grouping off the viewer's
+    /// repaint path, where it used to run over the whole transcript thirty
+    /// times a second.
+    ///
+    /// Empty when nothing carries a speaker: the flat `transcript` above is
+    /// the whole story then, and filling this too would send every word
+    /// twice.
     #[serde(default)]
-    pub segments: Vec<crate::session::Segment>,
+    pub turns: Vec<(Option<u32>, String)>,
+    /// Which transcript the two fields above are. Bumped on every change,
+    /// and monotonic, so no two different transcripts can ever share one.
+    ///
+    /// A viewer passes the last one it saw back as [`Request::GetState`]'s
+    /// `since`; an unchanged answer arrives without the text. Zero means
+    /// "this daemon does not track revisions" -- which is what an older
+    /// one's `serde(default)` produces -- so a viewer must never read a zero
+    /// as a match and keep stale text on the strength of it.
+    #[serde(default)]
+    pub revision: u64,
     pub last_fragment: String,
     pub model: Option<String>,
     pub chunk_ms: Option<u32>,
@@ -143,12 +174,20 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
+    /// Everything a session knows about itself, ready for the daemon to
+    /// stamp its own settings onto.
+    ///
+    /// `transcript`, `turns` and `revision` are deliberately left empty: the
+    /// daemon holds those, rebuilds them only when they change, and fills
+    /// them in itself. Passing a `SessionHandle::live` state here is
+    /// therefore no loss.
     pub fn from_session(s: &SessionState, mode: OutputMode, source_key: Option<String>) -> Self {
         Self {
             status: s.status,
             mode,
-            transcript: s.transcript.clone(),
-            segments: s.segments.clone(),
+            transcript: String::new(),
+            turns: Vec::new(),
+            revision: 0,
             last_fragment: s.last_fragment.clone(),
             model: s.model.clone(),
             chunk_ms: s.chunk_ms,
@@ -269,7 +308,8 @@ mod tests {
     #[test]
     fn requests_round_trip() {
         for r in [
-            Request::GetState,
+            Request::GetState { since: None },
+            Request::GetState { since: Some(42) },
             Request::Toggle,
             Request::SetMode {
                 mode: OutputMode::Both,
@@ -296,6 +336,34 @@ mod tests {
         });
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), r);
+    }
+
+    #[test]
+    fn a_poll_from_an_older_viewer_still_decodes() {
+        // A viewer built before revisions sends a bare `get_state`. It has to
+        // keep working, and it has to mean "send me everything" -- which is
+        // exactly what `since: None` asks for.
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"type":"get_state"}"#).unwrap(),
+            Request::GetState { since: None }
+        );
+    }
+
+    #[test]
+    fn a_state_from_an_older_daemon_reports_no_revision() {
+        // The other direction: a daemon that predates revisions sends no such
+        // field, and `serde(default)` fills in zero. A viewer reads zero as
+        // "not tracked" and asks for the whole transcript every time, which
+        // is what it used to get anyway.
+        let old = r#"{"type":"state","status":"idle","mode":"transcribe",
+            "transcript":"hello","last_fragment":"","model":null,
+            "chunk_ms":null,"error":null,"source_key":null}"#;
+        let Response::State(s) = serde_json::from_str::<Response>(old).unwrap() else {
+            panic!("expected a state");
+        };
+        assert_eq!(s.revision, 0);
+        assert_eq!(s.transcript, "hello");
+        assert!(s.turns.is_empty());
     }
 
     #[test]

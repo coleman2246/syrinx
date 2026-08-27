@@ -62,6 +62,14 @@ struct Overlay {
     /// rather than only that sound is arriving. A meter can be lively while
     /// the transcript is empty.
     last: String,
+    /// The transcript revision last seen, echoed back on the next poll.
+    ///
+    /// This window renders none of the transcript -- a meter, a status and
+    /// the last few words is all of it -- so telling the daemon which
+    /// revision we hold means it stops sending one after the first poll.
+    /// Nothing here ever reads the text that arrives with that first reply;
+    /// the point is only to stop paying for it thirty times a second.
+    revision: u64,
     gone: bool,
 }
 
@@ -76,8 +84,11 @@ impl eframe::App for Overlay {
         let ctx = ui.ctx().clone();
 
         let mut target: Vec<f32> = Vec::new();
-        match ipc::request(&Request::GetState) {
+        match ipc::request(&Request::GetState {
+            since: Some(self.revision),
+        }) {
             Ok(ipc::Response::State(s)) => {
+                self.revision = s.revision;
                 target = s.levels;
                 self.status = s.status;
                 if !s.last_fragment.trim().is_empty() {

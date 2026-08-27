@@ -436,8 +436,20 @@ impl App {
 
     fn poll(&mut self) {
         self.last_poll = Instant::now();
-        match ipc::request(&Request::GetState) {
-            Ok(Response::State(s)) => {
+        // Asking with the revision already on screen: an unchanged transcript
+        // comes back without its text, which is what keeps a two-hour meeting
+        // from being serialised, sent and parsed thirty times a second to say
+        // nothing new.
+        let since = self.state.revision;
+        match ipc::request(&Request::GetState { since: Some(since) }) {
+            Ok(Response::State(mut s)) => {
+                // Zero is never a match: it is what a daemon too old to track
+                // revisions reports, and keeping our own copy on the strength
+                // of it would leave this window permanently blank.
+                if since != 0 && s.revision == since {
+                    s.transcript = std::mem::take(&mut self.state.transcript);
+                    s.turns = std::mem::take(&mut self.state.turns);
+                }
                 // The daemon is the authority: it owns the session that
                 // streams, and it persists the setting. Mirroring it here
                 // keeps the dropdown honest across restarts and across two
@@ -835,12 +847,16 @@ impl App {
                     } else {
                         ui.weak("Nothing transcribed yet.");
                     }
-                } else if self.state.segments.iter().any(|s| s.speaker.is_some()) {
+                } else if self.state.turns.iter().any(|(s, _)| s.is_some()) {
                     // A paragraph per turn, headed by its speaker. A leading
                     // turn before the first label ever appears has nothing
                     // honest to call itself, so it renders bare rather than
                     // borrowing a number from the turn after it.
-                    for (speaker, text) in save::turn_texts(&self.state.segments) {
+                    //
+                    // Grouped by the daemon, which does it once per change
+                    // rather than once per frame. This used to run over every
+                    // segment of the whole transcript on every repaint.
+                    for (speaker, text) in &self.state.turns {
                         if let Some(n) = speaker {
                             ui.label(egui::RichText::new(format!("Speaker {n}")).strong());
                         }

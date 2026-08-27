@@ -107,7 +107,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     // waited for the next loop tick before it was even looked at. Reading a
     // published snapshot decouples how fresh state is from how fast the loop
     // spins, which is what a 30 Hz meter needs.
-    let published: Arc<Mutex<DaemonState>> = Arc::new(Mutex::new(DaemonState::default()));
+    let published: Arc<Mutex<Published>> = Arc::new(Mutex::new(Published::default()));
 
     // Accept loop: one thread per connection, which is ample for a handful of
     // short-lived requests.
@@ -164,6 +164,12 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         preview: None,
         last_viewer: None,
         last: Default::default(),
+        // One rather than zero, so the first tick's token cannot match the
+        // cache's default and the published revision leaves zero -- which
+        // viewers read as "this daemon does not track revisions" -- behind
+        // immediately.
+        generation: 1,
+        text: Default::default(),
     };
 
     // Resolve the source up front so viewers show what would actually be used
@@ -197,7 +203,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
             let resp = match req {
                 // Only reaches the loop as a keep-alive; the reply came from
                 // the published snapshot.
-                Request::GetState => {
+                Request::GetState { .. } => {
                     state.last_viewer = Some(std::time::Instant::now());
                     Response::Ok
                 }
@@ -305,7 +311,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         state.reap_file_job();
         state.update_preview();
 
-        let mut snap = state.snapshot();
+        let mut snap = state.live_snapshot();
         // Settled at startup and constant thereafter, so it is stamped on
         // rather than carried through the session machinery.
         snap.hotkey = hotkey_report.clone();
@@ -313,8 +319,8 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         snap.format = state.opts.format;
 
         // Built from `snap` before it moves into `published`, so a whole
-        // extra `DaemonState` clone -- segments included -- is not paid every
-        // 25 ms just to hand the tray three small fields.
+        // extra `DaemonState` clone is not paid every 25 ms just to hand the
+        // tray three small fields.
         if let Some(h) = &tray_handle {
             h.update(TrayState {
                 status: snap.status,
@@ -322,7 +328,10 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                 last_fragment: snap.last_fragment.clone(),
             });
         }
-        *published.lock().expect("published state poisoned") = snap;
+        state.publish_into(
+            &mut published.lock().expect("published state poisoned"),
+            snap,
+        );
 
         // 25 ms rather than 100: the loop publishes the state a 30 Hz meter
         // reads, and doing almost nothing forty times a second is cheap.
@@ -336,10 +345,47 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     Ok(())
 }
 
+/// What clients read, split by how often it changes.
+///
+/// `live` is republished every tick and is small. The transcript is not: at
+/// two hours of meeting it is around a megabyte of JSON, and it is
+/// byte-identical from one tick to the next almost every time. Keeping it
+/// beside the live state rather than inside it means the loop replaces it
+/// only when it moves, and a poll copies it only when the viewer asking has
+/// not already got it.
+///
+/// One mutex over both, so a reply can never pair a live state with a
+/// transcript from a different revision.
+#[derive(Default)]
+struct Published {
+    /// Everything except the transcript. `live.revision` says which
+    /// transcript the two fields below are.
+    live: DaemonState,
+    transcript: String,
+    turns: Vec<(Option<u32>, String)>,
+}
+
+impl Published {
+    /// The reply to a poll that last saw `since`.
+    ///
+    /// The text travels only when the viewer has not already got it. A
+    /// revision of zero never counts as a match: it is what a daemon that
+    /// does not track revisions reports, and treating it as one would leave
+    /// a viewer showing an empty transcript for ever.
+    fn state_since(&self, since: Option<u64>) -> DaemonState {
+        let mut out = self.live.clone();
+        if self.live.revision == 0 || since != Some(self.live.revision) {
+            out.transcript = self.transcript.clone();
+            out.turns = self.turns.clone();
+        }
+        out
+    }
+}
+
 fn serve_client(
     stream: Stream,
     tx: mpsc::Sender<(Request, Option<mpsc::Sender<Response>>)>,
-    published: Arc<Mutex<DaemonState>>,
+    published: Arc<Mutex<Published>>,
 ) {
     // A client that connects and then goes quiet must not tie up a thread.
     stream
@@ -354,10 +400,15 @@ fn serve_client(
         // Answered straight from the published snapshot. Polling is the common
         // case by far, and routing it through the loop would cap the meter at
         // the loop rate.
-        Ok(Request::GetState) => {
+        Ok(Request::GetState { since }) => {
             // Still tell the loop a viewer is here, so metering keeps running.
-            let _ = tx.send((Request::GetState, None));
-            Response::State(published.lock().expect("published state poisoned").clone())
+            let _ = tx.send((Request::GetState { since: None }, None));
+            Response::State(
+                published
+                    .lock()
+                    .expect("published state poisoned")
+                    .state_since(since),
+            )
         }
         Ok(req) => {
             let (rtx, rrx) = mpsc::channel();
@@ -414,6 +465,35 @@ struct DaemonRuntime {
     /// a snapshot falls back to an empty default. The text survives until the
     /// next session starts or it is explicitly cleared.
     last: crate::session::SessionState,
+    /// Bumped whenever `sessions` or `last` is replaced rather than merely
+    /// added to -- a session starting or being reaped, a transcript cleared,
+    /// a file job folded in. Sessions only ever count upwards while they
+    /// run, so this is what tells the cache below that the text moved
+    /// backwards or sideways underneath it.
+    generation: u64,
+    text: TranscriptCache,
+}
+
+/// The transcript as viewers see it, rebuilt only when it changes.
+///
+/// Building it on every tick meant merging and cloning every segment forty
+/// times a second and then regrouping them into turns -- at two hours of
+/// meeting, milliseconds of work per tick to produce a byte-identical
+/// answer. `token` is what makes "has it changed" answerable without
+/// looking at the text at all.
+#[derive(Default)]
+struct TranscriptCache {
+    /// Published to viewers, and monotonic, so no two different transcripts
+    /// can ever share one -- a viewer that slept through a whole session and
+    /// woke during the next cannot be told its stale copy is current.
+    revision: u64,
+    /// What `revision` was last computed from: the generation, how many
+    /// sessions are running, and how many changes they have made between
+    /// them. Every one is a counter read under a lock, so comparing costs
+    /// nothing.
+    token: (u64, usize, u64),
+    transcript: String,
+    turns: Vec<(Option<u32>, String)>,
 }
 
 impl DaemonRuntime {
@@ -464,19 +544,76 @@ impl DaemonRuntime {
         }
     }
 
-    fn snapshot(&self) -> DaemonState {
-        // Falls back to the last finished session rather than to an empty
-        // default, so a stopped transcript stays on screen.
-        let s = if self.sessions.is_empty() {
-            self.last.clone()
+    /// Rebuild the published transcript, if and only if it has moved.
+    ///
+    /// `changes` is the running total across live sessions, read from the
+    /// counters they keep. It, the session count and the generation together
+    /// change on every edit and on nothing else, so an unchanged token is
+    /// proof the text is unchanged -- and the expensive part below, which
+    /// clones every segment, merges them and groups them into turns, is
+    /// skipped entirely.
+    fn refresh_text(&mut self, changes: u64) {
+        let token = (self.generation, self.sessions.len(), changes);
+        if token == self.text.token {
+            return;
+        }
+        let (transcript, turns) = {
+            // Falls back to the last finished session rather than to an empty
+            // default, so a stopped transcript stays on screen.
+            let merged;
+            let s = if self.sessions.is_empty() {
+                &self.last
+            } else {
+                merged =
+                    merge_states(&self.sessions.iter().map(|s| s.state()).collect::<Vec<_>>());
+                &merged
+            };
+            // Turns only once something carries a speaker. Without labels
+            // they are one turn holding the entire transcript over again,
+            // and a viewer renders the flat text in that case anyway.
+            let turns = if s.segments.iter().any(|seg| seg.speaker.is_some()) {
+                save::turn_texts(&s.segments)
+            } else {
+                Vec::new()
+            };
+            (s.transcript.clone(), turns)
+        };
+        self.text.token = token;
+        self.text.revision += 1;
+        self.text.transcript = transcript;
+        self.text.turns = turns;
+    }
+
+    /// Everything a viewer needs except the transcript itself.
+    ///
+    /// `transcript` and `turns` come back empty and `revision` says which
+    /// ones they would have been; [`publish_into`](Self::publish_into) is
+    /// what pairs them up. Splitting it this way is the point: the fields
+    /// here move on every tick and are all small, and the transcript moves
+    /// when somebody speaks and is not.
+    fn live_snapshot(&mut self) -> DaemonState {
+        // `live` leaves the segments where they are, so the
+        // forty-times-a-second path never touches the transcript. The
+        // transcript reaches viewers from the cache instead, and
+        // `refresh_text` is what decides whether that cache needs rebuilding.
+        let lives: Vec<crate::session::SessionState> =
+            self.sessions.iter().map(|s| s.live()).collect();
+        self.refresh_text(lives.iter().map(|s| s.changes).sum());
+
+        // `merge_states` folds live states exactly as it folds full ones:
+        // with no segments to interleave, everything it does to them is a
+        // no-op, and the one merge rule stays in one place.
+        let s = if lives.is_empty() {
+            self.last.live()
         } else {
-            merge_states(&self.sessions.iter().map(|s| s.state()).collect::<Vec<_>>())
+            merge_states(&lives)
         };
         let mut out = DaemonState::from_session(
             &s,
             self.opts.mode,
             self.opts.source_keys.first().cloned(),
         );
+        out.revision = self.text.revision;
         out.source_keys = self.opts.source_keys.clone();
         out.source_mode = self.opts.source_mode;
         // The setting, not the session's answer about it: a viewer's checkbox
@@ -503,6 +640,20 @@ impl DaemonRuntime {
             out.rms = p.rms();
         }
         out
+    }
+
+    /// Hand a fresh live state to viewers, with the transcript beside it.
+    ///
+    /// The transcript is copied across only when it has actually moved. It
+    /// is the one big thing here -- around a megabyte of it after two hours
+    /// of meeting -- and copying it forty times a second to say nothing new
+    /// is the cost the revision exists to avoid.
+    fn publish_into(&self, p: &mut Published, live: DaemonState) {
+        if p.live.revision != live.revision {
+            p.transcript = self.text.transcript.clone();
+            p.turns = self.text.turns.clone();
+        }
+        p.live = live;
     }
 
     fn start(&mut self) {
@@ -540,6 +691,7 @@ impl DaemonRuntime {
         // A new session starts from a blank transcript; the previous one has
         // had its chance to be read and saved.
         self.last = Default::default();
+        self.generation += 1;
         self.start_overlay();
 
         let (url, token) = (self.opts.config.url.clone(), self.opts.config.token.clone());
@@ -710,6 +862,7 @@ impl DaemonRuntime {
             // saving would produce times that are simply wrong.
             self.last.segments.clear();
         }
+        self.generation += 1;
         self.file_job = None;
     }
 
@@ -718,6 +871,7 @@ impl DaemonRuntime {
     fn clear(&mut self) {
         if !self.running() {
             self.last = Default::default();
+            self.generation += 1;
         }
     }
 
@@ -816,6 +970,7 @@ impl DaemonRuntime {
         // Keep the finished transcript visible and saveable.
         self.last = st;
         self.sessions.clear();
+        self.generation += 1;
         self.stop_overlay();
     }
 }
@@ -917,6 +1072,8 @@ mod tests {
             last_viewer: None,
             file_job: None,
             last,
+            generation: 1,
+            text: Default::default(),
         }
     }
 
@@ -1038,12 +1195,174 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A daemon holding two speakers' worth of transcript, which is the case
+    /// every one of these is really about.
+    fn daemon_holding_a_conversation() -> DaemonRuntime {
+        daemon_holding(SessionState {
+            transcript: "we ship Thursday no we don't".into(),
+            segments: vec![
+                seg(0.0, "we ship Thursday", Some(1), None),
+                seg(2.0, "no we don't", Some(2), None),
+            ],
+            ..Default::default()
+        })
+    }
+
+    /// One tick of the daemon loop, publishing into `p` exactly as `run`
+    /// does -- so what these tests read is what a viewer would be sent.
+    fn tick(d: &mut DaemonRuntime, p: &mut Published) {
+        let snap = d.live_snapshot();
+        d.publish_into(p, snap);
+    }
+
+    #[test]
+    fn an_unchanged_transcript_is_not_sent_again() {
+        // The whole point of the revision. A viewer that already has the text
+        // gets a reply with the live fields and nothing else, so a two-hour
+        // meeting stops crossing the socket thirty times a second.
+        let mut d = daemon_holding_a_conversation();
+        let mut published = Published::default();
+        tick(&mut d, &mut published);
+        let rev = published.live.revision;
+        assert_ne!(rev, 0, "a live daemon must report a real revision");
+
+        let fresh = published.state_since(None);
+        assert_eq!(fresh.transcript, "we ship Thursday no we don't");
+        assert_eq!(fresh.turns.len(), 2);
+
+        let repeat = published.state_since(Some(rev));
+        assert!(repeat.transcript.is_empty(), "the text travelled twice");
+        assert!(repeat.turns.is_empty(), "the turns travelled twice");
+        // The live fields still come through, which is what a poll is for.
+        assert_eq!(repeat.revision, rev);
+        assert_eq!(repeat.status, fresh.status);
+
+        // An older revision is not a match, so the text comes back.
+        assert!(!published.state_since(Some(rev - 1)).transcript.is_empty());
+    }
+
+    #[test]
+    fn a_zero_revision_is_never_read_as_unchanged() {
+        // Zero is what a daemon too old to track revisions reports. If it
+        // ever counted as a match, a viewer would hold an empty transcript
+        // and never be sent another.
+        let published = Published {
+            live: DaemonState::default(),
+            transcript: "words".into(),
+            turns: Vec::new(),
+        };
+        assert_eq!(published.live.revision, 0);
+        assert_eq!(published.state_since(Some(0)).transcript, "words");
+    }
+
+    #[test]
+    fn the_revision_holds_still_while_the_transcript_does() {
+        // Ticking without speaking must not invent a new revision: every one
+        // costs every viewer a fresh copy of the whole meeting.
+        let mut d = daemon_holding_a_conversation();
+        let mut p = Published::default();
+        tick(&mut d, &mut p);
+        let first = p.live.revision;
+        for _ in 0..10 {
+            tick(&mut d, &mut p);
+            assert_eq!(p.live.revision, first);
+        }
+        // And the text is still there to be handed out, not merely unsent.
+        assert_eq!(p.transcript, "we ship Thursday no we don't");
+    }
+
+    #[test]
+    fn clearing_the_transcript_moves_the_revision_on() {
+        // And it must move when the text does, including when it is replaced
+        // rather than added to -- a cleared transcript is a change a viewer
+        // has to be told about, and it makes nothing longer.
+        let mut d = daemon_holding_a_conversation();
+        let mut p = Published::default();
+        tick(&mut d, &mut p);
+        let before = p.live.revision;
+        d.clear();
+        tick(&mut d, &mut p);
+        assert!(p.live.revision > before, "{before} -> {}", p.live.revision);
+        assert!(p.transcript.is_empty());
+        assert!(p.turns.is_empty());
+    }
+
+    #[test]
+    fn turns_are_published_ready_to_render() {
+        // The viewer does no grouping of its own any more, so what arrives
+        // has to be exactly what it used to compute for itself.
+        let mut d = daemon_holding_a_conversation();
+        let mut p = Published::default();
+        tick(&mut d, &mut p);
+        assert_eq!(
+            p.turns,
+            vec![
+                (Some(1), "we ship Thursday".to_string()),
+                (Some(2), "no we don't".to_string()),
+            ]
+        );
+        assert_eq!(p.turns, save::turn_texts(&d.last.segments));
+    }
+
+    #[test]
+    fn an_unlabelled_transcript_publishes_no_turns_at_all() {
+        // Without a speaker anywhere, the turns are one turn holding the
+        // whole transcript over again, and the viewer renders the flat text
+        // instead. Sending them would send every word twice.
+        let mut d = daemon_holding(SessionState {
+            transcript: "just me talking".into(),
+            segments: vec![seg(0.0, "just me talking", None, None)],
+            ..Default::default()
+        });
+        let mut p = Published::default();
+        tick(&mut d, &mut p);
+        assert_eq!(p.transcript, "just me talking");
+        assert!(
+            p.turns.is_empty(),
+            "nothing is labelled, so there is nothing to lay out in turns"
+        );
+    }
+
+    #[test]
+    fn a_live_state_carries_everything_except_the_transcript() {
+        // What the 40 Hz path reads. Dropping a field from it by accident
+        // would leave a viewer with a dead meter or a stale status, and the
+        // saving is only worth having because nothing a viewer shows lives
+        // in the two fields left behind.
+        let full = SessionState {
+            status: crate::session::Status::Listening,
+            transcript: "words".into(),
+            segments: vec![seg(0.0, "words", Some(1), None)],
+            last_fragment: "words".into(),
+            model: Some("nemotron".into()),
+            chunk_ms: Some(560),
+            diarize: true,
+            diarize_requested: true,
+            error: Some("boom".into()),
+            levels: vec![0.5; 10],
+            rms: 0.25,
+            changes: 7,
+        };
+        let live = full.live();
+        assert!(live.transcript.is_empty() && live.segments.is_empty());
+        assert_eq!(
+            (live.status, live.model.clone(), live.chunk_ms, live.changes),
+            (full.status, full.model.clone(), full.chunk_ms, full.changes)
+        );
+        assert_eq!(
+            (live.diarize, live.diarize_requested, live.rms),
+            (full.diarize, full.diarize_requested, full.rms)
+        );
+        assert_eq!((live.error, live.levels), (full.error, full.levels));
+        assert_eq!(live.last_fragment, full.last_fragment);
+    }
+
     #[test]
     fn a_viewer_is_told_what_the_next_session_would_ask_for() {
         // The checkbox reads this. It is not `diarize` or `diarize_requested`:
         // both are false with nothing running, and the setting is on.
-        let d = daemon_holding(SessionState::default());
-        let snap = d.snapshot();
+        let mut d = daemon_holding(SessionState::default());
+        let snap = d.live_snapshot();
         assert!(snap.diarize_configured);
         assert!(!snap.diarize);
         assert!(!snap.diarize_requested);

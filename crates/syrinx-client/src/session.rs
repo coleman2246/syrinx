@@ -84,6 +84,42 @@ pub struct SessionState {
     /// is receiving sound rather than only that it is running.
     pub levels: Vec<f32>,
     pub rms: f32,
+    /// How many times `transcript` and `segments` have moved.
+    ///
+    /// Read by the daemon on every tick to answer "has the transcript
+    /// changed" without looking at the transcript, which at a meeting's
+    /// length is tens of thousands of segments. A count rather than a
+    /// length: a revision retracts and re-pushes, so both the segment count
+    /// and the character count can come out the same on either side of a
+    /// real change.
+    pub changes: u64,
+}
+
+impl SessionState {
+    /// The same state with the transcript left out.
+    ///
+    /// `transcript` and `segments` come back empty; everything else is
+    /// copied. Cloning the whole thing costs a string per segment, which
+    /// after two hours of meeting is tens of thousands of them -- far too
+    /// much to pay forty times a second for a status line and a level meter.
+    /// `changes` comes through, so a caller can tell whether the transcript
+    /// it left behind has moved and clone the real thing only then.
+    pub fn live(&self) -> SessionState {
+        SessionState {
+            status: self.status,
+            transcript: String::new(),
+            segments: Vec::new(),
+            last_fragment: self.last_fragment.clone(),
+            model: self.model.clone(),
+            chunk_ms: self.chunk_ms,
+            diarize: self.diarize,
+            diarize_requested: self.diarize_requested,
+            error: self.error.clone(),
+            levels: self.levels.clone(),
+            rms: self.rms,
+            changes: self.changes,
+        }
+    }
 }
 
 /// Parameters for a run.
@@ -127,6 +163,16 @@ pub struct SessionHandle {
 impl SessionHandle {
     pub fn state(&self) -> SessionState {
         self.state.lock().expect("state lock poisoned").clone()
+    }
+
+    /// Everything about the session except the transcript.
+    ///
+    /// [`state`](Self::state) clones every segment, which after two hours of
+    /// meeting is tens of thousands of strings -- far too much to pay forty
+    /// times a second for a status line and a level meter. See
+    /// [`SessionState::live`] for what is left out.
+    pub fn live(&self) -> SessionState {
+        self.state.lock().expect("state lock poisoned").live()
     }
 
     pub fn stop(&mut self) {
@@ -362,6 +408,7 @@ async fn run(
                     if mode.keeps_transcript() {
                         s.transcript.push_str(&text);
                         s.segments.push(seg);
+                        s.changes += 1;
                     }
                     s.last_fragment = text;
                     drop(s);
@@ -395,6 +442,7 @@ async fn run(
                         // something the diarizer's lag buffer ever emits.
                         speaker: None,
                     });
+                    s.changes += 1;
                     drop(s);
                     n();
                 }

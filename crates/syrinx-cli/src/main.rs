@@ -462,7 +462,9 @@ fn run(
 
 /// The daemon's current state, or `None` if no daemon is listening.
 fn daemon_state() -> Option<syrinx_client::ipc::DaemonState> {
-    match syrinx_client::ipc::request(&syrinx_client::ipc::Request::GetState) {
+    // Always the whole state: this runs once per command and holds nothing
+    // between runs, so there is no earlier revision to ask against.
+    match syrinx_client::ipc::request(&syrinx_client::ipc::Request::GetState { since: None }) {
         Ok(syrinx_client::ipc::Response::State(s)) => Some(s),
         _ => None,
     }
