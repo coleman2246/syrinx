@@ -202,9 +202,42 @@ The rule: **diarization failing never costs the transcript.**
   `diarize: false` in every handshake, server still starts. A dictation
   server that will not boot over an optional feature's model file is the
   wrong trade.
-- CPU budget: VAD plus one embedding every 0.75 s is a few percent of one
-  core. If concurrent sessions ever made it matter, sessions degrade to
-  unlabeled rather than backpressuring audio.
+- CPU budget: VAD plus one embedding every 0.75 s of voiced audio is a few
+  percent of one core — 6% of one, measured, per session. A session that
+  could not keep up would backpressure its own audio; it does not shed
+  labels to keep the socket draining.
+
+That last bullet promised the opposite until the pipeline was built — "if
+concurrent sessions ever made it matter, sessions degrade to unlabeled
+rather than backpressuring audio" — and nothing implements it. What exists
+runs the diarizer inline in the blocking inference task, ahead of the ASR
+push, behind an 8-deep bounded audio channel; a diarizer slow enough to
+matter stalls the socket reader, which is precisely what the sentence said
+would not happen. The promise is corrected rather than kept, for three
+reasons.
+
+The 6% shares a task with an ASR that dominates it, so the diarizer cannot
+become the thing a session waits on without something having already gone
+badly wrong inside it — and the failures that go badly wrong in practice
+fail fast rather than slowly, which the strike-out already handles.
+`max_sessions` bounds how many diarizers run at once, and it is the
+admission control that was doing this job all along: the conditional the
+promise was written under ("if concurrent sessions ever made it matter")
+describes a server that has already accepted more work than it can do, and
+refusing that at the door is the answer the rest of the design gives. And a
+time budget would be a second way for a session to lose its labels, next to
+the consecutive-failure count that is already one, with no obvious rule for
+which of them should fire on a diarizer that is both slow and failing.
+Cheap to add; not cheap to reason about afterwards.
+
+What would change the answer is a diarizer whose cost stops being bounded
+by the audio handed to it — a second embedding pass, an overlap detector, a
+model that is not 26 MB — or a deployment that raises `max_sessions` far
+enough that the diarizers together rival the ASR. Either earns the second
+policy. The shape to reach for then is a time budget that feeds the
+*existing* retirement rather than inventing a parallel one: a push that
+overruns counts as a failed push, and a session that keeps overrunning
+drops its diarizer by the rule already written down above.
 
 ## GUI rendering and file formats
 
