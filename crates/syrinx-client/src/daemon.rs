@@ -268,14 +268,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                     Response::Ok
                 }
                 Request::SetStreamFile { path } => {
-                    state.opts.config.stream_to = path;
-                    if let Err(e) = state
-                        .opts
-                        .config
-                        .save(&crate::Config::default_path())
-                    {
-                        warn!("saving the config: {e:#}");
-                    }
+                    state.set_stream_file(path, &crate::Config::default_path());
                     Response::Ok
                 }
                 Request::SetServer { server } => {
@@ -326,8 +319,6 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         // Settled at startup and constant thereafter, so it is stamped on
         // rather than carried through the session machinery.
         snap.hotkey = hotkey_report.clone();
-        snap.stream_to = state.opts.config.stream_to.clone();
-        snap.format = state.opts.format;
 
         // Built from `snap` before it moves into `published`, so a whole
         // extra `DaemonState` clone is not paid every 25 ms just to hand the
@@ -627,9 +618,13 @@ impl DaemonRuntime {
         out.revision = self.text.revision;
         out.source_keys = self.opts.source_keys.clone();
         out.source_mode = self.opts.source_mode;
-        // The setting, not the session's answer about it: a viewer's checkbox
-        // has to read what the next session would ask for.
+        // The settings, not the session's answers about them: a viewer's
+        // controls have to read what the next session would do. Stamped here
+        // rather than by the caller so every reader of a snapshot -- the loop,
+        // and the tests -- sees the same one.
         out.diarize_configured = self.opts.config.diarize;
+        out.stream_to = self.opts.config.stream_to.clone();
+        out.format = self.opts.format;
 
         // A file job owns the status while it runs, so a viewer shows progress
         // rather than an idle window with nothing happening.
@@ -940,6 +935,24 @@ impl DaemonRuntime {
         }
         self.opts.config.diarize = on;
         if let Err(e) = self.opts.config.save(&crate::Config::default_path()) {
+            warn!("saving the config: {e:#}");
+        }
+    }
+
+    /// Where the next session appends its transcript, or nothing at all.
+    ///
+    /// Applied and written down, like `set_diarize`: the setting reaches a
+    /// session through `opts.config`, and one that died with the daemon would
+    /// have to be chosen again every time. Unlike `set_diarize` it is accepted
+    /// while running -- the writer is opened at session start, so this can
+    /// only ever describe the next session anyway.
+    ///
+    /// The config path is a parameter rather than `Config::default_path()`
+    /// because this writes a real file: a test that called it would otherwise
+    /// edit the settings of whoever ran it.
+    fn set_stream_file(&mut self, path: Option<String>, config: &std::path::Path) {
+        self.opts.config.stream_to = path;
+        if let Err(e) = self.opts.config.save(&config.to_path_buf()) {
             warn!("saving the config: {e:#}");
         }
     }
@@ -1341,6 +1354,54 @@ mod tests {
         );
         assert_eq!((live.error, live.levels), (full.error, full.levels));
         assert_eq!(live.last_fragment, full.last_fragment);
+    }
+
+    #[test]
+    fn a_chosen_stream_file_is_applied_and_written_down() {
+        // Nothing covered this handler end to end, and it has two halves that
+        // can fail separately: the next session reads `opts.config`, and every
+        // viewer reads the published state.
+        let config_path = scratch("streamfile").with_extension("toml");
+        let _ = std::fs::remove_file(&config_path);
+        let mut d = daemon_holding(SessionState::default());
+        let mut p = Published::default();
+
+        d.set_stream_file(Some("/tmp/notes.txt".into()), &config_path);
+        tick(&mut d, &mut p);
+
+        assert_eq!(d.opts.config.stream_to.as_deref(), Some("/tmp/notes.txt"));
+        assert_eq!(
+            p.live.stream_to.as_deref(),
+            Some("/tmp/notes.txt"),
+            "a window has to see what it just asked for"
+        );
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("/tmp/notes.txt"), "not persisted:\n{written}");
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn stopping_the_stream_takes_the_setting_away_for_good() {
+        // A cleared setting that survived in the file would come back on the
+        // next start, and a transcript would be appended to a file nobody
+        // asked for. `clearing_an_optional_setting_removes_it` covers the
+        // config half; this is the daemon reaching it.
+        let config_path = scratch("streamstop").with_extension("toml");
+        let _ = std::fs::remove_file(&config_path);
+        let mut d = daemon_holding(SessionState::default());
+        let mut p = Published::default();
+
+        d.set_stream_file(Some("/tmp/notes.txt".into()), &config_path);
+        d.set_stream_file(None, &config_path);
+        tick(&mut d, &mut p);
+
+        assert_eq!(d.opts.config.stream_to, None);
+        assert_eq!(p.live.stream_to, None);
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!written.contains("/tmp/notes.txt"), "still there:\n{written}");
+
+        let _ = std::fs::remove_file(&config_path);
     }
 
     #[test]
