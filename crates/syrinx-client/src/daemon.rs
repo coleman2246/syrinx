@@ -1543,7 +1543,8 @@ mod tests {
             Some(crate::mode::SourceMode::Separate),
         );
 
-        let back = Config::load(Some(path.clone())).expect("the file the daemon was given");
+        let back =
+            Config::load(Some(path.clone())).expect("the file the daemon was given");
         assert_eq!(
             back.selected_sources(),
             ["cpal:in:Yeti".to_string(), "cpal:out:Speakers".to_string()]

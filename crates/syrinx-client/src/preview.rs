@@ -192,7 +192,7 @@ impl Preview {
                 Opening::Open => return Ok(()),
                 Opening::Failed(e) => anyhow::bail!(e),
                 Opening::Pending if Instant::now() >= deadline => {
-                    anyhow::bail!("the audio device did not open within {WAIT_FOR_OPEN:?}")
+                    anyhow::bail!("the device did not open within {WAIT_FOR_OPEN:?}")
                 }
                 Opening::Pending => std::thread::sleep(Duration::from_millis(10)),
             }
@@ -343,14 +343,18 @@ mod tests {
         // "daemon did not answer in time". A start that waited on the device
         // therefore made Start, Stop and the source picker fail and froze the
         // tray for as long as the open took -- once per selected source.
+        //
+        // Timed rather than checked for `Pending`, because a device can fail
+        // fast enough that the answer is already in by the time this looks --
+        // which is a race, not a regression. What must never come back is a
+        // caller that waited.
         let started = std::time::Instant::now();
-        let preview = Preview::start(&missing_device());
+        let _preview = Preview::start(&missing_device());
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "starting a meter took {:?}; the daemon loop cannot afford that",
             started.elapsed()
         );
-        assert_eq!(preview.opening(), Opening::Pending);
     }
 
     #[test]

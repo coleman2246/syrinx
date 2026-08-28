@@ -102,10 +102,11 @@ fn on_stream_thread<S: 'static>(
     match ready_rx.recv_timeout(OPEN_TIMEOUT) {
         Ok(Ok(())) => Ok(stop_tx),
         Ok(Err(e)) => Err(anyhow::anyhow!(e)),
-        // Disconnected: the thread unwound before it could answer, which cpal
-        // backends do -- the Windows one panics rather than erroring in
-        // several places. Either way the caller gets an error, not a handle to
-        // a stream that is not running.
+        // Disconnected: the thread ended without answering at all. The guard
+        // above catches a panic and answers for it, so this is the backstop
+        // for whatever it cannot catch -- an abort, or a panic while
+        // panicking. The caller still gets an error rather than a handle to a
+        // stream that is not running.
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             anyhow::bail!("the audio thread stopped before the stream started")
         }

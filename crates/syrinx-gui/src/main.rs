@@ -982,13 +982,17 @@ impl App {
                         egui::vec2(rect.width() * v.max(0.01), rect.height()),
                     );
                     let colour = if health.as_ref().is_some_and(|s| s.error.is_some()) {
-                        // A device that would not open is a fault, unlike a
-                        // device that merely has nothing to play.
-                        theme::palette::WARNING
+                        // A device that would not open is a real fault, which
+                        // a device with nothing to play is not. Distinct from
+                        // the level scale below it, so a loud source and a
+                        // broken one can never read as the same thing.
+                        theme::palette::DANGER
                     } else if health.as_ref().is_none_or(|s| s.silent) {
                         theme::palette::BORDER
                     } else if v > 0.85 {
                         theme::palette::RECORDING
+                    } else if v > 0.6 {
+                        theme::palette::WARNING
                     } else {
                         theme::palette::SUCCESS
                     };
@@ -1031,7 +1035,6 @@ impl App {
             }
         }
     }
-
 
     fn transcript_box(&self, ui: &mut egui::Ui, height: f32) {
         // A surface of its own rather than bare canvas. The transcript is the
