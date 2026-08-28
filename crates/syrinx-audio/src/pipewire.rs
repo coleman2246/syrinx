@@ -276,12 +276,18 @@ impl PwCapture {
             if !linked {
                 // Without the link the stream yields silence, which would look
                 // like a broken microphone rather than a failed link.
-                let _ = child.start_kill();
+                kill_and_reap(&mut child);
                 anyhow::bail!("could not link application node {app_node} into the capture stream");
             }
         }
 
-        let mut stdout = child.stdout.take().context("pw-record stdout missing")?;
+        let Some(mut stdout) = child.stdout.take() else {
+            // Returning with the handle in hand would drop it, and dropping a
+            // `tokio::process::Child` neither kills nor waits: a pw-record
+            // nobody reads from would go on holding the capture open.
+            kill_and_reap(&mut child);
+            anyhow::bail!("pw-record stdout missing");
+        };
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
                 let mut s = String::new();
@@ -325,9 +331,50 @@ impl PwCapture {
 
 impl Drop for PwCapture {
     fn drop(&mut self) {
-        // start_kill rather than an await: Drop cannot be async, and leaking
-        // pw-record would hold the capture open indefinitely.
-        let _ = self.child.start_kill();
+        kill_and_reap(&mut self.child);
+    }
+}
+
+/// How long [`kill_and_reap`] gives a killed `pw-record` to reach the process
+/// table. A SIGKILLed process gets there as soon as it is next scheduled, so
+/// this is a bound on the pathological case rather than a budget anything
+/// normally spends -- and it is a bound because this runs from `Drop`, which
+/// is no place to hang.
+const REAP_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How often the status is asked for while waiting. `try_wait` is a
+/// non-blocking `waitpid`, so the only cost of asking again is the sleep.
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Kill `pw-record` and read the exit status it leaves behind.
+///
+/// The kill on its own is not enough. `start_kill` only asks, and the process
+/// then sits in the table as a zombie until someone waits for it -- which
+/// dropping a `tokio::process::Child` does not do. Drop hands the child to a
+/// process-global orphan queue that is drained only when some runtime's
+/// process driver parks, and the runtime here is often the last thing on its
+/// thread: `preview::Preview` builds a current-thread runtime per preview and
+/// releases the capture as the final statement inside `block_on`, so nothing
+/// parks afterwards and the queue is never looked at again. Measured with a
+/// stand-in pw-record, that child was still defunct three seconds later, and
+/// gone within 100 ms as soon as any other runtime parked -- which is why the
+/// leak reads as intermittent rather than permanent.
+///
+/// `try_wait` needs no runtime at all, so the wait is a poll and can happen
+/// wherever the drop does. Giving up at [`REAP_DEADLINE`] leaves the child
+/// exactly where it would have been anyway: on the orphan queue, for whichever
+/// runtime parks next.
+fn kill_and_reap(child: &mut tokio::process::Child) {
+    // Asked for rather than awaited: `Drop` cannot be async, and leaving
+    // pw-record running would hold the capture open indefinitely.
+    let _ = child.start_kill();
+    let deadline = std::time::Instant::now() + REAP_DEADLINE;
+    loop {
+        match child.try_wait() {
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(REAP_POLL),
+            // Reaped, or in a state no further asking improves.
+            _ => return,
+        }
     }
 }
 
@@ -445,6 +492,46 @@ mod tests {
         assert_ne!(s[0].display(), s[1].display());
         assert_ne!(s[0].stable_key(), s[1].stable_key());
         assert!(s.iter().any(|x| x.display().contains("YouTube")));
+    }
+
+    /// Whether the kernel still holds a record of this process.
+    ///
+    /// `/proc/<pid>` is there for a zombie as much as for a running process:
+    /// the entry goes when the exit status is read, not when the process
+    /// exits, which is the distinction the test below is about.
+    fn still_in_the_process_table(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[test]
+    fn a_killed_capture_is_reaped_without_waiting_for_a_runtime_to_park() {
+        // The shape a preview has: a current-thread runtime that is dropped as
+        // soon as the capture is released, on a thread that then ends. Tokio
+        // drains its orphan queue when a process driver parks, and nothing
+        // parks after this, so a child left to that queue stays defunct.
+        let pid = std::thread::spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("building a runtime");
+            rt.block_on(async {
+                let mut child = tokio::process::Command::new("sleep")
+                    .arg("30")
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawning a stand-in pw-record");
+                let pid = child.id().expect("an unwaited child has an id");
+                kill_and_reap(&mut child);
+                pid
+            })
+        })
+        .join()
+        .expect("the capture thread panicked");
+
+        assert!(
+            !still_in_the_process_table(pid),
+            "the stand-in was killed but never waited for, so {pid} is defunct"
+        );
     }
 
     #[test]
