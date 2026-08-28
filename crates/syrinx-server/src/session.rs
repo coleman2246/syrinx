@@ -71,10 +71,19 @@ impl Default for SessionTuning {
 }
 
 /// Text waiting for its speaker label to settle.
+///
+/// The span is both ends, and the two are separately load-bearing. `to_chunk`
+/// is where the label is voted from, because that is where the audio ends and
+/// the lag window follows it. `from_chunk` is where the *words* start, which
+/// is what a later correction has to be matched against -- a transducer emits
+/// nothing for several chunks and then a sentence covering all of them, so the
+/// two are routinely far apart.
 struct HeldCommit {
     text: String,
+    /// Index of the first chunk that contributed audio to this text.
+    from_chunk: u64,
     /// Index of the last chunk that contributed audio to this text.
-    chunk: u64,
+    to_chunk: u64,
 }
 
 /// What the diarizer said about one chunk.
@@ -98,8 +107,16 @@ struct ChunkLabel {
 /// attribution was lost for good.
 struct Emitted {
     seq: u64,
-    /// The chunk range its label was voted over, so an incoming correction can
-    /// tell whether it covers this commit.
+    /// The chunk range this commit's **text** came from, so an incoming
+    /// correction can tell whether it covers these words.
+    ///
+    /// Not the range the label was voted over, which is a different span and
+    /// wrong in both directions. The vote runs from the text's last chunk
+    /// forward into the lag window, so it starts where the words end and
+    /// reaches `lag_chunks` into whoever spoke next: a correction naming the
+    /// next speaker's chunks overlapped it and rewrote the outgoing speaker's
+    /// sentence, while one naming the chunks the words actually came from
+    /// missed it entirely.
     from_chunk: u64,
     to_chunk: u64,
     speaker: Option<u32>,
@@ -116,6 +133,10 @@ pub struct Session {
     diarizer: Option<Box<dyn Diarizer>>,
     strikes: u32,
     chunks_seen: u64,
+    /// First chunk whose audio has not yet come out as text. What a commit's
+    /// span starts at, since the transducer says nothing for several chunks
+    /// and then emits the sentence they all contributed to.
+    text_since: u64,
     /// What the diarizer said about each chunk seen. Bounded: labels no held
     /// commit can still consult are dropped as commits leave.
     chunk_labels: VecDeque<ChunkLabel>,
@@ -183,6 +204,7 @@ impl Session {
             diarizer,
             strikes: 0,
             chunks_seen: 0,
+            text_since: 0,
             chunk_labels: VecDeque::new(),
             held: VecDeque::new(),
             emitted: VecDeque::new(),
@@ -222,10 +244,16 @@ impl Session {
         }
         let tail = self.stream.finish()?;
         if !tail.is_empty() {
-            // Whatever the model was still holding belongs to the last chunk
-            // that went into it.
-            let chunk = self.chunks_seen.saturating_sub(1);
-            self.held.push_back(HeldCommit { text: tail, chunk });
+            // Whatever the model was still holding belongs to the chunks since
+            // the last commit, ending at the last chunk that went in. A tail
+            // with no chunks behind it at all clamps to chunk 0, which is
+            // where the arithmetic has nowhere below to go.
+            let to_chunk = self.chunks_seen.saturating_sub(1);
+            self.held.push_back(HeldCommit {
+                text: tail,
+                from_chunk: self.text_since.min(to_chunk),
+                to_chunk,
+            });
         }
         // The session is over, so no label will settle any further. Flushing
         // unconditionally -- including when there was no partial chunk to push
@@ -256,10 +284,13 @@ impl Session {
 
         let text = self.stream.push(chunk)?;
         if !text.is_empty() {
+            let to_chunk = self.chunks_seen - 1;
             self.held.push_back(HeldCommit {
                 text,
-                chunk: self.chunks_seen - 1,
+                from_chunk: self.text_since,
+                to_chunk,
             });
+            self.text_since = to_chunk + 1;
         }
         out.extend(self.release_ripe());
         Ok(out)
@@ -391,13 +422,15 @@ impl Session {
         let mut out = Vec::new();
         let lag = self.lag();
         while let Some(h) = self.held.front() {
-            if !force && self.chunks_seen < h.chunk + lag + 1 {
+            if !force && self.chunks_seen < h.to_chunk + lag + 1 {
                 break;
             }
             let h = self.held.pop_front().expect("front was Some");
-            let to = h.chunk + lag;
-            let (speaker, provisional) = self.majority_label(h.chunk, to);
-            out.push(self.emit(h.text, speaker, h.chunk, to, provisional));
+            // Voted from where the audio ends, forward through the lag window,
+            // which is the depth the spike calibrated. Recorded against where
+            // the *words* are, which is a different question.
+            let (speaker, provisional) = self.majority_label(h.to_chunk, h.to_chunk + lag);
+            out.push(self.emit(h.text, speaker, h.from_chunk, h.to_chunk, provisional));
         }
         self.forget_spent_labels();
         out
@@ -422,7 +455,7 @@ impl Session {
         let floor = self
             .held
             .front()
-            .map_or_else(|| self.chunks_seen.saturating_sub(1), |h| h.chunk);
+            .map_or_else(|| self.chunks_seen.saturating_sub(1), |h| h.to_chunk);
         while self.chunk_labels.front().is_some_and(|l| l.chunk < floor) {
             self.chunk_labels.pop_front();
         }
@@ -479,10 +512,9 @@ impl Session {
     /// one function is what makes the live-mode guarantee enforceable in a
     /// single place rather than at every call site.
     ///
-    /// It is also where a commit is recorded as correctable. The chunk range
-    /// is kept rather than recomputed because it is the range the *label* was
-    /// voted over, which is the question an incoming correction asks -- not
-    /// the range the text came from, which is narrower.
+    /// It is also where a commit is recorded as correctable, against the chunk
+    /// range its **text** came from -- see [`Emitted`] for why that is not the
+    /// range its label was voted over.
     fn emit(
         &mut self,
         text: String,
@@ -508,6 +540,10 @@ impl Session {
             seq: self.seq,
             text,
             speaker,
+            // Carried to the client rather than kept here, because the promise
+            // `transcript.relabel` makes is about what a client may repaint,
+            // and only the client knows what it is holding.
+            speaker_provisional: provisional,
         }
     }
 }

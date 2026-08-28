@@ -93,7 +93,9 @@ pub fn replay(
 
     for m in &messages {
         match m {
-            ServerMessage::TranscriptCommit { seq, text, speaker } => {
+            ServerMessage::TranscriptCommit {
+                seq, text, speaker, ..
+            } => {
                 let Ok(chunk) = text.trim().parse::<usize>() else {
                     continue;
                 };

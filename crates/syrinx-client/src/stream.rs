@@ -253,6 +253,7 @@ mod tests {
     fn seg(at: f64, text: &str) -> Segment {
         Segment {
             seq: None,
+            speaker_provisional: false,
             at,
             text: text.into(),
             source: None,
@@ -263,6 +264,7 @@ mod tests {
     fn seg_spk(at: f64, text: &str, speaker: Option<u32>) -> Segment {
         Segment {
             seq: None,
+            speaker_provisional: false,
             at,
             text: text.into(),
             source: None,
@@ -349,6 +351,7 @@ mod tests {
         let mut w = StreamWriter::open(&p, Format::Labelled).unwrap();
         let mk = |at: f64, text: &str, src: &str| Segment {
             seq: None,
+            speaker_provisional: false,
             at,
             text: text.into(),
             source: Some(src.into()),
@@ -385,6 +388,7 @@ mod tests {
         let mut w = StreamWriter::open(&p, Format::Labelled).unwrap();
         w.append(&Segment {
             seq: None,
+            speaker_provisional: false,
             at: 0.0,
             text: "hello".into(),
             source: Some("Yeti".into()),
@@ -505,6 +509,7 @@ mod tests {
         let p = scratch("spk-gap-labelled");
         let mk = |at: f64, text: &str, speaker: Option<u32>| Segment {
             seq: None,
+            speaker_provisional: false,
             at,
             text: text.into(),
             source: Some("Yeti".into()),
@@ -565,6 +570,7 @@ mod tests {
         let p = scratch("spk-source");
         let mk = |at: f64, text: &str, src: &str, speaker: Option<u32>| Segment {
             seq: None,
+            speaker_provisional: false,
             at,
             text: text.into(),
             source: Some(src.into()),
@@ -617,6 +623,7 @@ mod tests {
         let p = scratch("two-writers");
         let mk = |at: f64, text: &str, src: &str| Segment {
             seq: None,
+            speaker_provisional: false,
             at,
             text: text.into(),
             source: Some(src.into()),
@@ -674,6 +681,7 @@ mod tests {
                 text: "we ship Thursday".into(),
                 source: None,
                 speaker: None,
+                speaker_provisional: false,
                 seq: Some(1),
             },
             crate::session::Segment {
@@ -681,6 +689,7 @@ mod tests {
                 text: " or Friday".into(),
                 source: None,
                 speaker: None,
+                speaker_provisional: false,
                 seq: Some(2),
             },
         ];

@@ -1017,6 +1017,7 @@ mod tests {
     fn seg(at: f64, text: &str, speaker: Option<u32>, source: Option<&str>) -> Segment {
         Segment {
             seq: None,
+            speaker_provisional: false,
             at,
             text: text.into(),
             source: source.map(Into::into),
@@ -1028,6 +1029,7 @@ mod tests {
     fn seg_seq(at: f64, text: &str, speaker: Option<u32>, seq: u64) -> Segment {
         Segment {
             seq: Some(seq),
+            speaker_provisional: false,
             ..seg(at, text, speaker, None)
         }
     }

@@ -112,9 +112,9 @@ fn relabels(msgs: &[ServerMessage]) -> Vec<(u64, u64, u32)> {
 fn sequenced(msgs: &[ServerMessage]) -> Vec<(u64, String, Option<u32>)> {
     msgs.iter()
         .filter_map(|m| match m {
-            ServerMessage::TranscriptCommit { seq, text, speaker } => {
-                Some((*seq, text.clone(), *speaker))
-            }
+            ServerMessage::TranscriptCommit {
+                seq, text, speaker, ..
+            } => Some((*seq, text.clone(), *speaker)),
             _ => None,
         })
         .collect()
@@ -565,6 +565,170 @@ fn corrections_split_around_a_commit_they_may_not_touch() {
         msgs.extend(push_all(&mut s));
     }
     assert_eq!(relabels(&msgs), vec![(1, 1, 1), (3, 3, 1)]);
+}
+
+// ------------------------------------- corrections at the shipped lag depth
+//
+// Every test above runs at `lag_chunks: 0` and one word per chunk, where a
+// commit's first chunk, its last chunk and the end of its vote window are all
+// the same number. That collapse is what let a correction be matched against
+// the range its *label* was voted over rather than the range its *words* came
+// from: at lag 0 the vote window is a single chunk and the two spans coincide.
+// At the shipped depth they do not, and the difference is wrong in both
+// directions -- the vote window starts where the words end and reaches two
+// chunks into whoever spoke next.
+
+/// A session at the shipped lag with commits that span `chunks_per_word`
+/// chunks each, which is the shape a real transducer's output has.
+fn spanning(
+    words: &[&str],
+    diarizer: Option<Box<dyn Diarizer>>,
+    chunks_per_word: usize,
+) -> Session {
+    let backend = MockBackend::new(words)
+        .with_chunk_samples(CHUNK)
+        .with_chunks_per_word(chunks_per_word);
+    Session::with_tuning(
+        Mode::Transcript,
+        &backend,
+        "sid".into(),
+        diarizer,
+        SessionTuning::default(),
+    )
+}
+
+/// A diarizer that says nothing for `quiet` chunks and then reports one
+/// correction.
+fn corrects_at(quiet: usize, relabel: Relabel) -> Option<Box<dyn Diarizer>> {
+    let mut script: Vec<Attribution> = (0..quiet).map(|_| Attribution::default()).collect();
+    script.push(Attribution {
+        speaker: Some(relabel.speaker),
+        relabels: vec![relabel],
+        ..Default::default()
+    });
+    scripted(script)
+}
+
+#[test]
+fn a_correction_cannot_claim_the_words_of_the_chunks_before_it() {
+    // Three chunks per word at the shipped lag of 2, so commit 1's words come
+    // from chunks 0-2 and its label is voted over chunks 2-4. A correction
+    // naming chunks 3 onwards is about the *next* commit, whose words are
+    // chunks 3-5 -- and it must not reach commit 1, whose vote window happens
+    // to extend into the same chunks.
+    assert_eq!(LAG_CHUNKS, 2, "the collapse this test avoids returns at 0");
+    let mut s = spanning(
+        &WORDS,
+        corrects_at(
+            9,
+            Relabel {
+                from_chunk: 3,
+                to_chunk: 9,
+                speaker: 2,
+            },
+        ),
+        3,
+    );
+
+    let mut msgs = Vec::new();
+    for _ in 0..10 {
+        msgs.extend(push_all(&mut s));
+    }
+    assert_eq!(
+        sequenced(&msgs)
+            .iter()
+            .map(|(seq, t, _)| (*seq, t.clone()))
+            .collect::<Vec<_>>(),
+        vec![(1, "one ".into()), (2, "two ".into())],
+        "the fixture has to have produced two multi-chunk commits"
+    );
+    assert_eq!(
+        relabels(&msgs),
+        vec![(2, 2, 2)],
+        "the correction reached a commit whose words came from earlier chunks"
+    );
+}
+
+#[test]
+fn a_correction_reaches_a_commit_whose_words_started_before_its_label_did() {
+    // The same collapse, from the other side. Commit 1's words come from
+    // chunks 0-2; a correction naming chunks 0-1 is about those words, and
+    // matching it against the vote window -- which starts at chunk 2 -- misses
+    // it entirely. This is the opening of a meeting, which is the case the
+    // whole correction mechanism exists for.
+    let mut s = spanning(
+        &WORDS,
+        corrects_at(
+            6,
+            Relabel {
+                from_chunk: 0,
+                to_chunk: 1,
+                speaker: 1,
+            },
+        ),
+        3,
+    );
+
+    let mut msgs = Vec::new();
+    for _ in 0..7 {
+        msgs.extend(push_all(&mut s));
+    }
+    assert_eq!(
+        relabels(&msgs),
+        vec![(1, 1, 1)],
+        "the opening commit was never named"
+    );
+}
+
+#[test]
+fn a_commit_that_carries_a_guess_says_so_on_the_wire() {
+    // The bit `transcript.relabel`'s promise rests on at the far end. A commit
+    // voted entirely out of provisional labels is one a later window may take
+    // back; one a full window settled is not, and only the client knows which
+    // of its segments is which.
+    let guess = |speaker| Attribution {
+        speaker: Some(speaker),
+        provisional: true,
+        ..Default::default()
+    };
+    let mut s = tuned(
+        &WORDS,
+        scripted(vec![
+            guess(2),
+            Attribution::speaker(Some(1)),
+            guess(1),
+            guess(1),
+        ]),
+        SessionTuning {
+            lag_chunks: 0,
+            ..Default::default()
+        },
+    );
+    let mut msgs = Vec::new();
+    for _ in 0..4 {
+        msgs.extend(push_all(&mut s));
+    }
+    let flags: Vec<(Option<u32>, bool)> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::TranscriptCommit {
+                speaker,
+                speaker_provisional,
+                ..
+            } => Some((*speaker, *speaker_provisional)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        vec![
+            (Some(2), true),
+            (Some(1), false),
+            (Some(1), true),
+            (Some(1), true)
+        ],
+        "a guess and a settled label have to be distinguishable on the wire"
+    );
 }
 
 #[test]

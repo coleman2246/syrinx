@@ -59,6 +59,11 @@ pub enum ServerMessage {
     },
 
     /// Final text. Never revised. The only transcript message live mode emits.
+    ///
+    /// "Never revised" is about the *words*. The speaker beside them can still
+    /// be corrected -- see [`ServerMessage::TranscriptRelabel`] -- and
+    /// `speaker_provisional` is how a client knows which of its commits are
+    /// still open to that.
     #[serde(rename = "transcript.commit")]
     TranscriptCommit {
         seq: u64,
@@ -68,6 +73,26 @@ pub enum ServerMessage {
         /// could not tell for this stretch -- a gap, never a guess.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         speaker: Option<u32>,
+        /// Whether `speaker` is the diarizer's best guess rather than an
+        /// answer it will stand behind.
+        ///
+        /// About the speaker, not the text: this is a commit either way. A
+        /// guess comes from a 0.75 s hop naming a turn early, or from a full
+        /// window that no centroid stood out clearly enough for, and a later
+        /// window may contradict either.
+        ///
+        /// It travels because the promise
+        /// [`ServerMessage::TranscriptRelabel`] makes -- that a correction
+        /// never touches a commit carrying a confident label of its own --
+        /// is otherwise unkeepable at the receiving end. Without it a client
+        /// applying a relabel to everything in range overwrites labels the
+        /// server never meant it to, and the protocol's guarantee is a
+        /// comment about the server rather than a property of the exchange.
+        ///
+        /// Additive and omitted when false, which is every commit an older
+        /// server sends and most of what a new one does.
+        #[serde(default, skip_serializing_if = "is_false")]
+        speaker_provisional: bool,
     },
 
     /// Text that may still change. Transcript mode only.
@@ -80,6 +105,12 @@ pub enum ServerMessage {
         /// could not tell for this stretch -- a gap, never a guess.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         speaker: Option<u32>,
+        /// Whether `speaker` is a guess, exactly as on
+        /// [`ServerMessage::TranscriptCommit`]. The two questions are
+        /// independent -- this message says the *words* may change -- so a
+        /// client that keeps segments needs both answers here too.
+        #[serde(default, skip_serializing_if = "is_false")]
+        speaker_provisional: bool,
     },
 
     /// Retract `retract_n` characters and replace with `text`.
@@ -100,10 +131,17 @@ pub enum ServerMessage {
     /// A speaker needs several agreeing windows before it is minted, so the
     /// opening of a turn is committed before anyone can be named for it. This
     /// is how the name catches up: the commits it covers were emitted with no
-    /// speaker, or with a provisional guess a later full window contradicted,
-    /// and both are corrected rather than left wrong. It never renumbers a
-    /// speaker and never touches a commit that already carries a confident
-    /// label of its own.
+    /// speaker, or with a guess a later full window contradicted, and both are
+    /// corrected rather than left wrong. It never renumbers a speaker and
+    /// never touches a commit that already carries a confident label of its
+    /// own.
+    ///
+    /// That last promise is enforced at **both** ends, which is what makes it
+    /// a promise rather than a note about the server: the range names commits
+    /// a correction *may* cover, and each commit's own
+    /// `speaker_provisional` says whether it is one of them. A client applies
+    /// it only to the commits in range that it holds as unlabelled or
+    /// provisional.
     ///
     /// Deliberately *not* [`ServerMessage::TranscriptRevise`]. That message is
     /// reserved for a post-processing layer, says the *text* changed, and
@@ -225,6 +263,7 @@ mod tests {
             seq: 7,
             text: "hello".into(),
             speaker: None,
+            speaker_provisional: false,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<ServerMessage>(&s).unwrap(), m);
@@ -376,10 +415,50 @@ mod tests {
             seq: 7,
             text: "hello".into(),
             speaker: Some(2),
+            speaker_provisional: false,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"speaker\":2"), "got: {s}");
         assert_eq!(serde_json::from_str::<ServerMessage>(&s).unwrap(), m);
+    }
+
+    #[test]
+    fn a_guessed_speaker_says_so_and_a_settled_one_stays_silent() {
+        // The bit that makes `transcript.relabel`'s promise keepable at the
+        // receiving end. It has to be on the wire, it has to round-trip, and
+        // -- because it is true of a minority of commits and false on every
+        // one an older server ever sent -- it has to vanish when false.
+        let guessed = ServerMessage::TranscriptCommit {
+            seq: 3,
+            text: "hello".into(),
+            speaker: Some(2),
+            speaker_provisional: true,
+        };
+        let s = serde_json::to_string(&guessed).unwrap();
+        assert!(s.contains("\"speaker_provisional\":true"), "got: {s}");
+        assert_eq!(serde_json::from_str::<ServerMessage>(&s).unwrap(), guessed);
+
+        let settled = ServerMessage::TranscriptCommit {
+            seq: 3,
+            text: "hello".into(),
+            speaker: Some(2),
+            speaker_provisional: false,
+        };
+        let s = serde_json::to_string(&settled).unwrap();
+        assert!(!s.contains("speaker_provisional"), "got: {s}");
+
+        // And a commit from a server that predates the field is a settled
+        // one, which is what every such commit meant.
+        let old = r#"{"type":"transcript.commit","seq":1,"text":"hi","speaker":2}"#;
+        let m: ServerMessage = serde_json::from_str(old).unwrap();
+        let ServerMessage::TranscriptCommit {
+            speaker_provisional,
+            ..
+        } = m
+        else {
+            panic!()
+        };
+        assert!(!speaker_provisional);
     }
 
     #[test]

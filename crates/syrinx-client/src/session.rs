@@ -56,6 +56,19 @@ pub struct Segment {
     pub source: Option<String>,
     /// Anonymous speaker from the server's diarizer, when one ran.
     pub speaker: Option<u32>,
+    /// Whether `speaker` is the diarizer's best guess rather than an answer it
+    /// will stand behind -- the commit's `speaker_provisional`.
+    ///
+    /// Kept per segment because it is what makes `transcript.relabel`'s
+    /// promise enforceable here: a correction may fill a gap or replace a
+    /// guess, and may not touch a label a full window settled. Nothing else
+    /// reads it, and nothing renders it: a reader is shown the best answer
+    /// going either way.
+    ///
+    /// Defaults to false, which is what a state file written before the field
+    /// existed meant and what an older server's commits mean.
+    #[serde(default, skip_serializing_if = "is_not_provisional")]
+    pub speaker_provisional: bool,
     /// The `seq` of the transcript message this came from, so a later
     /// `transcript.relabel` naming a range of seqs can find it.
     ///
@@ -65,6 +78,11 @@ pub struct Segment {
     /// from the wire when absent, for the same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+}
+
+/// serde helper: lets the common `false` vanish from a state file.
+fn is_not_provisional(b: &bool) -> bool {
+    !*b
 }
 
 /// Give `from_seq..=to_seq` a speaker, reporting whether anything moved.
@@ -86,11 +104,21 @@ pub struct Segment {
 /// segments -- which the GUI paints and Save-as writes -- carry the corrected
 /// attribution. That divergence is the design's, and `stream.rs` proves the
 /// writer ignores corrections rather than leaving it to be believed.
+///
+/// **A segment carrying a confident label is never touched.** The range says
+/// which commits a correction *may* cover; each commit's own
+/// `speaker_provisional` says whether it is one of them. Applying to
+/// everything in range instead is how one speaker's settled sentence acquires
+/// another's name, and the protocol promises it cannot -- a promise only this
+/// end can keep, because only this end knows what it is holding.
 pub fn apply_relabel(segments: &mut [Segment], from_seq: u64, to_seq: u64, speaker: u32) -> bool {
     let mut moved = false;
     for seg in segments {
-        if seg.seq.is_some_and(|s| s >= from_seq && s <= to_seq) && seg.speaker != Some(speaker) {
+        let in_range = seg.seq.is_some_and(|s| s >= from_seq && s <= to_seq);
+        let correctable = seg.speaker.is_none() || seg.speaker_provisional;
+        if in_range && correctable && seg.speaker != Some(speaker) {
             seg.speaker = Some(speaker);
+            seg.speaker_provisional = false;
             moved = true;
         }
     }
@@ -480,8 +508,18 @@ async fn run(
         while let Some(Ok(msg)) = rx.next().await {
             let Ws::Text(t) = msg else { continue };
             match serde_json::from_str::<ServerMessage>(&t) {
-                Ok(ServerMessage::TranscriptCommit { seq, text, speaker })
-                | Ok(ServerMessage::TranscriptProvisional { seq, text, speaker }) => {
+                Ok(ServerMessage::TranscriptCommit {
+                    seq,
+                    text,
+                    speaker,
+                    speaker_provisional,
+                })
+                | Ok(ServerMessage::TranscriptProvisional {
+                    seq,
+                    text,
+                    speaker,
+                    speaker_provisional,
+                }) => {
                     if mode.types_at_cursor()
                         && let Err(e) = inject::type_text(&text, inject_method)
                     {
@@ -493,6 +531,7 @@ async fn run(
                         text: text.clone(),
                         source: label.clone(),
                         speaker,
+                        speaker_provisional,
                     };
                     // Written whatever the mode: the point of streaming is a
                     // copy on disk, and typing at the cursor is exactly when
@@ -540,6 +579,7 @@ async fn run(
                         // reserved for a future post-processing layer, not
                         // something the diarizer's lag buffer ever emits.
                         speaker: None,
+                        speaker_provisional: false,
                     });
                     s.changes += 1;
                     drop(s);
@@ -703,9 +743,69 @@ mod tests {
                 text: format!("fragment {i} "),
                 source: None,
                 speaker: *speaker,
+                speaker_provisional: false,
                 seq: Some(i as u64 + 1),
             })
             .collect()
+    }
+
+    /// The same, with each segment's `speaker_provisional` given explicitly.
+    fn committed_with_guesses(speakers: &[(Option<u32>, bool)]) -> Vec<Segment> {
+        speakers
+            .iter()
+            .enumerate()
+            .map(|(i, (speaker, guess))| Segment {
+                at: i as f64,
+                text: format!("fragment {i} "),
+                source: None,
+                speaker: *speaker,
+                speaker_provisional: *guess,
+                seq: Some(i as u64 + 1),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_relabel_leaves_a_settled_label_inside_its_range_alone() {
+        // The promise `transcript.relabel` documents, kept at the end that can
+        // keep it. A correction's range says which commits it *may* cover; the
+        // commit's own `speaker_provisional` says whether it is one of them.
+        // Applying to everything in range instead is how one speaker's settled
+        // sentence acquires another's name.
+        let mut segs = committed_with_guesses(&[(Some(2), false), (None, false), (Some(3), true)]);
+        assert!(apply_relabel(&mut segs, 1, 3, 1));
+        assert_eq!(
+            segs.iter()
+                .map(|s| (s.speaker, s.speaker_provisional))
+                .collect::<Vec<_>>(),
+            vec![(Some(2), false), (Some(1), false), (Some(1), false)],
+            "a confident label was overwritten by a correction"
+        );
+    }
+
+    #[test]
+    fn a_relabel_that_can_touch_nothing_reports_no_change() {
+        // The return value drives a repaint, and a correction that lands
+        // entirely on settled labels has to be as quiet as one that lands on
+        // nothing at all.
+        let mut segs = committed_with_guesses(&[(Some(2), false), (Some(3), false)]);
+        assert!(!apply_relabel(&mut segs, 1, 2, 1));
+        assert_eq!(
+            segs.iter().map(|s| s.speaker).collect::<Vec<_>>(),
+            vec![Some(2), Some(3)]
+        );
+    }
+
+    #[test]
+    fn a_corrected_segment_stops_being_correctable() {
+        // A correction is a full window's answer, so what it writes is
+        // settled: a second correction naming the same range must leave it
+        // alone rather than trading the label back and forth.
+        let mut segs = committed_with_guesses(&[(Some(2), true)]);
+        assert!(apply_relabel(&mut segs, 1, 1, 1));
+        assert!(!segs[0].speaker_provisional);
+        assert!(!apply_relabel(&mut segs, 1, 1, 3));
+        assert_eq!(segs[0].speaker, Some(1));
     }
 
     #[test]
