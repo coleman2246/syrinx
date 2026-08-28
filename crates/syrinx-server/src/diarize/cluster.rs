@@ -2680,6 +2680,27 @@ mod tests {
     }
 
     #[test]
+    fn a_ceiling_of_nan_is_the_loosest_setting_and_not_the_strictest() {
+        // Which is why `config.rs` refuses a non-finite `diarize_mint_ceiling`
+        // at load, and why the reason it gives has to be this one. The clause
+        // is `rival < mint_ceiling.min(t_retire)`, and `f32::min` discards a
+        // NaN operand rather than propagating it, so a NaN ceiling is not a
+        // comparison every rival loses -- it is no ceiling at all, leaving
+        // `T_RETIRE` as the only cap and the split guard effectively off.
+        assert_eq!(f32::NAN.min(T_RETIRE), T_RETIRE, "the fold this rests on");
+        assert_eq!(
+            pool_whose_mean_lands_on_speaker_one(T_MARGIN, T_MINT_CEILING).minted(),
+            2,
+            "the shipped ceiling refuses this pool"
+        );
+        assert_eq!(
+            pool_whose_mean_lands_on_speaker_one(T_MARGIN, f32::NAN).minted(),
+            3,
+            "and a NaN one mints it, which is the loose end, not the strict one"
+        );
+    }
+
+    #[test]
     fn a_margin_of_zero_switches_the_mint_ceiling_off_however_it_is_set() {
         // The escape hatch, now that it is a decision rather than a
         // coincidence. It used to hold by arithmetic -- at margin 0 the

@@ -691,12 +691,20 @@ mod tests {
     }
 
     #[test]
-    fn a_non_finite_mint_ceiling_is_refused_rather_than_compared_against() {
-        // TOML spells all three of these, and every comparison in the mint
-        // gate is a `<` that a NaN loses. A ceiling of NaN would therefore
-        // read as "refuse every mint" and a session would simply stop finding
-        // speakers, with nothing in the log to say why. `contains` is false
-        // for all three, which is what makes the load the place it fails.
+    fn a_non_finite_mint_ceiling_is_refused_rather_than_swallowed_by_the_cap() {
+        // TOML spells all three of these, and the range check is the only
+        // thing between them and the clusterer.
+        //
+        // A NaN ceiling is never compared at all, which is why it is the
+        // dangerous one. The gate reads `mint_ceiling.min(t_retire)`, and
+        // `f32::min` discards a NaN operand, so the cap alone would decide:
+        // the loosest setting the key can reach, with the split guard off,
+        // rather than the "refuse every mint" a `<` against NaN would give.
+        // `inf` folds to the same cap; only `-inf` refuses everything.
+        // `contains` is false for all three, which is what makes the load the
+        // place it fails, and
+        // `cluster::tests::a_ceiling_of_nan_is_the_loosest_setting_and_not_the_strictest`
+        // is what holds the behaviour this rests on.
         for value in ["nan", "inf", "-inf"] {
             assert!(
                 with(&format!("diarize_mint_ceiling = {value}")).is_err(),
