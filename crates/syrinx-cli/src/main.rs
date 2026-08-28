@@ -497,6 +497,13 @@ fn run(
             mode.label()
         );
     }
+    // Said, but not fatal. The run recorded and saved everything it had; one
+    // fragment did not reach the file being streamed to, which is worth
+    // knowing and is not a reason to exit non-zero on an otherwise complete
+    // transcript.
+    if let Some(w) = final_state.stream_error {
+        eprintln!("warning: {w}");
+    }
     if let Some(e) = final_state.error {
         anyhow::bail!("{e}");
     }

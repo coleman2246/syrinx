@@ -1382,6 +1382,7 @@ mod tests {
             diarize: true,
             diarize_requested: true,
             error: Some("boom".into()),
+            stream_error: Some("a fragment was not written".into()),
             levels: vec![0.5; 10],
             rms: 0.25,
             changes: 7,
@@ -1397,6 +1398,7 @@ mod tests {
             (full.diarize, full.diarize_requested, full.rms)
         );
         assert_eq!((live.error, live.levels), (full.error, full.levels));
+        assert_eq!(live.stream_error, full.stream_error);
         assert_eq!(live.last_fragment, full.last_fragment);
     }
 

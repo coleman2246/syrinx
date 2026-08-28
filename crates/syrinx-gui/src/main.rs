@@ -666,6 +666,12 @@ impl eframe::App for App {
         if let Some(e) = &self.state.error {
             ui.colored_label(theme::palette::DANGER, e);
         }
+        // Amber rather than red, and a line of its own. A lost fragment is not
+        // a dead session: the words are still arriving, still being kept and
+        // still saveable, and it is the copy on disk that has a hole in it.
+        if let Some(e) = &self.state.stream_error {
+            ui.colored_label(theme::palette::WARNING, e);
+        }
         if let Some(e) = &self.list_error {
             ui.colored_label(theme::palette::DANGER, e);
         }

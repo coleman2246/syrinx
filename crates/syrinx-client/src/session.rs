@@ -80,6 +80,19 @@ pub struct SessionState {
     /// `diarize`, not read back from global options.
     pub diarize_requested: bool,
     pub error: Option<String>,
+    /// Trouble appending to the transcript file, which is not [`Self::error`].
+    ///
+    /// A failed append costs the fragment it was carrying and nothing else:
+    /// the writer stays open, the next fragment may well succeed, the
+    /// transcript in memory is untouched and the session goes on. Recording
+    /// it as an error made a USB stick blinking once into a failed run --
+    /// `syrinx start --stream` exited non-zero after a complete, saved
+    /// transcript -- and in separate mode it took the one `error` slot
+    /// `merge_states` keeps, hiding a second source that had really died.
+    ///
+    /// Kept once set. The lost words stay lost, so a later success is not
+    /// permission to report a complete file.
+    pub stream_error: Option<String>,
     /// Live spectrum of the audio being sent, so a viewer can see the session
     /// is receiving sound rather than only that it is running.
     pub levels: Vec<f32>,
@@ -115,6 +128,7 @@ impl SessionState {
             diarize: self.diarize,
             diarize_requested: self.diarize_requested,
             error: self.error.clone(),
+            stream_error: self.stream_error.clone(),
             levels: self.levels.clone(),
             rms: self.rms,
             changes: self.changes,
@@ -161,6 +175,10 @@ pub fn merge_states(states: &[SessionState]) -> SessionState {
         // source is forced to Transcribe, so it alone can be the one asking.
         diarize_requested: states.iter().any(|s| s.diarize_requested),
         error: states.iter().find_map(|s| s.error.clone()),
+        // Folded separately, and this is the point of it being separate: a
+        // stream blip on the first source used to take the one `error` slot
+        // and hide a second source whose connection had really dropped.
+        stream_error: states.iter().find_map(|s| s.stream_error.clone()),
         // Levels come from the first source; a merged spectrum would say less
         // than one real one.
         levels: states.first().map(|s| s.levels.clone()).unwrap_or_default(),
@@ -294,23 +312,23 @@ pub fn start(
     }
 }
 
-/// Record what became of one append to the transcript stream.
+/// Record that a fragment did not reach the transcript file.
 ///
-/// A failure used to reach `error!` and nothing further, so a stream that died
-/// an hour into a meeting was indistinguishable from one still being written:
-/// the daemon log is not somewhere anyone has open while dictating, and the
-/// file itself only says so once it is read.
+/// The failure used to reach `error!` and nothing further, so a file that had
+/// stopped taking words an hour into a meeting looked exactly like one still
+/// being written: the daemon log is not somewhere anyone has open while
+/// dictating, and the file itself only says so once it is read.
 ///
-/// The first failure is the one kept, and a later success does not clear it.
-/// The fragment that could not be written is not written by the fragment after
-/// it, so a message that cleared itself would report a complete file that is
-/// missing a sentence.
-fn record_append(state: &mut SessionState, result: Result<()>) {
-    let Err(e) = result else { return };
-    error!("failed to append to the transcript stream: {e:#}");
-    state
-        .error
-        .get_or_insert_with(|| format!("the transcript stream stopped: {e:#}"));
+/// What it says is what is known -- one append failed. The writer is not
+/// closed and the next fragment may well succeed, so "the stream stopped" was
+/// a claim about the future that a single lost fragment does not support.
+///
+/// The first message is the one kept. Those words are not written by the
+/// fragment after them, so a message that cleared itself would report a
+/// complete file that is missing a sentence.
+fn record_lost_fragment(state: &mut SessionState, lost: Option<String>) {
+    let Some(msg) = lost else { return };
+    state.stream_error.get_or_insert(msg);
 }
 
 fn fail(state: &Arc<Mutex<SessionState>>, msg: String) {
@@ -480,8 +498,15 @@ async fn run(
                         Some(w) => w.append(&seg),
                         None => Ok(()),
                     };
+                    // Logged and worded out here, before the lock. The daemon
+                    // reads this state forty times a second and neither a log
+                    // line nor a formatted message is worth making it wait.
+                    let lost = appended.err().map(|e| {
+                        error!("failed to append to the transcript stream: {e:#}");
+                        format!("a fragment was not written to the transcript file: {e:#}")
+                    });
                     let mut s = st.lock().expect("state lock poisoned");
-                    record_append(&mut s, appended);
+                    record_lost_fragment(&mut s, lost);
                     if mode.keeps_transcript() {
                         s.transcript.push_str(&text);
                         s.segments.push(seg);
@@ -652,23 +677,38 @@ mod tests {
         );
     }
 
+    fn lost(what: &str) -> Option<String> {
+        Some(format!("a fragment was not written to the transcript file: {what}"))
+    }
+
     #[test]
-    fn a_stream_that_stops_being_written_reaches_the_window() {
-        // The failure only ever reached `error!` in the daemon log, which is
-        // not a place anyone has open while dictating -- so a stream that died
-        // an hour into a meeting looked exactly like one still being written,
-        // right up until the file was read.
+    fn a_fragment_that_never_reached_the_file_is_worth_saying() {
+        // It only ever reached `error!` in the daemon log, which is not a
+        // place anyone has open while dictating -- so a file that had stopped
+        // taking words an hour into a meeting looked exactly like one still
+        // being written, right up until it was read.
         let mut s = SessionState::default();
-        record_append(&mut s, Err(anyhow::anyhow!("No space left on device")));
-        let msg = s.error.expect("a failed append is worth showing");
+        record_lost_fragment(&mut s, lost("No space left on device"));
+        let msg = s.stream_error.expect("a lost fragment is worth showing");
         assert!(msg.contains("No space left on device"), "{msg}");
-        assert!(msg.contains("transcript"), "say what stopped: {msg}");
+        assert!(msg.contains("fragment"), "say what was lost: {msg}");
+    }
+
+    #[test]
+    fn a_lost_fragment_does_not_fail_the_session() {
+        // `error` is what the CLI exits non-zero on and what the window paints
+        // in red. A USB stick blinking once during a meeting that was fully
+        // transcribed and fully saved is neither of those.
+        let mut s = SessionState::default();
+        record_lost_fragment(&mut s, lost("No space left on device"));
+        assert_eq!(s.error, None);
     }
 
     #[test]
     fn an_append_that_worked_says_nothing() {
         let mut s = SessionState::default();
-        record_append(&mut s, Ok(()));
+        record_lost_fragment(&mut s, None);
+        assert_eq!(s.stream_error, None);
         assert_eq!(s.error, None);
     }
 
@@ -678,9 +718,41 @@ mod tests {
         // after it, so a message that cleared itself would report a complete
         // file that is missing a sentence.
         let mut s = SessionState::default();
-        record_append(&mut s, Err(anyhow::anyhow!("No space left on device")));
-        record_append(&mut s, Ok(()));
-        assert!(s.error.is_some());
+        record_lost_fragment(&mut s, lost("No space left on device"));
+        record_lost_fragment(&mut s, None);
+        assert!(s.stream_error.is_some());
+    }
+
+    #[test]
+    fn a_second_lost_fragment_does_not_replace_the_first() {
+        // The first is the one that says what went wrong; the ones after it
+        // are the same disk saying so again.
+        let mut s = SessionState::default();
+        record_lost_fragment(&mut s, lost("No space left on device"));
+        record_lost_fragment(&mut s, lost("Input/output error"));
+        assert!(s.stream_error.unwrap().contains("No space left"));
+    }
+
+    #[test]
+    fn a_lost_fragment_on_one_source_does_not_hide_a_failure_on_another() {
+        // Separate mode folds a state per source and keeps the first `error`
+        // it finds. While a lost fragment lived in that field, a stream blip
+        // on the first source masked a second source whose connection had
+        // really dropped, and the run came back reporting the blip.
+        let blipped = SessionState {
+            stream_error: lost("No space left on device"),
+            ..Default::default()
+        };
+        let dropped = SessionState {
+            error: Some("the server closed the connection".into()),
+            ..Default::default()
+        };
+        let merged = merge_states(&[blipped, dropped]);
+        assert_eq!(
+            merged.error.as_deref(),
+            Some("the server closed the connection")
+        );
+        assert!(merged.stream_error.is_some(), "both are worth reporting");
     }
 
     #[test]

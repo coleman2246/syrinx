@@ -144,6 +144,12 @@ pub struct DaemonState {
     #[serde(default)]
     pub diarize_configured: bool,
     pub error: Option<String>,
+    /// A fragment that never reached the transcript file; see
+    /// `SessionState::stream_error`. Separate from `error` because it does not
+    /// stop the session, and a window that painted it as one would be saying
+    /// the recording had died when it is still running.
+    #[serde(default)]
+    pub stream_error: Option<String>,
     /// Stable key of the first source, kept for viewers that show only one.
     pub source_key: Option<String>,
     /// Every selected source, in order.
@@ -197,6 +203,7 @@ impl DaemonState {
             // what the setting says now.
             diarize_configured: false,
             error: s.error.clone(),
+            stream_error: s.stream_error.clone(),
             source_key,
             source_keys: Vec::new(),
             source_mode: Default::default(),
