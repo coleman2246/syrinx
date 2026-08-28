@@ -691,24 +691,15 @@ impl OnlineClusterer {
             // The pre-2026-08-27 rule, and the only clause that survives at
             // `diarize_margin = 0`.
             Some(rival) if rival < self.t_assign => true,
-            // Which is what the next line is for. `diarize_margin = 0` is a
-            // switch and not a setting: `config.rs` and the README both
-            // document it as the whole retreat to that rule, so it has to
-            // switch the ceiling off alongside the margin and the cohort
-            // test, and it is asked here rather than left to arrive by
-            // arithmetic. One key legitimately governing two rules is a
-            // statement only its off position can make -- "the adaptive rules
-            // are off wholesale" is one fact about the deployment, and every
-            // rule added since agrees on what it means. At any other value
-            // they are two different quantities on two different scales: how
-            // far one noisy window's best cosine must beat its second, against
-            // how close a *mean* of four may sit to an incumbent. Tying those
-            // together made caution in one place buy recklessness in the
-            // other. `mint_ceiling` is what carries the second now.
+            // `diarize_margin = 0` is a switch rather than a setting:
+            // `config.rs` and the README both document it as the whole
+            // retreat to that rule, so it has to shut the ceiling off along
+            // with the margin and the cohort test. Asked outright, because
+            // the ceiling is a setting of its own and nothing in the clause
+            // below would make it unreachable at a margin of zero.
             Some(_) if self.margin <= 0.0 => false,
             Some(rival) => {
-                rival < self.mint_ceiling.min(self.t_retire)
-                    && cohesion - rival >= T_MINT_MARGIN
+                rival < self.mint_ceiling.min(self.t_retire) && cohesion - rival >= T_MINT_MARGIN
             }
         }
     }
@@ -2462,9 +2453,7 @@ mod tests {
         let rival = similarity(&between, &first);
         assert!((0.35..CEILING).contains(&rival), "{rival}");
 
-        let mut c = OnlineClusterer::with_params(
-            T_ASSIGN, 0.35, EMA_ALPHA, MIN_POOL, 0.5, CEILING,
-        );
+        let mut c = OnlineClusterer::with_params(T_ASSIGN, 0.35, EMA_ALPHA, MIN_POOL, 0.5, CEILING);
         for _ in 0..MIN_POOL {
             c.observe(&first);
         }
@@ -2480,14 +2469,11 @@ mod tests {
 
     #[test]
     fn a_margin_of_zero_mints_by_the_pre_2026_08_27_rule() {
-        // The other half of the escape hatch, and the half that is a decision
-        // rather than arithmetic: the ceiling is its own setting now, so
-        // "margin 0 turns it off too" is a rule `may_mint` states and this is
-        // what holds it stated. The ceiling here is the shipped one, and it is
-        // the margin alone that has to switch it off -- the only clause left
-        // is the original one, nobody over the threshold near the mean, so the
-        // crowded newcomer the shipped configuration mints is refused. That is
-        // honest about what the hatch costs.
+        // The other half of the escape hatch. The ceiling is left at the
+        // shipped value, so the margin alone is what has to switch it off:
+        // the only clause left is then the original one, nobody over the
+        // threshold near the mean, and the crowded newcomer the shipped
+        // configuration mints is refused. That is what the hatch costs.
         let mut c = OnlineClusterer::with_config(DiarizeTuning {
             margin: 0.0,
             ..DiarizeTuning::default()
@@ -2511,11 +2497,11 @@ mod tests {
 
     // ------------------------------------------- the ceiling is its own knob
     //
-    // The ceiling was read as `t_assign + margin` until the two were found to
-    // be different quantities on different scales -- see [`T_MINT_CEILING`].
-    // What follows is the pair of fixtures that separate them: one that
-    // reaches the gate only because a margin withheld it, and one that reaches
-    // it at any margin at all, including none.
+    // Two fixtures that reach the mint gate by different routes, because what
+    // has to be shown is that the ceiling and the assignment margin do not
+    // move together -- see [`T_MINT_CEILING`]. The first pools only because a
+    // margin withheld an assignment; the second pools at any margin at all,
+    // including none.
 
     /// Half of [`WIDE`], and the angle both incumbents sit at from the pool.
     const HALF_WIDE: f32 = 53.13;
