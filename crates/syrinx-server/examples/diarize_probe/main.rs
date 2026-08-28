@@ -56,7 +56,8 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 
 use syrinx_server::diarize::cluster::{
-    EMA_ALPHA, MIN_POOL, OnlineClusterer, T_ASSIGN, T_CHANGE, T_MARGIN, T_RETIRE, cosine,
+    EMA_ALPHA, MIN_POOL, OnlineClusterer, T_ASSIGN, T_CHANGE, T_MARGIN, T_MINT_CEILING,
+    T_RETIRE, cosine,
 };
 use syrinx_server::diarize::fbank::SAMPLE_RATE;
 use syrinx_server::diarize::real::{Embedder, Vad, norm_for};
@@ -610,6 +611,11 @@ struct Params {
     /// server used before 2026-08-27, which is what makes `--margin 0` the
     /// before-and-after comparison for every number this harness reports.
     margin: f32,
+    /// How close to an incumbent a pool's mean may sit and still mint. Its own
+    /// axis rather than a function of `margin`, because the two are different
+    /// quantities on different scales -- and because this is the number the
+    /// design names as the one most in need of a measurement.
+    mint_ceiling: f32,
 }
 
 impl Default for Params {
@@ -620,6 +626,7 @@ impl Default for Params {
             alpha: EMA_ALPHA,
             min_pool: MIN_POOL,
             margin: T_MARGIN,
+            mint_ceiling: T_MINT_CEILING,
         }
     }
 }
@@ -632,6 +639,7 @@ impl Params {
             self.alpha,
             self.min_pool,
             self.margin,
+            self.mint_ceiling,
         )
     }
 }
@@ -730,6 +738,11 @@ const MARGIN_FLAG: Flag = (
     true,
     "how far the best centroid must beat the second; 0 is the pre-2026-08-27 rule",
 );
+const MINT_CEILING_FLAG: Flag = (
+    "--mint-ceiling",
+    true,
+    "how close to an incumbent a pool's mean may sit and still mint",
+);
 const WINDOW_FLAG: Flag = ("--window", true, "window length in seconds");
 const HOP_FLAG: Flag = ("--hop", true, "hop in seconds; 0 means half the window");
 const MODEL_FLAG: Flag = ("--model", true, "embedding model filename, or a path");
@@ -749,6 +762,7 @@ const RUN: Spec = Spec {
         ALPHA_FLAG,
         MIN_POOL_FLAG,
         MARGIN_FLAG,
+        MINT_CEILING_FLAG,
         ("--quiet", false, "suppress the per-segment listing"),
     ],
 };
@@ -816,6 +830,7 @@ const LIVE: Spec = Spec {
         ("--lag", true, "diarize_lag_chunks"),
         MIN_POOL_FLAG,
         MARGIN_FLAG,
+        MINT_CEILING_FLAG,
         ("--change", true, "diarize_change_threshold"),
         (
             "--relabel-window",
@@ -927,10 +942,9 @@ impl Args {
     fn has(&self, name: &str) -> bool {
         self.argv.iter().any(|a| a == name)
     }
-    /// The four clustering thresholds, each defaulting to the shipped
-    /// constant. Overriding one leaves the other three at what the server
-    /// runs, which is what makes `--t-assign 0.6` answer "what would raising
-    /// only this cost?".
+    /// The clustering thresholds, each defaulting to the shipped constant.
+    /// Overriding one leaves the rest at what the server runs, which is what
+    /// makes `--t-assign 0.6` answer "what would raising only this cost?".
     fn params(&self) -> Result<Params> {
         let shipped = Params::default();
         Ok(Params {
@@ -939,6 +953,7 @@ impl Args {
             alpha: self.num("--alpha", shipped.alpha)?,
             min_pool: self.num("--min-pool", shipped.min_pool as f32)? as usize,
             margin: self.num("--margin", shipped.margin)?,
+            mint_ceiling: self.num("--mint-ceiling", shipped.mint_ceiling)?,
         })
     }
     /// Window and hop in seconds; a hop of zero means half the window.
@@ -1309,12 +1324,18 @@ fn sweep(args: &Args) -> Result<()> {
                         for &t_retire in &retires {
                             for &alpha in &alphas {
                                 for &margin in &margins {
+                                    // The ceiling is held at the shipped
+                                    // value rather than given an axis: it is
+                                    // the number the design says to sweep
+                                    // next, and a grid this size answers one
+                                    // question at a time.
                                     let params = Params {
                                         t_assign,
                                         t_retire,
                                         alpha,
                                         min_pool,
                                         margin,
+                                        mint_ceiling: T_MINT_CEILING,
                                     };
                                     let (hyp, clusterer) =
                                         label_frames(&emb, params, reference.frames.len());
@@ -1508,6 +1529,7 @@ fn live(args: &Args) -> Result<()> {
     let tuning = syrinx_server::diarize::DiarizeTuning {
         min_pool: args.num("--min-pool", MIN_POOL as f32)? as usize,
         margin: args.num("--margin", T_MARGIN)?,
+        mint_ceiling: args.num("--mint-ceiling", T_MINT_CEILING)?,
         change_threshold: args.num("--change", T_CHANGE)?,
     };
     let session_tuning = syrinx_server::session::SessionTuning {

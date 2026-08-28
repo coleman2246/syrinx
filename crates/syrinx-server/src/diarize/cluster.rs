@@ -30,8 +30,9 @@
 //! swept against three hand-annotated AMI meetings. The ones added by
 //! `docs/specs/2026-08-27-diarization-latency-and-crowding-design.md`
 //! -- [`T_MARGIN`], [`SHORT_MARGIN_FACTOR`], [`T_ZNORM`], [`T_MINT_MARGIN`],
-//! [`MAX_POOLS`], [`POOL_AGE`] -- are **engineering estimates and have not
-//! been measured**; the probe's live-emulation mode exists to replace them.
+//! [`T_MINT_CEILING`], [`MAX_POOLS`], [`POOL_AGE`] -- are **engineering
+//! estimates and have not been measured**; the probe's live-emulation mode
+//! exists to replace them.
 //!
 //! Pure arithmetic. No models, no `ort`, no feature gate -- which is what lets
 //! the whole of the labelling policy be tested in CI on synthetic embeddings.
@@ -42,8 +43,9 @@
 // others. A stale copy there would attribute a sweep's numbers to constants
 // the server no longer ships, which is precisely the failure the probe exists
 // to prevent. Hidden from the docs because most of them are not a
-// configuration surface -- see [`OnlineClusterer::with_params`] -- and the two
-// that are, `MIN_POOL` and `T_MARGIN`, are only the defaults of config keys.
+// configuration surface -- see [`OnlineClusterer::with_params`] -- and the
+// three that are, `MIN_POOL`, `T_MARGIN` and `T_MINT_CEILING`, are only the
+// defaults of config keys.
 
 /// Cosine similarity above which an embedding joins its nearest centroid.
 /// 0.45, not the 0.6 the design first guessed: the spike measured
@@ -221,6 +223,41 @@ pub const T_CHANGE: f32 = 0.30;
 #[doc(hidden)]
 pub const T_MINT_MARGIN: f32 = 0.20;
 
+/// How far into a known speaker's territory a pool's **mean** may sit and
+/// still become a speaker of its own.
+///
+/// The other half of the mint gate, and at the shipped pool size the half that
+/// decides. [`T_MINT_MARGIN`] asks whether the group is tighter with itself
+/// than with anybody known; this asks how close to an incumbent that question
+/// is still worth asking at all, because past some distance the answer is not
+/// "somebody new" but "that person, on a bad window".
+///
+/// **A number of its own rather than `T_ASSIGN + margin`, which is where it
+/// used to be read from**, for two reasons. The first is scale. `T_ASSIGN` and
+/// [`T_MARGIN`] were calibrated on a single noisy 1.5 s window against a
+/// centroid -- the spike put same-speaker windows at a median cosine of 0.517
+/// -- while what is compared here is `cos(pool mean, centroid)`, a mean of
+/// `MIN_POOL` windows, which for one voice sits far higher than any of those
+/// windows does. That is the same scale error [`T_MINT_MARGIN`] documents and
+/// avoids on the cohesion side, and the ceiling had it too. The second is that
+/// deriving it made one config key do two unrelated jobs in opposite
+/// directions: `diarize_margin` is documented as assignment caution, and
+/// raising it to name people more carefully in a crowded room quietly widened
+/// the band a pool could mint into. `diarize_mint_ceiling` carries this one.
+///
+/// **Unmeasured.** 0.55 is exactly where `T_ASSIGN + T_MARGIN` put it, so
+/// every mint the shipped clusterer decided before it decides the same way now
+/// -- but that is where the arithmetic happened to land, not an argument that
+/// it is right. The design already records this ceiling as the single most
+/// important number the probe's live-emulation mode has to answer, and giving
+/// it a key of its own is what makes it sweepable: **it is now the thing to
+/// sweep**, and nothing here has swept it.
+///
+/// `T_RETIRE` still caps it where it is used: a mean that close to a live
+/// centroid mints a duplicate the next assignment folds straight back.
+#[doc(hidden)]
+pub const T_MINT_CEILING: f32 = 0.55;
+
 /// How many candidate speakers may be waiting for their fourth agreeing
 /// window at once.
 ///
@@ -341,14 +378,19 @@ pub struct OnlineClusterer {
     /// are the unit its reluctance is written in.
     windows_seen: u64,
     next_label: u32,
-    /// The five thresholds, held rather than read from the consts so that the
-    /// probe can sweep them and the server can configure `min_pool` and
-    /// `margin`. All five are the consts above in every clusterer that ships.
+    /// The six thresholds, held rather than read from the consts so that the
+    /// probe can sweep them and the server can configure `min_pool`, `margin`
+    /// and `mint_ceiling`. All six are the consts above in every clusterer
+    /// that ships.
     t_assign: f32,
     t_retire: f32,
     alpha: f32,
     min_pool: usize,
     margin: f32,
+    /// How close to a live centroid a pool's mean may sit and still mint.
+    /// Deliberately not derived from `margin`: the two are different
+    /// quantities on different scales, and [`T_MINT_CEILING`] says why.
+    mint_ceiling: f32,
 }
 
 impl Default for OnlineClusterer {
@@ -359,29 +401,38 @@ impl Default for OnlineClusterer {
 
 impl OnlineClusterer {
     pub fn new() -> Self {
-        Self::with_config(MIN_POOL, T_MARGIN)
+        Self::with_config(MIN_POOL, T_MARGIN, T_MINT_CEILING)
     }
 
-    /// A clusterer at a configured pool size and margin: the server's
-    /// `diarize_min_pool` and `diarize_margin`, whose defaults are
-    /// [`MIN_POOL`] and [`T_MARGIN`].
+    /// A clusterer at a configured pool size, margin and mint ceiling: the
+    /// server's `diarize_min_pool`, `diarize_margin` and
+    /// `diarize_mint_ceiling`, whose defaults are [`MIN_POOL`], [`T_MARGIN`]
+    /// and [`T_MINT_CEILING`].
     ///
-    /// The two clustering parameters the configuration exposes. The others
+    /// The three clustering parameters the configuration exposes. The others
     /// have no trade an operator could make with them -- `T_RETIRE` never
     /// fired in any accepted configuration, and `T_ASSIGN` fails quietly
     /// rather than loudly when it is wrong, which is not a knob to hand out.
-    /// These two do: how fast a new voice is picked up against how often one
-    /// person is split across two labels, and how sure the clusterer has to be
-    /// before it names anybody at all.
+    /// These three do: how fast a new voice is picked up against how often one
+    /// person is split across two labels, how sure the clusterer has to be
+    /// before it names anybody at all, and how far into a known speaker's
+    /// territory a pool of orphans may still turn out to be somebody else.
     ///
     /// Both this and [`OnlineClusterer::new`] reach the fields through
     /// [`OnlineClusterer::with_params`], so there is still exactly one place
     /// the constants are assigned.
-    pub fn with_config(min_pool: usize, margin: f32) -> Self {
-        Self::with_params(T_ASSIGN, T_RETIRE, EMA_ALPHA, min_pool, margin)
+    pub fn with_config(min_pool: usize, margin: f32, mint_ceiling: f32) -> Self {
+        Self::with_params(
+            T_ASSIGN,
+            T_RETIRE,
+            EMA_ALPHA,
+            min_pool,
+            margin,
+            mint_ceiling,
+        )
     }
 
-    /// A clusterer with all five thresholds overridden. **Not a configuration
+    /// A clusterer with all six thresholds overridden. **Not a configuration
     /// surface**: the server builds every clusterer through
     /// [`OnlineClusterer::new`] or [`OnlineClusterer::with_config`], so
     /// `T_ASSIGN`, `T_RETIRE` and `EMA_ALPHA` are the calibrated constants
@@ -398,6 +449,7 @@ impl OnlineClusterer {
         alpha: f32,
         min_pool: usize,
         margin: f32,
+        mint_ceiling: f32,
     ) -> Self {
         Self {
             centroids: Vec::new(),
@@ -409,6 +461,7 @@ impl OnlineClusterer {
             alpha,
             min_pool,
             margin,
+            mint_ceiling,
         }
     }
 
@@ -578,8 +631,8 @@ impl OnlineClusterer {
     /// `diarize_margin = 0`: nobody who already has a number is within
     /// `T_ASSIGN` of the pool's mean, so minting cannot split an existing
     /// speaker. The second lets a pool mint *slightly* into that band -- as
-    /// far above `T_ASSIGN` as the configured margin -- but only when the pool
-    /// is more like itself than it is like that incumbent, by
+    /// far in as the configured ceiling, [`T_MINT_CEILING`] -- but only when
+    /// the pool is more like itself than it is like that incumbent, by
     /// [`T_MINT_MARGIN`].
     ///
     /// Narrowing the band rather than opening it is the point. A rule that
@@ -626,11 +679,25 @@ impl OnlineClusterer {
             None => true,
             Some(rival) if rival.is_nan() => false,
             // The pre-2026-08-27 rule, and the only clause that survives at
-            // `diarize_margin = 0` -- where the arm below cannot fire, since
-            // it needs `rival < t_assign + 0` against a `rival >= t_assign`.
+            // `diarize_margin = 0`.
             Some(rival) if rival < self.t_assign => true,
+            // Which is what the next line is for. `diarize_margin = 0` is a
+            // switch and not a setting: `config.rs` and the README both
+            // document it as the whole retreat to that rule, so it has to
+            // switch the ceiling off alongside the margin and the cohort
+            // test, and it is asked here rather than left to arrive by
+            // arithmetic. One key legitimately governing two rules is a
+            // statement only its off position can make -- "the adaptive rules
+            // are off wholesale" is one fact about the deployment, and every
+            // rule added since agrees on what it means. At any other value
+            // they are two different quantities on two different scales: how
+            // far one noisy window's best cosine must beat its second, against
+            // how close a *mean* of four may sit to an incumbent. Tying those
+            // together made caution in one place buy recklessness in the
+            // other. `mint_ceiling` is what carries the second now.
+            Some(_) if self.margin <= 0.0 => false,
             Some(rival) => {
-                rival < (self.t_assign + self.margin).min(self.t_retire)
+                rival < self.mint_ceiling.min(self.t_retire)
                     && cohesion - rival >= T_MINT_MARGIN
             }
         }
@@ -1703,7 +1770,12 @@ mod tests {
         };
         let shipped = run(OnlineClusterer::new());
         let swept = run(OnlineClusterer::with_params(
-            T_ASSIGN, T_RETIRE, EMA_ALPHA, MIN_POOL, T_MARGIN,
+            T_ASSIGN,
+            T_RETIRE,
+            EMA_ALPHA,
+            MIN_POOL,
+            T_MARGIN,
+            T_MINT_CEILING,
         ));
         assert_eq!(shipped, swept);
 
@@ -1753,7 +1825,14 @@ mod tests {
 
         let (shipped, _) = observe_all(OnlineClusterer::new(), &script);
         let (swept, _) = observe_all(
-            OnlineClusterer::with_params(T_ASSIGN, T_RETIRE, EMA_ALPHA, 2, T_MARGIN),
+            OnlineClusterer::with_params(
+                T_ASSIGN,
+                T_RETIRE,
+                EMA_ALPHA,
+                2,
+                T_MARGIN,
+                T_MINT_CEILING,
+            ),
             &script,
         );
         assert_eq!(
@@ -1777,12 +1856,18 @@ mod tests {
         // same two agreeing windows separate the cases.
         let script = vec![noisy(0, 0), noisy(0, 1)];
         assert_eq!(
-            observe_all(OnlineClusterer::with_config(MIN_POOL, T_MARGIN), &script),
+            observe_all(
+                OnlineClusterer::with_config(MIN_POOL, T_MARGIN, T_MINT_CEILING),
+                &script
+            ),
             observe_all(OnlineClusterer::new(), &script),
             "the default must be the calibrated clusterer, exactly"
         );
 
-        let (configured, _) = observe_all(OnlineClusterer::with_config(2, T_MARGIN), &script);
+        let (configured, _) = observe_all(
+            OnlineClusterer::with_config(2, T_MARGIN, T_MINT_CEILING),
+            &script,
+        );
         assert_eq!(
             configured,
             vec![Heard::Unknown, Heard::Settled(1)],
@@ -1806,7 +1891,14 @@ mod tests {
 
         let (shipped, _) = observe_all(OnlineClusterer::new(), &script);
         let (swept, _) = observe_all(
-            OnlineClusterer::with_params(0.99, T_RETIRE, EMA_ALPHA, MIN_POOL, T_MARGIN),
+            OnlineClusterer::with_params(
+                0.99,
+                T_RETIRE,
+                EMA_ALPHA,
+                MIN_POOL,
+                T_MARGIN,
+                T_MINT_CEILING,
+            ),
             &script,
         );
         assert_eq!(
@@ -1838,7 +1930,14 @@ mod tests {
 
         let (shipped, _) = observe_all(OnlineClusterer::new(), &script);
         let (swept, _) = observe_all(
-            OnlineClusterer::with_params(T_ASSIGN, T_RETIRE, 1.0, MIN_POOL, T_MARGIN),
+            OnlineClusterer::with_params(
+                T_ASSIGN,
+                T_RETIRE,
+                1.0,
+                MIN_POOL,
+                T_MARGIN,
+                T_MINT_CEILING,
+            ),
             &script,
         );
         assert_eq!(
@@ -1873,7 +1972,14 @@ mod tests {
 
         let (shipped, shipped_live) = observe_all(OnlineClusterer::new(), &script);
         let (swept, swept_live) = observe_all(
-            OnlineClusterer::with_params(T_ASSIGN, 0.35, EMA_ALPHA, MIN_POOL, T_MARGIN),
+            OnlineClusterer::with_params(
+                T_ASSIGN,
+                0.35,
+                EMA_ALPHA,
+                MIN_POOL,
+                T_MARGIN,
+                T_MINT_CEILING,
+            ),
             &script,
         );
         assert_eq!(
@@ -2223,7 +2329,7 @@ mod tests {
         let mut c = two_speakers();
         let voice = crowded_by_both(0.50);
         const CROWDED: f32 = 0.50;
-        const { assert!(CROWDED < T_ASSIGN + T_MARGIN, "inside the ceiling") };
+        const { assert!(CROWDED < T_MINT_CEILING, "inside the ceiling") };
         let heard: Vec<Heard> = (0..MIN_POOL).map(|_| c.observe(&voice)).collect();
         assert!(heard[..MIN_POOL - 1].iter().all(|h| h.is_guess()));
         assert_eq!(heard.last(), Some(&Heard::Settled(3)));
@@ -2263,7 +2369,7 @@ mod tests {
         }
         let rival = cosine(&mean, &voice(0));
         assert!(
-            rival >= T_ASSIGN + T_MARGIN,
+            rival >= T_MINT_CEILING,
             "the mean sits at {rival} from speaker 1, which has to be past the \
              mint gate's ceiling for the ceiling to be what refuses this"
         );
@@ -2299,13 +2405,16 @@ mod tests {
 
         // Two speakers far enough apart not to retire at 0.35, and a voice
         // exactly between them -- ambiguous, so it reaches the gate at all.
+        const CEILING: f32 = 0.95;
         let (first, second, between) = (at(0.0), at(80.0), at(40.0));
         let apart = similarity(&first, &second);
         assert!(apart < 0.35, "the two speakers sit at {apart}");
         let rival = similarity(&between, &first);
-        assert!((0.35..T_ASSIGN + 0.5).contains(&rival), "{rival}");
+        assert!((0.35..CEILING).contains(&rival), "{rival}");
 
-        let mut c = OnlineClusterer::with_params(T_ASSIGN, 0.35, EMA_ALPHA, MIN_POOL, 0.5);
+        let mut c = OnlineClusterer::with_params(
+            T_ASSIGN, 0.35, EMA_ALPHA, MIN_POOL, 0.5, CEILING,
+        );
         for _ in 0..MIN_POOL {
             c.observe(&first);
         }
@@ -2321,12 +2430,15 @@ mod tests {
 
     #[test]
     fn a_margin_of_zero_mints_by_the_pre_2026_08_27_rule() {
-        // The other half of the escape hatch. At margin 0 the ceiling is
-        // `T_ASSIGN` exactly, so the only clause left is the original one --
-        // nobody over the threshold near the mean -- and the crowded newcomer
-        // the shipped configuration mints is refused, which is honest about
-        // what the hatch costs.
-        let mut c = OnlineClusterer::with_config(MIN_POOL, 0.0);
+        // The other half of the escape hatch, and the half that is a decision
+        // rather than arithmetic: the ceiling is its own setting now, so
+        // "margin 0 turns it off too" is a rule `may_mint` states and this is
+        // what holds it stated. The ceiling here is the shipped one, and it is
+        // the margin alone that has to switch it off -- the only clause left
+        // is the original one, nobody over the threshold near the mean, so the
+        // crowded newcomer the shipped configuration mints is refused. That is
+        // honest about what the hatch costs.
+        let mut c = OnlineClusterer::with_config(MIN_POOL, 0.0, T_MINT_CEILING);
         for _ in 0..MIN_POOL {
             c.observe(&at(0.0));
         }
@@ -2342,6 +2454,182 @@ mod tests {
             assert!(c.observe(&voice).settled().is_some());
         }
         assert_eq!(c.minted(), 2, "the old rule refuses this mint");
+    }
+
+    // ------------------------------------------- the ceiling is its own knob
+    //
+    // The ceiling was read as `t_assign + margin` until the two were found to
+    // be different quantities on different scales -- see [`T_MINT_CEILING`].
+    // What follows is the pair of fixtures that separate them: one that
+    // reaches the gate only because a margin withheld it, and one that reaches
+    // it at any margin at all, including none.
+
+    /// Half of [`WIDE`], and the angle both incumbents sit at from the pool.
+    const HALF_WIDE: f32 = 53.13;
+    /// Two incumbents far enough apart that a voice exactly between them is
+    /// 0.600 from each: outside the shipped ceiling, inside where a
+    /// `diarize_margin` of 0.20 used to move it.
+    const WIDE: f32 = 2.0 * HALF_WIDE;
+
+    /// Two speakers [`WIDE`] degrees apart and four identical windows on the
+    /// bisector, fed through.
+    ///
+    /// Equidistant by construction, so the lead is zero and no margin however
+    /// small will assign them -- which is the only reason they pool at all,
+    /// and what makes this the fixture the assignment margin must not be able
+    /// to reach. Being identical, their mean is the window itself, so the
+    /// number the ceiling decides on is exactly `cos(HALF_WIDE)`.
+    fn pool_on_the_bisector(margin: f32, mint_ceiling: f32) -> OnlineClusterer {
+        let mut c = OnlineClusterer::with_config(MIN_POOL, margin, mint_ceiling);
+        for _ in 0..MIN_POOL {
+            c.observe(&at(0.0));
+        }
+        for _ in 0..MIN_POOL {
+            c.observe(&at(WIDE));
+        }
+        assert_eq!(c.live_labels(), vec![1, 2]);
+
+        let between = at(HALF_WIDE);
+        let lead = similarity(&between, &at(0.0)) - similarity(&between, &at(WIDE));
+        assert!(lead.abs() < 1e-5, "the fixture leads by {lead}, not by 0");
+        for _ in 0..MIN_POOL {
+            c.observe(&between);
+        }
+        c
+    }
+
+    #[test]
+    fn raising_the_assignment_margin_no_longer_changes_what_mints() {
+        // The regression. `diarize_margin` is documented as assignment
+        // caution -- "raising it labels less and guesses less" -- and the
+        // ceiling used to be read as `t_assign + margin`, so raising it also
+        // widened the band a pool could mint into. An operator being careful
+        // in a crowded room silently loosened the split protection the
+        // 2026-08-24 spike measured at zero, in the one direction the
+        // documentation promised it would not.
+        //
+        // The pool sits where the two ceilings disagree, which is the whole
+        // of what makes this fixture able to fail.
+        let rival = similarity(&at(HALF_WIDE), &at(0.0));
+        assert!(
+            (T_MINT_CEILING..T_ASSIGN + 0.20).contains(&rival),
+            "the pool sits at {rival}, which has to straddle the shipped \
+             ceiling and the one a margin of 0.20 used to produce"
+        );
+
+        let shipped = pool_on_the_bisector(T_MARGIN, T_MINT_CEILING).minted();
+        let cautious = pool_on_the_bisector(0.20, T_MINT_CEILING).minted();
+        assert_eq!(
+            shipped, cautious,
+            "the assignment margin moved the mint ceiling"
+        );
+        assert_eq!(shipped, 2, "and both refuse the pool, as the ceiling says");
+    }
+
+    #[test]
+    fn the_shipped_mint_ceiling_is_where_the_assignment_margin_used_to_put_it() {
+        // The compatibility claim the decoupling rests on: a deployment at the
+        // shipped settings sees nothing change, because the number is the same
+        // number. It is now a number rather than a sum, so this is the line
+        // that keeps the equality deliberate -- moving the ceiling is a
+        // decision somebody has to take on purpose, and the probe run that
+        // would justify it has not happened.
+        const { assert!(T_MINT_CEILING == T_ASSIGN + T_MARGIN) };
+        assert_eq!(OnlineClusterer::new().mint_ceiling, T_ASSIGN + T_MARGIN);
+        assert_eq!(OnlineClusterer::new().mint_ceiling, 0.55);
+    }
+
+    /// Four windows that agree with each other, none of them assignable to
+    /// anybody, whose *mean* lands at 0.56 from speaker 1. Fed through.
+    ///
+    /// The shape that reaches the mint gate from a margin of zero, which the
+    /// bisector fixture cannot: at margin 0 assignment is the bare argmax over
+    /// `T_ASSIGN`, so a pool forms there only when every member is
+    /// individually below the threshold. Averaging four of them then lifts the
+    /// mean well above it -- 0.44 each, 0.56 together -- which is the scale
+    /// difference the ceiling lives on and the assignment margin does not.
+    ///
+    /// 0.56 is near the top of the band such a pool can occupy at all. Every
+    /// member being under `T_ASSIGN` bounds `cos(mean, member)` from above,
+    /// and `cohesion - rival >= T_MINT_MARGIN` then holds `rival` under 0.579.
+    fn pool_whose_mean_lands_on_speaker_one(
+        margin: f32,
+        mint_ceiling: f32,
+    ) -> OnlineClusterer {
+        let mut c = OnlineClusterer::with_config(MIN_POOL, margin, mint_ceiling);
+        for _ in 0..MIN_POOL {
+            c.observe(&voice(0));
+        }
+        for _ in 0..MIN_POOL {
+            c.observe(&voice(6));
+        }
+        assert_eq!(c.live_labels(), vec![1, 2]);
+
+        // 0.44 shared with speaker 1, 0.2962 on a second shared axis, the rest
+        // on a private axis each -- so 0.44 from speaker 1 individually and
+        // 0.49 from each other, which pools them and assigns them nowhere.
+        let pooled: Vec<Vec<f32>> = (0..MIN_POOL)
+            .map(|i| {
+                embedding(&[
+                    (0, 0.44),
+                    (1, 0.296_196_f32.sqrt()),
+                    (2 + i, 0.510_204_f32.sqrt()),
+                ])
+            })
+            .collect();
+        let mean = mean_of(&pooled);
+        let rival = cosine(&mean, &voice(0));
+        assert!((rival - 0.56).abs() < 1e-4, "the mean sits at {rival}");
+        assert!(rival >= T_ASSIGN, "or the first clause would decide this");
+        assert!(
+            cohesion(&mean, &pooled) - rival >= T_MINT_MARGIN,
+            "or T_MINT_MARGIN would decide this instead of the ceiling"
+        );
+
+        for v in &pooled[..MIN_POOL - 1] {
+            assert_eq!(c.observe(v), Heard::Unknown, "nobody, at any margin");
+        }
+        c.observe(&pooled[MIN_POOL - 1]);
+        c
+    }
+
+    #[test]
+    fn a_higher_mint_ceiling_mints_a_pool_the_shipped_one_refuses() {
+        // A parameter a constructor accepts and then ignores satisfies every
+        // equality test in this file, so the ceiling needs a script where it
+        // alone decides the answer. Same margin, same pool, one number moved.
+        assert_eq!(
+            pool_whose_mean_lands_on_speaker_one(T_MARGIN, T_MINT_CEILING).minted(),
+            2,
+            "0.56 is outside the shipped ceiling"
+        );
+        assert_eq!(
+            pool_whose_mean_lands_on_speaker_one(T_MARGIN, 0.60).minted(),
+            3,
+            "and inside a ceiling of 0.60"
+        );
+    }
+
+    #[test]
+    fn a_margin_of_zero_switches_the_mint_ceiling_off_however_it_is_set() {
+        // The escape hatch, now that it is a decision rather than a
+        // coincidence. It used to hold by arithmetic -- at margin 0 the
+        // ceiling *was* `t_assign`, so its clause needed `rival < t_assign`
+        // against a `rival >= t_assign` and could never fire -- and separating
+        // the two takes that away. `diarize_margin = 0` is documented as the
+        // whole retreat to the pre-2026-08-27 rule, so a ceiling still running
+        // underneath it would be a hatch that does not shut.
+        assert_eq!(
+            pool_whose_mean_lands_on_speaker_one(T_MARGIN, 0.60).minted(),
+            3,
+            "the fixture has to mint at this ceiling, or the line below would \
+             pass for the wrong reason"
+        );
+        assert_eq!(
+            pool_whose_mean_lands_on_speaker_one(0.0, 0.60).minted(),
+            2,
+            "a mint ceiling outlived the hatch that is supposed to close it"
+        );
     }
 
     #[test]
@@ -2440,7 +2728,7 @@ mod tests {
         // at `diarize_margin = 0.30` hold its *hops* to a looser rule than its
         // windows, which inverts the reason the number exists.
         let build = |margin: f32| {
-            let mut c = OnlineClusterer::with_config(MIN_POOL, margin);
+            let mut c = OnlineClusterer::with_config(MIN_POOL, margin, T_MINT_CEILING);
             for _ in 0..MIN_POOL {
                 c.observe(&voice(0));
             }

@@ -26,14 +26,19 @@ use anyhow::Result;
 /// because they are set together and every one of them is read exactly once,
 /// at session start.
 ///
-/// Held as a struct rather than passed as three arguments because two of them
-/// are floats in the same range and a caller that swapped them would compile.
+/// Held as a struct rather than passed as four arguments because three of them
+/// are cosines and a caller that swapped them would compile.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DiarizeTuning {
     /// `diarize_min_pool`: agreeing windows before a speaker is minted.
     pub min_pool: usize,
     /// `diarize_margin`: how far the best centroid must beat the second.
     pub margin: f32,
+    /// `diarize_mint_ceiling`: how close to an incumbent a pool's mean may sit
+    /// and still be somebody new. A separate setting from `margin` because it
+    /// is a separate question on a separate scale -- see
+    /// [`cluster::T_MINT_CEILING`].
+    pub mint_ceiling: f32,
     /// `diarize_change_threshold`: the cosine drop between hops that marks a
     /// turn change.
     pub change_threshold: f32,
@@ -46,6 +51,7 @@ impl Default for DiarizeTuning {
         Self {
             min_pool: cluster::MIN_POOL,
             margin: cluster::T_MARGIN,
+            mint_ceiling: cluster::T_MINT_CEILING,
             change_threshold: cluster::T_CHANGE,
         }
     }
@@ -216,6 +222,7 @@ mod tests {
         let t = DiarizeTuning::default();
         assert_eq!(t.min_pool, cluster::MIN_POOL);
         assert_eq!(t.margin, cluster::T_MARGIN);
+        assert_eq!(t.mint_ceiling, cluster::T_MINT_CEILING);
         assert_eq!(t.change_threshold, cluster::T_CHANGE);
     }
 }

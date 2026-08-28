@@ -559,7 +559,11 @@ impl RealDiarizer {
             state: None,
             framer: Framer::default(),
             assembler: WindowAssembler::default(),
-            clusterer: OnlineClusterer::with_config(tuning.min_pool, tuning.margin),
+            clusterer: OnlineClusterer::with_config(
+                tuning.min_pool,
+                tuning.margin,
+                tuning.mint_ceiling,
+            ),
             change_threshold: tuning.change_threshold,
             last_label: None,
             previous_hop: None,

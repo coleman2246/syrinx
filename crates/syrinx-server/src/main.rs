@@ -76,6 +76,7 @@ fn build_diarizer(config: &Config) -> Option<Arc<dyn DiarizerFactory>> {
     let tuning = syrinx_server::diarize::DiarizeTuning {
         min_pool: config.diarize_min_pool,
         margin: config.diarize_margin,
+        mint_ceiling: syrinx_server::diarize::cluster::T_MINT_CEILING,
         change_threshold: config.diarize_change_threshold,
     };
     match RealDiarizerFactory::load(std::path::Path::new(dir), tuning) {
