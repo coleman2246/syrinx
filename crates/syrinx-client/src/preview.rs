@@ -8,28 +8,87 @@
 //! source selection and only one process can sensibly hold a capture open.
 
 use anyhow::{Context, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use syrinx_audio::meter::{self, BANDS};
+use syrinx_audio::mixer::{STARVE_AFTER, SourceHealth};
 use syrinx_audio::{Capture, Source};
+use tokio::sync::{Notify, mpsc};
 
 /// A running preview. Dropping it stops the capture.
 pub struct Preview {
     levels: Arc<Mutex<[f32; BANDS]>>,
     rms: Arc<Mutex<f32>>,
-    stop: Arc<AtomicBool>,
+    /// When a chunk last arrived, so a source delivering nothing can say so
+    /// rather than reading as a source delivering silence.
+    last_chunk: Arc<Mutex<Instant>>,
+    stop: Arc<Notify>,
     /// Which source this is metering, so the daemon can tell when to re-point.
     pub source_key: String,
+    /// `Source::short_label`, so a meter row can name itself.
+    pub label: String,
+}
+
+/// Fold arriving audio into the published levels until told to stop.
+///
+/// Split out from [`Preview::start`] so it can be driven without a device: the
+/// fault it exists to prevent is a source that never delivers a chunk, and no
+/// real device can be asked to behave that way on demand.
+async fn meter_loop(
+    mut rx: mpsc::Receiver<Vec<f32>>,
+    stop: Arc<Notify>,
+    levels: Arc<Mutex<[f32; BANDS]>>,
+    rms: Arc<Mutex<f32>>,
+    last_chunk: Arc<Mutex<Instant>>,
+) {
+    // A rolling window kept just long enough for one FFT frame. Holding more
+    // would make the meter lag behind the sound.
+    let mut window: Vec<f32> = Vec::with_capacity(4096);
+    loop {
+        let chunk = tokio::select! {
+            // Selected on, not checked after the await. This loop used to be
+            // `while let Some(chunk) = rx.recv().await` with the stop flag read
+            // inside it, so a source that never delivered a chunk never
+            // reached the check: `recv` returns neither Some nor None, because
+            // the sender lives in the capture callback, the capture is held by
+            // this task, and this task is what was waiting. A silent WASAPI
+            // loopback therefore pinned its capture client, its thread and its
+            // runtime for the life of the process -- and the daemon re-points
+            // the preview whenever the first selected key changes, leaking
+            // another every time. That is the mechanism behind "restart the
+            // daemon and the GUI a few times".
+            _ = stop.notified() => break,
+            chunk = rx.recv() => match chunk {
+                Some(c) => c,
+                None => break,
+            },
+        };
+        *last_chunk.lock().expect("preview clock poisoned") = Instant::now();
+        window.extend_from_slice(&chunk);
+        if window.len() > 4096 {
+            let excess = window.len() - 4096;
+            window.drain(..excess);
+        }
+        *levels.lock().expect("levels lock poisoned") =
+            meter::spectrum(&window, syrinx_proto::SAMPLE_RATE);
+        *rms.lock().expect("rms lock poisoned") = meter::rms(&chunk);
+    }
 }
 
 impl Preview {
     pub fn start(source: &Source) -> Result<Self> {
         let levels = Arc::new(Mutex::new([0.0f32; BANDS]));
         let rms_v = Arc::new(Mutex::new(0.0f32));
-        let stop = Arc::new(AtomicBool::new(false));
+        let last_chunk = Arc::new(Mutex::new(Instant::now()));
+        let stop = Arc::new(Notify::new());
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let (l, r, s) = (levels.clone(), rms_v.clone(), stop.clone());
+        let (l, r, c, s) = (
+            levels.clone(),
+            rms_v.clone(),
+            last_chunk.clone(),
+            stop.clone(),
+        );
         let src = source.clone();
 
         // Everything happens inside the runtime. `Capture::start` spawns a
@@ -49,9 +108,8 @@ impl Preview {
                 }
             };
             rt.block_on(async move {
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<f32>>(32);
-                // Held for the life of this task; dropping it stops capture.
-                let _capture = match Capture::start(&src, tx) {
+                let (tx, rx) = mpsc::channel::<Vec<f32>>(32);
+                let capture = match Capture::start(&src, tx) {
                     Ok(c) => {
                         let _ = ready_tx.send(Ok(()));
                         c
@@ -61,23 +119,11 @@ impl Preview {
                         return;
                     }
                 };
-
-                // A rolling window kept just long enough for one FFT frame.
-                // Holding more would make the meter lag behind the sound.
-                let mut window: Vec<f32> = Vec::with_capacity(4096);
-                while let Some(chunk) = rx.recv().await {
-                    if s.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    window.extend_from_slice(&chunk);
-                    if window.len() > 4096 {
-                        let excess = window.len() - 4096;
-                        window.drain(..excess);
-                    }
-                    *l.lock().expect("levels lock poisoned") =
-                        meter::spectrum(&window, syrinx_proto::SAMPLE_RATE);
-                    *r.lock().expect("rms lock poisoned") = meter::rms(&chunk);
-                }
+                meter_loop(rx, s, l, r, c).await;
+                // Explicit because it is the whole point: this handle is what
+                // was being held open, and the device is not released until it
+                // goes.
+                drop(capture);
             });
         });
 
@@ -92,8 +138,10 @@ impl Preview {
         Ok(Self {
             levels,
             rms: rms_v,
+            last_chunk,
             stop,
             source_key: source.stable_key(),
+            label: source.short_label(),
         })
     }
 
@@ -104,10 +152,148 @@ impl Preview {
     pub fn rms(&self) -> f32 {
         *self.rms.lock().expect("rms lock poisoned")
     }
+
+    /// Nothing has arrived from this source for [`STARVE_AFTER`].
+    ///
+    /// Distinct from an rms of zero, which is what a live microphone in a
+    /// quiet room reads. This says the device has delivered no audio at all,
+    /// which is what an idle Windows loopback does.
+    pub fn silent(&self) -> bool {
+        self.last_chunk
+            .lock()
+            .expect("preview clock poisoned")
+            .elapsed()
+            >= STARVE_AFTER
+    }
+
+    /// This source as a meter row.
+    pub fn health(&self) -> SourceHealth {
+        SourceHealth {
+            label: self.label.clone(),
+            rms: self.rms(),
+            silent: self.silent(),
+        }
+    }
 }
 
 impl Drop for Preview {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // `notify_one` rather than `notify_waiters`: a stop that arrives
+        // before the task has reached its first `notified()` has to be
+        // remembered, not dropped on the floor.
+        self.stop.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The three things a meter publishes into, as `meter_loop` takes them.
+    type Published = (
+        Arc<Mutex<[f32; BANDS]>>,
+        Arc<Mutex<f32>>,
+        Arc<Mutex<Instant>>,
+    );
+
+    fn published() -> Published {
+        (
+            Arc::new(Mutex::new([0.0f32; BANDS])),
+            Arc::new(Mutex::new(0.0f32)),
+            Arc::new(Mutex::new(Instant::now())),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_meter_lets_go_of_a_source_that_never_produced_a_chunk() {
+        // The leak. `tx` stands in for the capture callback, which the capture
+        // keeps alive and the task keeps alive in turn -- so `recv` never
+        // returns and the old loop never looked at its stop flag. Held here
+        // for the whole test, exactly as a silent WASAPI loopback holds it.
+        let (tx, rx) = mpsc::channel::<Vec<f32>>(32);
+        let (levels, rms, clock) = published();
+        let stop = Arc::new(Notify::new());
+        let task = tokio::spawn(meter_loop(rx, stop.clone(), levels, rms, clock));
+
+        stop.notify_one();
+
+        // Deadline-bounded: the regression is a task that never ends, which
+        // without one hangs the run rather than failing it.
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the meter held its capture after being told to stop")
+            .expect("the meter task panicked");
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_arrives_first_is_not_lost() {
+        // The daemon drops a preview from a synchronous loop, which can happen
+        // before the task has reached its first await. A signal that only woke
+        // a waiter already waiting would leak exactly as before.
+        let (tx, rx) = mpsc::channel::<Vec<f32>>(32);
+        let (levels, rms, clock) = published();
+        let stop = Arc::new(Notify::new());
+        stop.notify_one();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            meter_loop(rx, stop, levels, rms, clock),
+        )
+        .await
+        .expect("a stop signalled before the first await was dropped");
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn the_meter_lets_go_when_its_source_ends() {
+        // The other exit: the device went away rather than the user leaving.
+        let (tx, rx) = mpsc::channel::<Vec<f32>>(32);
+        let (levels, rms, clock) = published();
+        drop(tx);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            meter_loop(rx, Arc::new(Notify::new()), levels, rms, clock),
+        )
+        .await
+        .expect("the meter outlived its source");
+    }
+
+    #[tokio::test]
+    async fn a_chunk_that_arrives_moves_the_level() {
+        // The loop still has to do its job; letting go is only half of it.
+        let (tx, rx) = mpsc::channel::<Vec<f32>>(32);
+        let (levels, rms, clock) = published();
+        let stop = Arc::new(Notify::new());
+        let task = tokio::spawn(meter_loop(
+            rx,
+            stop.clone(),
+            levels.clone(),
+            rms.clone(),
+            clock.clone(),
+        ));
+
+        let tone: Vec<f32> = (0..1600).map(|i| (i as f32 * 0.2).sin() * 0.5).collect();
+        tx.send(tone).await.unwrap();
+
+        let moved = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if *rms.lock().unwrap() > 0.0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(moved.is_ok(), "the meter never registered the audio");
+        assert!(
+            levels.lock().unwrap().iter().any(|b| *b > 0.0),
+            "the spectrum stayed flat"
+        );
+
+        stop.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 }
