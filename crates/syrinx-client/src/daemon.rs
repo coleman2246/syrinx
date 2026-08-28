@@ -68,6 +68,14 @@ fn state_hotkey(config: &Config) -> Result<Option<crate::hotkey::HotKey>> {
 /// What the daemon does when a session ends by itself.
 pub struct DaemonOptions {
     pub config: Config,
+    /// The config file this daemon was given, if it was given one.
+    ///
+    /// Settings written back go here rather than to the canonical path. A
+    /// daemon started as `syrinx daemon --config <other>` was writing its
+    /// source selection, format and stream file into a file it would never
+    /// read again -- which is the exact fault that remembering the selection
+    /// exists to fix.
+    pub config_path: Option<std::path::PathBuf>,
     pub mode: OutputMode,
     /// Selected sources, in order. The first is the one that types at the
     /// cursor in separate mode.
@@ -261,20 +269,12 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                     // happened to start with.
                     state.opts.format = format;
                     state.opts.config.format = format;
-                    if let Err(e) = state.opts.config.save(&crate::Config::default_path()) {
-                        warn!("saving the config: {e:#}");
-                    }
+                    state.save_config();
                     Response::Ok
                 }
                 Request::SetStreamFile { path } => {
                     state.opts.config.stream_to = path;
-                    if let Err(e) = state
-                        .opts
-                        .config
-                        .save(&crate::Config::default_path())
-                    {
-                        warn!("saving the config: {e:#}");
-                    }
+                    state.save_config();
                     Response::Ok
                 }
                 Request::SetServer { server } => {
@@ -585,6 +585,22 @@ impl DaemonRuntime {
         self.sessions.iter().any(|s| s.is_running())
     }
 
+    /// Write the config back to the file this daemon was given.
+    ///
+    /// One place, because every setting written back has the same problem: a
+    /// daemon run with `--config <other>` that saved to the canonical path
+    /// would drop the change the moment it restarted and read `<other>` again.
+    fn save_config(&self) {
+        let path = self
+            .opts
+            .config_path
+            .clone()
+            .unwrap_or_else(crate::Config::default_path);
+        if let Err(e) = self.opts.config.save(&path) {
+            warn!("saving the config to {}: {e:#}", path.display());
+        }
+    }
+
     /// Take a new source selection, and write it down.
     ///
     /// Written back to the config for the same reason `set_diarize` is: this
@@ -605,9 +621,7 @@ impl DaemonRuntime {
             self.opts.source_mode = m;
             self.opts.config.source_mode = m;
         }
-        if let Err(e) = self.opts.config.save(&crate::Config::default_path()) {
-            warn!("saving the config: {e:#}");
-        }
+        self.save_config();
     }
 
     /// Start, stop or re-point the level meter.
@@ -1095,9 +1109,7 @@ impl DaemonRuntime {
             return;
         }
         self.opts.config.diarize = on;
-        if let Err(e) = self.opts.config.save(&crate::Config::default_path()) {
-            warn!("saving the config: {e:#}");
-        }
+        self.save_config();
     }
 
     fn save(&self, format: save::Format, path: Option<&str>) -> Result<String> {
@@ -1203,6 +1215,7 @@ mod tests {
         DaemonRuntime {
             opts: DaemonOptions {
                 config: config(),
+                config_path: None,
                 mode: OutputMode::Transcribe,
                 source_keys: Vec::new(),
                 source_mode: Default::default(),
@@ -1512,6 +1525,31 @@ mod tests {
         );
         assert_eq!((live.error, live.levels), (full.error, full.levels));
         assert_eq!(live.last_fragment, full.last_fragment);
+    }
+
+    #[test]
+    fn a_daemon_given_a_config_writes_its_selection_back_to_that_file() {
+        // Not to the canonical path. A daemon started as `--config <other>`
+        // that saved elsewhere lost the selection the moment it restarted and
+        // read `<other>` again -- which is the whole fault that writing the
+        // selection down exists to fix.
+        let path = scratch("config").with_extension("toml");
+        let _ = std::fs::remove_file(&path);
+        let mut d = daemon_holding(SessionState::default());
+        d.opts.config_path = Some(path.clone());
+
+        d.remember_sources(
+            vec!["cpal:in:Yeti".into(), "cpal:out:Speakers".into()],
+            Some(crate::mode::SourceMode::Separate),
+        );
+
+        let back = Config::load(Some(path.clone())).expect("the file the daemon was given");
+        assert_eq!(
+            back.selected_sources(),
+            ["cpal:in:Yeti".to_string(), "cpal:out:Speakers".to_string()]
+        );
+        assert_eq!(back.source_mode, crate::mode::SourceMode::Separate);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

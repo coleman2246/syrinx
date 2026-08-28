@@ -331,6 +331,36 @@ fn stream_path_for(base: &Path, source: &str, sources: usize) -> PathBuf {
     }
 }
 
+/// What this run will capture, and how the streams are combined.
+///
+/// Sources named on the command line replace the remembered selection outright:
+/// naming one is an instruction about this run. Otherwise the *whole* remembered
+/// selection is used, read through the same accessor the daemon reads. Taking
+/// `source_key` alone ran one source where the user had chosen two, and a config
+/// written by hand with `source_keys` and no `source_key` fell back to the
+/// default input without a word -- it worked at all only because the daemon
+/// mirrors the first key back into the older field.
+///
+/// `--separate` turns separate mode on; without it the config decides, so
+/// `syrinx run` and the daemon agree about a selection the window wrote down.
+fn selection_for_run(
+    cfg: &Config,
+    named: Vec<String>,
+    separate: bool,
+) -> (Vec<String>, syrinx_client::mode::SourceMode) {
+    let keys = if named.is_empty() {
+        cfg.selected_sources()
+    } else {
+        named
+    };
+    let mode = if separate {
+        syrinx_client::mode::SourceMode::Separate
+    } else {
+        cfg.source_mode
+    };
+    (keys, mode)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     config: Option<PathBuf>,
@@ -348,25 +378,18 @@ fn run(
     let mode = mode.map(OutputMode::from).unwrap_or(cfg.mode);
 
     let available = syrinx_client::list_sources()?;
-    let chosen: Vec<syrinx_client::Source> = if sources_wanted.is_empty() {
-        vec![syrinx_client::choose_source(
-            &available,
-            cfg.source_key.as_deref(),
-        )?]
+    let (wanted, source_mode) = selection_for_run(&cfg, sources_wanted, separate);
+    let chosen: Vec<syrinx_client::Source> = if wanted.is_empty() {
+        vec![syrinx_client::choose_source(&available, None)?]
     } else {
         let mut v = Vec::new();
-        for key in &sources_wanted {
+        for key in &wanted {
             v.push(
                 syrinx_client::resolve(&available, key)
                     .with_context(|| format!("no source matching {key:?}"))?,
             );
         }
         v
-    };
-    let source_mode = if separate {
-        syrinx_client::mode::SourceMode::Separate
-    } else {
-        syrinx_client::mode::SourceMode::Combined
     };
 
     // The flag wins over the config, so a one-off run can stream somewhere
@@ -572,6 +595,7 @@ fn run_daemon(
     save_each: bool,
     format: Option<FormatArg>,
 ) -> Result<()> {
+    let config_path = config.clone();
     let cfg = Config::load(config)?;
     let format = resolve_format(format, &cfg);
     let mode = mode.map(OutputMode::from).unwrap_or(cfg.mode);
@@ -593,6 +617,7 @@ fn run_daemon(
 
     syrinx_client::daemon::run(syrinx_client::daemon::DaemonOptions {
         config: cfg,
+        config_path,
         mode,
         source_keys,
         source_mode,
@@ -850,5 +875,70 @@ mod stream_tests {
             .collect();
         assert_eq!(saved, streamed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use syrinx_client::mode::SourceMode;
+
+    fn cfg_from(toml_text: &str) -> Config {
+        toml::from_str(toml_text).expect("the test config must parse")
+    }
+
+    #[test]
+    fn a_config_holding_only_the_source_list_is_still_honoured() {
+        // Written by hand, or by a build that only ever wrote the list. This
+        // read `source_key`, which is absent here, so it fell back to the
+        // default input and recorded the wrong device without saying so.
+        let cfg = cfg_from(
+            "token = \"t\"\nsource_keys = [\"cpal:in:Yeti\", \"cpal:out:Speakers\"]\n",
+        );
+        let (keys, _) = selection_for_run(&cfg, Vec::new(), false);
+        assert_eq!(keys, ["cpal:in:Yeti", "cpal:out:Speakers"]);
+    }
+
+    #[test]
+    fn every_remembered_source_is_used_not_only_the_first() {
+        // It took `source_key` and made a one-element list of it, so a
+        // two-source selection ran as one and the second was never recorded.
+        let cfg = cfg_from(
+            "token = \"t\"\nsource_key = \"cpal:in:Yeti\"\n\
+             source_keys = [\"cpal:in:Yeti\", \"cpal:out:Speakers\"]\n",
+        );
+        let (keys, _) = selection_for_run(&cfg, Vec::new(), false);
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn the_older_single_source_spelling_still_works() {
+        let cfg = cfg_from("token = \"t\"\nsource_key = \"rnnoise_source\"\n");
+        let (keys, _) = selection_for_run(&cfg, Vec::new(), false);
+        assert_eq!(keys, ["rnnoise_source"]);
+    }
+
+    #[test]
+    fn sources_named_on_the_command_line_replace_the_remembered_selection() {
+        // An instruction about this run, not an addition to what was saved.
+        let cfg = cfg_from("token = \"t\"\nsource_keys = [\"a\", \"b\"]\n");
+        let (keys, _) = selection_for_run(&cfg, vec!["c".into()], false);
+        assert_eq!(keys, ["c"]);
+    }
+
+    #[test]
+    fn the_remembered_source_mode_is_read_when_no_flag_says_otherwise() {
+        // `syrinx run` ignored `source_mode` entirely, so a selection the
+        // window had saved as separate came back combined and mixed two
+        // people into one unlabelled stream.
+        let cfg = cfg_from("token = \"t\"\nsource_mode = \"separate\"\n");
+        assert_eq!(selection_for_run(&cfg, Vec::new(), false).1, SourceMode::Separate);
+    }
+
+    #[test]
+    fn the_separate_flag_turns_it_on_whatever_the_config_says() {
+        let cfg = cfg_from("token = \"t\"\nsource_mode = \"combined\"\n");
+        assert_eq!(selection_for_run(&cfg, Vec::new(), true).1, SourceMode::Separate);
+        assert_eq!(selection_for_run(&cfg, Vec::new(), false).1, SourceMode::Combined);
     }
 }
