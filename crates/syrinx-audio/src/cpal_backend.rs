@@ -21,8 +21,37 @@ use crate::source::{Source, SourceKind, SourceTarget};
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 
+/// Run `f`, treating a panic inside it as "no answer".
+///
+/// cpal's Windows backend does not confine itself to returning errors:
+/// `Device::description` calls `.OpenPropertyStore(STGM_READ).expect("could
+/// not open property store")`, so one endpoint that fails transiently panics
+/// the caller. That caller is the GUI's UI thread every two seconds and the
+/// daemon's main loop, for every endpoint on the machine -- a device being
+/// swapped or a driver reloading would take down whichever process happened to
+/// touch it first.
+///
+/// Losing one endpoint from a list is a far smaller thing than losing the
+/// process, so a panic costs the endpoint. This only works where panics unwind;
+/// under `panic = "abort"` there is nothing to catch, and nothing here can help.
+fn without_panicking<T>(what: &str, f: impl FnOnce() -> Option<T>) -> Option<T> {
+    // AssertUnwindSafe because the closure only reads a device and the result
+    // is discarded on the way out, so there is no half-updated state to
+    // observe afterwards.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => {
+            // No name to give it: the name is what panicked.
+            tracing::warn!("skipping an audio endpoint: {what} panicked");
+            None
+        }
+    }
+}
+
 fn device_name(d: &cpal::Device) -> Option<String> {
-    d.description().ok().map(|x| x.name().to_string())
+    without_panicking("describing the device", || {
+        d.description().ok().map(|x| x.name().to_string())
+    })
 }
 
 /// Enumerate microphones, and outputs re-offered as system audio.
@@ -129,5 +158,30 @@ mod tests {
     #[test]
     fn a_missing_device_is_an_error_not_a_panic() {
         assert!(find_device("no such device exists anywhere", false).is_err());
+    }
+
+    #[test]
+    fn an_endpoint_that_panics_while_being_described_is_skipped_not_fatal() {
+        // cpal's Windows backend panics rather than erroring when a property
+        // store will not open, and this is reached from the GUI's UI thread
+        // every two seconds. The panic message printed by this test is the
+        // test doing its job.
+        let got: Option<String> = without_panicking("a deliberately broken endpoint", || {
+            panic!("could not open property store")
+        });
+        assert_eq!(got, None, "a panicking endpoint must drop out of the list");
+    }
+
+    #[test]
+    fn an_endpoint_that_answers_is_passed_straight_through() {
+        // The guard must not cost the ordinary case its answer.
+        assert_eq!(
+            without_panicking("a working endpoint", || Some("Yeti".to_string())),
+            Some("Yeti".to_string())
+        );
+        assert_eq!(
+            without_panicking("an endpoint with no name", || None::<String>),
+            None
+        );
     }
 }
