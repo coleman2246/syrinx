@@ -491,7 +491,7 @@ struct App {
     /// Set when the socket drops, so the window can say so rather than showing
     /// stale state as if it were live.
     disconnected: bool,
-    status_line: Option<String>,
+    status_line: Option<(Severity, String)>,
     list_error: Option<String>,
     /// Server address being edited. Applied on Enter or the Apply button, not
     /// per keystroke, so a half-typed host is never dialled.
@@ -560,7 +560,9 @@ impl App {
                 self.state = s;
                 self.disconnected = false;
             }
-            Ok(Response::Error { message }) => self.status_line = Some(message),
+            Ok(Response::Error { message }) => {
+                self.status_line = Some((Severity::Error, message))
+            }
             Ok(_) => {}
             Err(_) => self.disconnected = true,
         }
@@ -569,16 +571,49 @@ impl App {
     /// Send a command and refresh immediately, so the UI does not wait a poll
     /// interval to reflect a button the user just pressed.
     fn send(&mut self, req: Request) {
-        match ipc::request(&req) {
-            Ok(Response::Error { message }) => self.status_line = Some(message),
-            Ok(Response::Saved { path }) => self.status_line = Some(format!("Saved to {path}")),
-            Ok(_) => self.status_line = None,
-            Err(e) => {
-                self.disconnected = true;
-                self.status_line = Some(format!("{e:#}"));
-            }
+        let reply = ipc::request(&req);
+        // Only ever set here, never cleared: the poll that follows is what
+        // decides the socket is back.
+        if reply.is_err() {
+            self.disconnected = true;
         }
+        self.status_line = status_for(&reply);
         self.poll();
+    }
+}
+
+/// Whether a status line reports something that worked or something that did
+/// not.
+///
+/// The line was painted green whatever it said, so a daemon error read as a
+/// success. That matters most for streaming: the likeliest way choosing a file
+/// fails is choosing one that cannot be opened, and the refusal arrives as an
+/// ordinary `Response::Error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Severity {
+    Ok,
+    Error,
+}
+
+impl Severity {
+    fn colour(self) -> egui::Color32 {
+        match self {
+            Severity::Ok => theme::palette::SUCCESS,
+            Severity::Error => theme::palette::DANGER,
+        }
+    }
+}
+
+/// What a reply leaves on the status line, and in what colour.
+///
+/// `None` clears it. An acknowledgement has nothing to say, and a message left
+/// over from the last command reads as the answer to this one.
+fn status_for(reply: &Result<Response>) -> Option<(Severity, String)> {
+    match reply {
+        Ok(Response::Error { message }) => Some((Severity::Error, message.clone())),
+        Ok(Response::Saved { path }) => Some((Severity::Ok, format!("Saved to {path}"))),
+        Ok(_) => None,
+        Err(e) => Some((Severity::Error, format!("{e:#}"))),
     }
 }
 
@@ -634,8 +669,8 @@ impl eframe::App for App {
         if let Some(e) = &self.list_error {
             ui.colored_label(theme::palette::DANGER, e);
         }
-        if let Some(s) = &self.status_line {
-            ui.colored_label(theme::palette::SUCCESS, s);
+        if let Some((severity, s)) = &self.status_line {
+            ui.colored_label(severity.colour(), s);
         }
 
         ctx.request_repaint_after(POLL_INTERVAL);
@@ -674,10 +709,15 @@ impl App {
             if (submitted || apply) && !running {
                 match self.apply_server() {
                     Ok(()) => {
-                        self.status_line = Some(format!("Server set to {}", self.config.url));
+                        self.status_line = Some((
+                            Severity::Ok,
+                            format!("Server set to {}", self.config.url),
+                        ));
                         self.editing_url = false;
                     }
-                    Err(e) => self.status_line = Some(format!("{e:#}")),
+                    Err(e) => {
+                        self.status_line = Some((Severity::Error, format!("{e:#}")))
+                    }
                 }
             }
         });
@@ -1155,14 +1195,16 @@ impl App {
             if ui.button(label).on_hover_text(hover).clicked() {
                 if streaming {
                     action = Some(Request::SetStreamFile { path: None });
-                    self.status_line = Some("Stopped streaming to file".into());
+                    self.status_line =
+                        Some((Severity::Ok, "Stopped streaming to file".into()));
                 } else if let Some(p) = rfd::FileDialog::new()
                     .set_file_name(save::filename_for(&save::timestamp()))
                     .set_directory(save::default_dir())
                     .save_file()
                 {
                     let path = p.display().to_string();
-                    self.status_line = Some(format!("Appending to {path}"));
+                    self.status_line =
+                        Some((Severity::Ok, format!("Appending to {path}")));
                     action = Some(Request::SetStreamFile { path: Some(path) });
                 }
             }
@@ -1335,6 +1377,48 @@ mod tests {
     fn an_address_without_a_scheme_is_refused() {
         assert!(normalise_server("192.168.1.10").is_err());
         assert!(normalise_server("dictate.example.com").is_err());
+    }
+
+    #[test]
+    fn a_failure_is_not_reported_in_the_colour_of_success() {
+        // The status line was painted green whatever it said. The likeliest
+        // way this window fails is a stream target that cannot be opened, and
+        // that was reported in the colour that means it worked.
+        let (severity, text) = status_for(&Ok(Response::Error {
+            message: "opening /mnt/gone/notes.txt to append: No such file".into(),
+        }))
+        .expect("an error has to reach the window");
+        assert_eq!(severity, Severity::Error);
+        assert_eq!(severity.colour(), theme::palette::DANGER);
+        assert!(text.contains("No such file"), "{text}");
+    }
+
+    #[test]
+    fn a_lost_daemon_is_a_failure_too() {
+        // A transport failure took the same green path as a save.
+        let (severity, text) =
+            status_for(&Err(anyhow::anyhow!("the daemon is not listening")))
+                .expect("a dropped socket has to reach the window");
+        assert_eq!(severity, Severity::Error);
+        assert!(text.contains("not listening"), "{text}");
+    }
+
+    #[test]
+    fn a_completed_save_stays_green() {
+        let (severity, text) = status_for(&Ok(Response::Saved {
+            path: "/tmp/a.txt".into(),
+        }))
+        .expect("a save says where it went");
+        assert_eq!(severity, Severity::Ok);
+        assert_eq!(severity.colour(), theme::palette::SUCCESS);
+        assert!(text.contains("/tmp/a.txt"), "{text}");
+    }
+
+    #[test]
+    fn a_bare_acknowledgement_clears_the_line() {
+        // Otherwise the last message stays up and reads as the answer to
+        // whichever button was pressed next.
+        assert!(status_for(&Ok(Response::Ok)).is_none());
     }
 
     #[test]
