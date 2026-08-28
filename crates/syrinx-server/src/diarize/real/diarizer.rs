@@ -712,19 +712,31 @@ impl RealDiarizer {
     /// Whether the voice in `embedding` is a different one from the hop held
     /// across the silence before it.
     ///
-    /// Three ways to answer yes, and each is a reason the seam has to stand.
+    /// Four ways to answer yes, and each is a reason the seam has to stand.
     /// Comparison may be switched off, at `diarize_change_threshold = 0`,
     /// where no cosine between hops is allowed to decide anything and the
     /// reach of a correction is a decision. There may be no earlier hop to
     /// compare against, which is the opening of a session and the case the
-    /// seam was invented for. Or the two may genuinely differ, at the stricter
-    /// bar a comparison across silence is held to.
+    /// seam was invented for. The comparison may not be answerable at all. Or
+    /// the two may genuinely differ, at the stricter bar a comparison across
+    /// silence is held to.
     fn voice_changed_across_the_gap(&self, embedding: &[f32]) -> bool {
         self.change_threshold <= 0.0
-            || self
-                .previous_hop
-                .as_ref()
-                .is_none_or(|before| cosine(before, embedding) < self.gap_change_threshold)
+            || self.previous_hop.as_ref().is_none_or(|before| {
+                let cos = cosine(before, embedding);
+                // Checked here rather than inferred from `real::embed`
+                // refusing non-finite vectors two modules away. `cosine` is a
+                // bare dot product, so a NaN reaching it makes `cos <
+                // threshold` *false* -- "same voice, discard the seam", which
+                // is the unsafe direction and the opposite of every other
+                // default in this file. A comparison that cannot be made has
+                // answered nothing, and nothing is what a seam is for.
+                //
+                // Not a panic: a session's contract with a failing model is to
+                // stop labelling, not to take the process down, and `Fuse`
+                // already owns that decision.
+                !cos.is_finite() || cos < self.gap_change_threshold
+            })
     }
 
     /// A hop: the turn-change test, then a provisional label if there is
@@ -1771,6 +1783,27 @@ mod tests {
         let mut out = Attribution::default();
         d.hop(axis(1), 13, &mut out);
         assert_eq!(d.correctable_since, Some(13));
+    }
+
+    #[test]
+    fn a_comparison_that_cannot_be_made_commits_the_seam() {
+        // `cosine` is a bare dot product, so a non-finite embedding makes
+        // `cos < threshold` false -- "same voice, discard the seam", which is
+        // the unsafe direction. `real::embed` refuses non-finite vectors, so
+        // this is an invariant two modules away being asserted where it is
+        // relied on rather than a case that arises.
+        let mut d = headless(DiarizeTuning::default());
+        let mut out = Attribution::default();
+        d.hop(vec![f32::NAN; 4], 3, &mut out);
+        d.gap = Gap::Pending(10);
+
+        let mut out = Attribution::default();
+        d.hop(axis(0), 13, &mut out);
+        assert_eq!(
+            d.correctable_since,
+            Some(13),
+            "a comparison that answered NaN was read as \"the same person\""
+        );
     }
 
     #[test]
