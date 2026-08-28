@@ -140,10 +140,42 @@ reads lines, not paragraphs. `plain` is prose and names the speaker once,
 where the turn starts, because repeating it every time somebody drew breath
 would wreck the reading.
 
-The one thing no format can attribute is the start of a session, before any
-voice has been given a number. Those lines arrive bare and stay that way: the
-streamed file is written as it is spoken, so the first label to arrive is
-never applied backwards over what is already on disk.
+The start of a session is the hard case, because a voice has to be heard for
+several seconds before it can be given a number, and the words are on screen
+long before that. When the name arrives the server sends a correction, and the
+lines that had none acquire it — on screen, and in whatever **Save as…**
+writes.
+
+A correction can also change a name that was already there. In a crowded room
+the diarizer will sometimes name a turn early, from three quarters of a second
+of audio, and mark that name as a guess; when a full window disagrees, the
+line changes from **Speaker 2:** to **Speaker 1:** in front of you. Only a
+guess moves. A name a full window settled on is never rewritten by a
+correction, and no speaker is ever renumbered — Speaker 2 does not become
+Speaker 3 halfway down the page.
+
+**A file written by `stream_to` never gets that correction**, and the
+difference is deliberate rather than an oversight. That file is written as the
+words are spoken and flushed sentence by sentence, so that a crash at minute
+forty costs the last line and not the meeting; nothing can be taken back out
+of it afterwards. It therefore keeps the honest record of what was known live,
+with the opening lines bare, while the saved file and the screen carry the
+corrected attribution. If you want one file with the corrections in it, use
+**Save as…** at the end; if you want one that survives the machine going away,
+use `stream_to`; there is no reason not to use both.
+
+Corrections can be switched off entirely, if text acquiring or changing a
+speaker's name a few seconds after it appears reads worse to you than a gap.
+This one is a **server** setting, in the server's config file rather than the
+client's — the corrections are the server's to send:
+
+```toml
+diarize_relabel_window = 0   # seconds of transcript still open to correction
+```
+
+Neither config rejects a key it does not know, so a server setting written
+into the client's file is silently ignored, and vice versa. Nothing will tell
+you; the behaviour simply will not change.
 
 ### Asking is not receiving
 
@@ -170,7 +202,11 @@ say why, because nothing went wrong. `transcribe` is the mode that asks.
 The labels are stable, which is the property that matters: over an 87-minute
 meeting every speaker kept the label they started with — no renumbering, no
 drift. A transcript whose Speaker 3 stops meaning the same person halfway
-down is worse than one with no labels at all.
+down is worse than one with no labels at all. That guarantee is about the
+*numbers*: once a stretch of text is confidently somebody's, it stays theirs,
+and nobody is renumbered. Text that was unattributed, or attributed as a
+guess, can still change hands afterwards — see the correction above — which
+is the one place a label you have already read may move.
 
 Short interjections arrive unlabelled, and that is the design rather than a
 gap in it. When the diarizer has not heard enough of a voice to be sure, it
@@ -186,8 +222,11 @@ Both of those numbers are settings, in case your meetings disagree with the
 recordings they were measured on:
 
 ```toml
-diarize_lag_chunks = 2    # chunks a commit waits for its label
-diarize_min_pool = 4      # agreeing windows before a new speaker is minted
+diarize_lag_chunks = 2          # chunks a commit waits for its label
+diarize_min_pool = 4            # agreeing windows before a new speaker is minted
+diarize_margin = 0.10           # how far the best voice must beat the second
+diarize_change_threshold = 0.30 # how much the voice must change to end a turn
+diarize_relabel_window = 30     # seconds of transcript still open to correction
 ```
 
 Dropping the lag to 1 hands text over half a second sooner and pays for it at
@@ -196,8 +235,32 @@ the wait off altogether. Dropping the pool to 3 gives a quiet participant a
 number three quarters of a second earlier, and risks the split this whole
 design is arranged to avoid — on the 87-minute meeting a pool of 3 found six
 speakers in a room of five, and a pool of 2 found twenty in a room of four.
-Both keys are optional, both are refused at startup if they are wildly out of
-range, and neither is environment-overridable, for the same reason
+The three below them are newer and, unlike the two above, are **engineering
+estimates rather than measurements** — they were chosen by reasoning from the
+numbers the AMI recordings gave and have not themselves been measured against
+a meeting.
+
+`diarize_margin` is how much clearer the best-matching voice has to be than
+the runner-up before the diarizer will commit to a name. Raising it does not
+make labels disappear: a voice it will not commit to is still named, as a
+guess a later correction may change. Setting it to **0** is the full retreat
+to the behaviour of every release before this one — it turns off the margin,
+the crowded-room test that goes with it, and the extra caution before a new
+speaker is minted, all three together, because it is no use as an escape hatch
+if any of them keeps running.
+
+`diarize_change_threshold` is how much the voice has to change between one
+three-quarter-second stretch and the next before the diarizer calls it a new
+turn; **0** never does. Turns shorter than about three quarters of a second of
+speech are not detected as turns whatever it is set to, which is what keeps
+the diarizer from cutting its own analysis window so often that it never
+finishes one.
+
+`diarize_relabel_window` is how far back a correction may reach, and 0 sends
+none.
+
+All five keys are optional, all five are refused at startup if they are wildly
+out of range, and none is environment-overridable, for the same reason
 `diarize_model_dir` is not.
 
 What has *not* been measured is the caveat worth carrying. No split (one

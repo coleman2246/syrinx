@@ -5,10 +5,10 @@
 //! plain function calls, with no socket and no GPU.
 
 use crate::asr::{AsrBackend, AsrStream};
-use crate::diarize::Diarizer;
+use crate::diarize::{Diarizer, Relabel};
 use anyhow::Result;
 use std::collections::VecDeque;
-use syrinx_proto::{Mode, ServerMessage};
+use syrinx_proto::{Mode, SAMPLE_RATE, ServerMessage};
 
 /// How many chunks a commit is held so its speaker label can settle. The
 /// diarizer needs more audio context than the transducer does; calibrated by
@@ -26,11 +26,102 @@ pub const LAG_CHUNKS: usize = 2;
 /// session that must keep transcribing.
 const MAX_DIARIZER_STRIKES: u32 = 5;
 
+/// Seconds of already-emitted transcript that stay eligible for a speaker
+/// correction.
+///
+/// A voice needs four agreeing 1.5 s windows before it is minted, which is
+/// roughly 3.7 s of speech, and the text of those seconds has already been
+/// committed by then -- unlabelled, and until now unlabellable forever. The
+/// session keeps a ring of what it emitted over this many seconds so that
+/// `transcript.relabel` can fill those gaps when the name finally arrives.
+///
+/// 30 s covers the mint delay many times over, which is deliberate: the case
+/// it is really sized for is a quiet participant whose first few sentences are
+/// spread across half a minute before four windows of them agree.
+///
+/// `pub` because it is the default of the `diarize_relabel_window` config key,
+/// which reads it here rather than repeating the number next to a copy of this
+/// paragraph. **An engineering estimate, not a measurement.**
+pub const RELABEL_WINDOW: u64 = 30;
+
+/// The session-level diarization settings a deployment can change.
+///
+/// Two fields rather than two arguments because both are read once, at
+/// construction, and a caller that swapped them would compile: they are both
+/// small counts, and both are about how long text waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionTuning {
+    /// `diarize_lag_chunks`: how many chunks a commit is held so its label can
+    /// settle.
+    pub lag_chunks: usize,
+    /// `diarize_relabel_window`: seconds of emitted transcript still eligible
+    /// for a speaker correction. 0 turns corrections off.
+    pub relabel_window: u64,
+}
+
+impl Default for SessionTuning {
+    /// The calibrated and estimated values, read from where each one's
+    /// justification lives rather than repeated here.
+    fn default() -> Self {
+        Self {
+            lag_chunks: LAG_CHUNKS,
+            relabel_window: RELABEL_WINDOW,
+        }
+    }
+}
+
 /// Text waiting for its speaker label to settle.
+///
+/// The span is both ends, and the two are separately load-bearing. `to_chunk`
+/// is where the label is voted from, because that is where the audio ends and
+/// the lag window follows it. `from_chunk` is where the *words* start, which
+/// is what a later correction has to be matched against -- a transducer emits
+/// nothing for several chunks and then a sentence covering all of them, so the
+/// two are routinely far apart.
 struct HeldCommit {
     text: String,
+    /// Index of the first chunk that contributed audio to this text.
+    from_chunk: u64,
     /// Index of the last chunk that contributed audio to this text.
+    to_chunk: u64,
+}
+
+/// What the diarizer said about one chunk.
+struct ChunkLabel {
     chunk: u64,
+    speaker: Option<u32>,
+    /// Whether `speaker` is a guess rather than an answer the diarizer will
+    /// stand behind -- a hop naming a turn early, or a window no centroid stood
+    /// out clearly enough for. A commit voted entirely out of guesses is one a
+    /// later window may correct; one a window settled is not.
+    provisional: bool,
+    /// Whether the voice changed at this chunk. The vote stops here.
+    boundary: bool,
+}
+
+/// A commit already on the wire, and what it would take to correct its
+/// speaker.
+///
+/// Held in a bounded ring covering `relabel_window` seconds, because a
+/// speaker's first sentences are committed before four windows have agreed
+/// that they are anybody -- and until `transcript.relabel` existed, that
+/// attribution was lost for good.
+struct Emitted {
+    seq: u64,
+    /// The chunk range this commit's **text** came from, so an incoming
+    /// correction can tell whether it covers these words.
+    ///
+    /// Not the range the label was voted over, which is a different span and
+    /// wrong in both directions. The vote runs from the text's last chunk
+    /// forward into the lag window, so it starts where the words end and
+    /// reaches `lag_chunks` into whoever spoke next: matched against that, a
+    /// correction naming the next speaker's chunks overlaps a commit made
+    /// entirely of the previous speaker's words, while one naming the chunks
+    /// those words came from misses it.
+    from_chunk: u64,
+    to_chunk: u64,
+    speaker: Option<u32>,
+    provisional: bool,
 }
 
 pub struct Session {
@@ -43,14 +134,21 @@ pub struct Session {
     diarizer: Option<Box<dyn Diarizer>>,
     strikes: u32,
     chunks_seen: u64,
-    /// One label per chunk seen, tagged with its chunk index. Bounded: labels
-    /// no held commit can still consult are dropped as commits leave.
-    chunk_labels: VecDeque<(u64, Option<u32>)>,
+    /// First chunk whose audio has not yet come out as text. What a commit's
+    /// span starts at, since the transducer says nothing for several chunks
+    /// and then emits the sentence they all contributed to.
+    text_since: u64,
+    /// What the diarizer said about each chunk seen. Bounded: labels no held
+    /// commit can still consult are dropped as commits leave.
+    chunk_labels: VecDeque<ChunkLabel>,
     held: VecDeque<HeldCommit>,
-    /// This session's lag depth, in chunks. Held rather than read from
-    /// [`LAG_CHUNKS`] so a deployment can tune it; every session built by
-    /// [`Session::new`] carries exactly that constant.
-    lag_chunks: usize,
+    /// Commits already sent whose speaker may still be corrected. Bounded by
+    /// `tuning.relabel_window`, and empty for good when that is 0.
+    emitted: VecDeque<Emitted>,
+    /// This session's diarization settings. Held rather than read from the
+    /// constants so a deployment can tune them; every session built by
+    /// [`Session::new`] carries exactly [`SessionTuning::default`].
+    tuning: SessionTuning,
 }
 
 impl Session {
@@ -69,24 +167,33 @@ impl Session {
         session_id: String,
         diarizer: Option<Box<dyn Diarizer>>,
     ) -> Self {
-        Self::with_lag(mode, backend, session_id, diarizer, LAG_CHUNKS)
+        Self::with_tuning(
+            mode,
+            backend,
+            session_id,
+            diarizer,
+            SessionTuning::default(),
+        )
     }
 
-    /// The same, at a configured lag depth -- the server's
-    /// `diarize_lag_chunks`, whose default is [`LAG_CHUNKS`]. `new` delegates
-    /// here, so the depth reaches the field from one place rather than two.
+    /// The same, at configured settings -- the server's `diarize_lag_chunks`
+    /// and `diarize_relabel_window`. `new` delegates here, so they reach the
+    /// fields from one place rather than two.
     ///
-    /// `lag_chunks` is only consulted while a diarizer is alive, so a session
-    /// without one is unaffected by any value. A depth of 0 releases every
-    /// commit in the call that produced its text, labelled from that chunk
-    /// alone: the fastest setting, and the one that leaves the most turn
-    /// starts attributed to whoever was speaking before.
-    pub fn with_lag(
+    /// Neither is consulted without a diarizer, so a session that never asked
+    /// for labels is unaffected by any value. A lag of 0 releases every commit
+    /// in the call that produced its text, labelled from that chunk alone: the
+    /// fastest setting, and the one that leaves the most turn starts
+    /// attributed to whoever was speaking before. A relabel window of 0 sends
+    /// no corrections, which leaves the opening of a meeting permanently
+    /// unattributed -- honest, and what the server did before corrections
+    /// existed.
+    pub fn with_tuning(
         mode: Mode,
         backend: &dyn AsrBackend,
         session_id: String,
         diarizer: Option<Box<dyn Diarizer>>,
-        lag_chunks: usize,
+        tuning: SessionTuning,
     ) -> Self {
         Self {
             mode,
@@ -98,9 +205,11 @@ impl Session {
             diarizer,
             strikes: 0,
             chunks_seen: 0,
+            text_since: 0,
             chunk_labels: VecDeque::new(),
             held: VecDeque::new(),
-            lag_chunks,
+            emitted: VecDeque::new(),
+            tuning,
         }
     }
 
@@ -136,10 +245,16 @@ impl Session {
         }
         let tail = self.stream.finish()?;
         if !tail.is_empty() {
-            // Whatever the model was still holding belongs to the last chunk
-            // that went into it.
-            let chunk = self.chunks_seen.saturating_sub(1);
-            self.held.push_back(HeldCommit { text: tail, chunk });
+            // Whatever the model was still holding belongs to the chunks since
+            // the last commit, ending at the last chunk that went in. A tail
+            // with no chunks behind it at all clamps to chunk 0, which is
+            // where the arithmetic has nowhere below to go.
+            let to_chunk = self.chunks_seen.saturating_sub(1);
+            self.held.push_back(HeldCommit {
+                text: tail,
+                from_chunk: self.text_since.min(to_chunk),
+                to_chunk,
+            });
         }
         // The session is over, so no label will settle any further. Flushing
         // unconditionally -- including when there was no partial chunk to push
@@ -154,30 +269,46 @@ impl Session {
     /// any commit ending at chunk N can be released, or the commit would be
     /// labelled from a window with a hole in it.
     fn consume_chunk(&mut self, chunk: &[f32]) -> Result<Vec<ServerMessage>> {
-        let label = self.label(chunk);
-        self.chunk_labels.push_back((self.chunks_seen, label));
+        let heard = self.label(chunk);
+        self.chunk_labels.push_back(ChunkLabel {
+            chunk: self.chunks_seen,
+            speaker: heard.speaker,
+            provisional: heard.provisional,
+            boundary: heard.boundary,
+        });
         self.chunks_seen += 1;
+
+        // Corrections go out before this chunk's own text, so a client sees a
+        // commit's speaker fixed before the next commit arrives rather than
+        // after it -- and so `seq` still only ever counts upwards.
+        let mut out = self.apply_relabels(&heard.relabels);
 
         let text = self.stream.push(chunk)?;
         if !text.is_empty() {
+            let to_chunk = self.chunks_seen - 1;
             self.held.push_back(HeldCommit {
                 text,
-                chunk: self.chunks_seen - 1,
+                from_chunk: self.text_since,
+                to_chunk,
             });
+            self.text_since = to_chunk + 1;
         }
-        Ok(self.release_ripe())
+        out.extend(self.release_ripe());
+        Ok(out)
     }
 
     /// Ask the diarizer who is speaking, or give up on it.
     ///
-    /// Only errors are strikes: `Ok(None)` is honest uncertainty and says
-    /// nothing about the diarizer's health.
-    fn label(&mut self, chunk: &[f32]) -> Option<u32> {
-        let d = self.diarizer.as_mut()?;
+    /// Only errors are strikes: an `Attribution` with no speaker in it is
+    /// honest uncertainty and says nothing about the diarizer's health.
+    fn label(&mut self, chunk: &[f32]) -> crate::diarize::Attribution {
+        let Some(d) = self.diarizer.as_mut() else {
+            return crate::diarize::Attribution::default();
+        };
         match d.push(chunk) {
-            Ok(l) => {
+            Ok(a) => {
                 self.strikes = 0;
-                l
+                a
             }
             Err(e) => {
                 self.strikes += 1;
@@ -191,8 +322,91 @@ impl Session {
                     tracing::warn!("dropping the diarizer; the session continues unlabelled");
                     self.diarizer = None;
                 }
-                None
+                crate::diarize::Attribution::default()
             }
+        }
+    }
+
+    /// Turn the diarizer's corrections into `transcript.relabel` messages.
+    ///
+    /// Three rules, and all three are about *not* rewriting history:
+    ///
+    /// - only commits still inside the relabel window are eligible, so text
+    ///   the reader has scrolled past does not move under them;
+    /// - only a commit with no speaker, or one carrying a guess this
+    ///   contradicts, is touched. A label a full window settled stands. That
+    ///   is a real guard but not a sufficient one, and it is worth being
+    ///   precise about which half of the job it does: it stops a correction
+    ///   overwriting somebody else's *settled* sentence, and it says nothing
+    ///   about an unattributed one. What keeps a correction off text that was
+    ///   never labelled at all is the diarizer bounding the range it asks
+    ///   for -- see `real::RealDiarizer`'s notes on provenance;
+    /// - a speaker is never renumbered. This names an existing speaker for
+    ///   text that had none, and nothing else.
+    ///
+    /// Contiguous runs of `seq` are coalesced into one message, because that
+    /// is the shape the correction really has -- a stretch of one person
+    /// talking -- and because a client applying it to a range is doing one
+    /// pass rather than one per commit.
+    fn apply_relabels(&mut self, relabels: &[Relabel]) -> Vec<ServerMessage> {
+        // Pruned here rather than as commits leave, so the window is measured
+        // from the chunk the correction arrived on. Pruning on the way out
+        // instead would measure it from the last chunk that produced text,
+        // which in a quiet meeting is an arbitrary distance behind.
+        self.forget_frozen_commits();
+        let mut out = Vec::new();
+        if self.tuning.relabel_window == 0 {
+            return out;
+        }
+        for r in relabels {
+            let mut run: Option<(u64, u64)> = None;
+            for e in self.emitted.iter_mut() {
+                let overlaps = e.from_chunk <= r.to_chunk && e.to_chunk >= r.from_chunk;
+                let correctable =
+                    e.speaker.is_none() || (e.provisional && e.speaker != Some(r.speaker));
+                if overlaps && correctable {
+                    e.speaker = Some(r.speaker);
+                    e.provisional = false;
+                    run = match run {
+                        Some((from, to)) if to + 1 == e.seq => Some((from, e.seq)),
+                        Some((from, to)) => {
+                            out.push(ServerMessage::TranscriptRelabel {
+                                from_seq: from,
+                                to_seq: to,
+                                speaker: r.speaker,
+                            });
+                            Some((e.seq, e.seq))
+                        }
+                        None => Some((e.seq, e.seq)),
+                    };
+                }
+            }
+            if let Some((from, to)) = run {
+                out.push(ServerMessage::TranscriptRelabel {
+                    from_seq: from,
+                    to_seq: to,
+                    speaker: r.speaker,
+                });
+            }
+        }
+        out
+    }
+
+    /// Drop commits too old to be corrected.
+    ///
+    /// Measured in chunks, from the seconds the config names: a chunk is
+    /// `chunk_samples` at 16 kHz, and rounding up means the window is never
+    /// shorter than what was asked for.
+    fn forget_frozen_commits(&mut self) {
+        if self.tuning.relabel_window == 0 {
+            self.emitted.clear();
+            return;
+        }
+        let per_chunk = self.chunk_samples.max(1) as f64 / SAMPLE_RATE as f64;
+        let span = (self.tuning.relabel_window as f64 / per_chunk).ceil() as u64;
+        let floor = self.chunks_seen.saturating_sub(span);
+        while self.emitted.front().is_some_and(|e| e.to_chunk < floor) {
+            self.emitted.pop_front();
         }
     }
 
@@ -213,12 +427,15 @@ impl Session {
         let mut out = Vec::new();
         let lag = self.lag();
         while let Some(h) = self.held.front() {
-            if !force && self.chunks_seen < h.chunk + lag + 1 {
+            if !force && self.chunks_seen < h.to_chunk + lag + 1 {
                 break;
             }
             let h = self.held.pop_front().expect("front was Some");
-            let speaker = self.majority_label(h.chunk, h.chunk + lag);
-            out.push(self.emit(h.text, speaker));
+            // Voted from where the audio ends, forward through the lag window,
+            // which is the depth the spike calibrated. Recorded against where
+            // the *words* are, which is a different question.
+            let (speaker, provisional) = self.majority_label(h.to_chunk, h.to_chunk + lag);
+            out.push(self.emit(h.text, speaker, h.from_chunk, h.to_chunk, provisional));
         }
         self.forget_spent_labels();
         out
@@ -229,7 +446,7 @@ impl Session {
     /// for a label that is never coming.
     fn lag(&self) -> u64 {
         if self.diarizer.is_some() {
-            self.lag_chunks as u64
+            self.tuning.lag_chunks as u64
         } else {
             0
         }
@@ -243,31 +460,53 @@ impl Session {
         let floor = self
             .held
             .front()
-            .map_or_else(|| self.chunks_seen.saturating_sub(1), |h| h.chunk);
-        while self.chunk_labels.front().is_some_and(|(c, _)| *c < floor) {
+            .map_or_else(|| self.chunks_seen.saturating_sub(1), |h| h.to_chunk);
+        while self.chunk_labels.front().is_some_and(|l| l.chunk < floor) {
             self.chunk_labels.pop_front();
         }
     }
 
-    /// Most frequent Some-label across `[from, to]`; earlier chunks win ties,
-    /// because that is where the words actually live. None when nothing is
-    /// known -- a gap, never a guess.
-    fn majority_label(&self, from: u64, to: u64) -> Option<u32> {
-        let mut counts: Vec<(u32, usize, u64)> = Vec::new(); // (label, count, first seen)
-        for (c, l) in &self.chunk_labels {
-            if (*c >= from && *c <= to)
-                && let Some(l) = l
-            {
-                match counts.iter_mut().find(|(k, _, _)| k == l) {
-                    Some((_, n, _)) => *n += 1,
-                    None => counts.push((*l, 1, *c)),
+    /// Most frequent Some-label across `[from, to]`, and whether it was voted
+    /// entirely out of provisional guesses. Earlier chunks win ties, because
+    /// that is where the words actually live. None when nothing is known -- a
+    /// gap, never a guess.
+    ///
+    /// **The vote stops at a turn change.** It used to run to `to`
+    /// unconditionally, and both halves of that were wrong at a boundary: the
+    /// window reaches into the next speaker's chunks, so the outgoing
+    /// speaker's own words can be outvoted by the person who interrupted them,
+    /// and the tie-break towards the earliest label hands a tie to whoever was
+    /// there first, which at a boundary is the outgoing speaker by
+    /// construction. Clipping fixes both at once, because both are the same
+    /// mistake: a vote that spans two turns is not a vote about either of
+    /// them. The tie-break is kept, and now means what it says -- earliest
+    /// *within this turn*.
+    ///
+    /// A boundary at `from` does not clip, because that is where this turn
+    /// starts rather than where it ends.
+    fn majority_label(&self, from: u64, to: u64) -> (Option<u32>, bool) {
+        // (label, count, first seen, provisional votes)
+        let mut counts: Vec<(u32, usize, u64, usize)> = Vec::new();
+        for l in &self.chunk_labels {
+            if l.chunk < from || l.chunk > to {
+                continue;
+            }
+            if l.boundary && l.chunk > from {
+                break;
+            }
+            let Some(speaker) = l.speaker else { continue };
+            match counts.iter_mut().find(|(k, _, _, _)| *k == speaker) {
+                Some((_, n, _, p)) => {
+                    *n += 1;
+                    *p += usize::from(l.provisional);
                 }
+                None => counts.push((speaker, 1, l.chunk, usize::from(l.provisional))),
             }
         }
         counts
             .into_iter()
             .max_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)))
-            .map(|(l, _, _)| l)
+            .map_or((None, false), |(l, n, _, p)| (Some(l), p == n))
     }
 
     /// All transcript emission funnels through here.
@@ -277,12 +516,39 @@ impl Session {
     /// point, gated on [`Mode::allows_revision`]. Routing every emission through
     /// one function is what makes the live-mode guarantee enforceable in a
     /// single place rather than at every call site.
-    fn emit(&mut self, text: String, speaker: Option<u32>) -> ServerMessage {
+    ///
+    /// It is also where a commit is recorded as correctable, against the chunk
+    /// range its **text** came from -- see [`Emitted`] for why that is not the
+    /// range its label was voted over.
+    fn emit(
+        &mut self,
+        text: String,
+        speaker: Option<u32>,
+        from_chunk: u64,
+        to_chunk: u64,
+        provisional: bool,
+    ) -> ServerMessage {
         self.seq += 1;
+        // Only a labelling session can ever be corrected, so a live-mode
+        // session keeps no ring at all rather than a bounded one it will
+        // never consult.
+        if self.tuning.relabel_window > 0 && self.diarizer.is_some() {
+            self.emitted.push_back(Emitted {
+                seq: self.seq,
+                from_chunk,
+                to_chunk,
+                speaker,
+                provisional,
+            });
+        }
         ServerMessage::TranscriptCommit {
             seq: self.seq,
             text,
             speaker,
+            // Carried to the client rather than kept here, because the promise
+            // `transcript.relabel` makes is about what a client may repaint,
+            // and only the client knows what it is holding.
+            speaker_provisional: provisional,
         }
     }
 }

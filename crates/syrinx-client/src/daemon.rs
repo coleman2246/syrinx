@@ -1257,10 +1257,21 @@ mod tests {
 
     fn seg(at: f64, text: &str, speaker: Option<u32>, source: Option<&str>) -> Segment {
         Segment {
+            seq: None,
+            speaker_provisional: false,
             at,
             text: text.into(),
             source: source.map(Into::into),
             speaker,
+        }
+    }
+
+    /// A segment that came from a known commit, for the correction tests.
+    fn seg_seq(at: f64, text: &str, speaker: Option<u32>, seq: u64) -> Segment {
+        Segment {
+            seq: Some(seq),
+            speaker_provisional: false,
+            ..seg(at, text, speaker, None)
         }
     }
 
@@ -1534,6 +1545,41 @@ mod tests {
             ]
         );
         assert_eq!(p.turns, save::turn_texts(&d.last.segments));
+    }
+
+    #[test]
+    fn a_relabel_reaches_the_viewer_as_a_fresh_set_of_turns() {
+        // How a correction becomes something on screen, with no code in the
+        // viewer that knows what a correction is. The GUI renders the turns
+        // the daemon publishes; the daemon recomputes them when a session's
+        // `changes` counter moves; and `session::apply_relabel` moves it. So
+        // the whole client-side path is: correct the segments, and everything
+        // that renders from them follows.
+        //
+        // Driven through `refresh_text` directly, because the counter it keys
+        // on lives in a running session and a test has no socket to give one.
+        let mut d = daemon_holding(SessionState {
+            transcript: "hello there".into(),
+            segments: vec![
+                seg_seq(0.0, "hello ", None, 1),
+                seg_seq(0.6, "there", Some(1), 2),
+            ],
+            ..Default::default()
+        });
+        d.refresh_text(2);
+        assert_eq!(
+            d.text.turns,
+            vec![(None, "hello ".to_string()), (Some(1), "there".to_string())],
+            "the opening fragment arrived before anybody had a number"
+        );
+        let first = d.text.revision;
+
+        // The correction names the opening fragment, and the two fragments
+        // become one turn under one heading.
+        assert!(crate::session::apply_relabel(&mut d.last.segments, 1, 1, 1));
+        d.refresh_text(3);
+        assert_ne!(d.text.revision, first, "the viewer was never told");
+        assert_eq!(d.text.turns, vec![(Some(1), "hello there".to_string())]);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub struct MockBackend {
     script: Arc<Vec<String>>,
     chunk_samples: usize,
+    chunks_per_word: usize,
     tail: Option<String>,
 }
 
@@ -19,6 +20,7 @@ impl MockBackend {
         Self {
             script: Arc::new(words.iter().map(|s| s.to_string()).collect()),
             chunk_samples: 8960,
+            chunks_per_word: 1,
             tail: None,
         }
     }
@@ -26,6 +28,19 @@ impl MockBackend {
     /// Smaller chunks keep tests fast and readable.
     pub fn with_chunk_samples(mut self, n: usize) -> Self {
         self.chunk_samples = n;
+        self
+    }
+
+    /// Emit a word every `n` chunks rather than every chunk, so a commit's
+    /// text spans several chunks of audio.
+    ///
+    /// The shape a real transducer has and the default does not: it says
+    /// nothing for a while and then emits a phrase covering everything it has
+    /// heard since. One word per chunk collapses a commit's first and last
+    /// chunk onto each other, which hides every question about which chunks a
+    /// commit's words actually came from.
+    pub fn with_chunks_per_word(mut self, n: usize) -> Self {
+        self.chunks_per_word = n.max(1);
         self
     }
 
@@ -43,6 +58,8 @@ impl AsrBackend for MockBackend {
         Box::new(MockStream {
             script: self.script.clone(),
             idx: 0,
+            pushes: 0,
+            chunks_per_word: self.chunks_per_word,
             tail: self.tail.clone(),
         })
     }
@@ -57,11 +74,17 @@ impl AsrBackend for MockBackend {
 pub struct MockStream {
     script: Arc<Vec<String>>,
     idx: usize,
+    pushes: usize,
+    chunks_per_word: usize,
     tail: Option<String>,
 }
 
 impl AsrStream for MockStream {
     fn push(&mut self, _audio: &[f32]) -> Result<String> {
+        self.pushes += 1;
+        if !self.pushes.is_multiple_of(self.chunks_per_word) {
+            return Ok(String::new());
+        }
         match self.script.get(self.idx) {
             Some(w) => {
                 self.idx += 1;
@@ -120,6 +143,28 @@ mod tests {
     fn without_a_scripted_tail_finish_drains_nothing() {
         let mut s = MockBackend::new(&["only"]).stream();
         assert_eq!(s.finish().unwrap(), "");
+    }
+
+    #[test]
+    fn a_word_can_span_several_chunks() {
+        // What a real transducer does, and what a commit's chunk span is
+        // measured against: silence, silence, then the phrase all three
+        // chunks contributed to.
+        let b = MockBackend::new(&["hello", "world"]).with_chunks_per_word(3);
+        let mut s = b.stream();
+        assert_eq!(s.push(&[0.0; 8960]).unwrap(), "");
+        assert_eq!(s.push(&[0.0; 8960]).unwrap(), "");
+        assert_eq!(s.push(&[0.0; 8960]).unwrap(), "hello ");
+        assert_eq!(s.push(&[0.0; 8960]).unwrap(), "");
+        assert_eq!(s.push(&[0.0; 8960]).unwrap(), "");
+        assert_eq!(s.push(&[0.0; 8960]).unwrap(), "world ");
+    }
+
+    #[test]
+    fn one_chunk_per_word_is_the_default() {
+        let b = MockBackend::new(&["hello"]);
+        let mut s = b.stream();
+        assert_eq!(s.push(&[0.0; 8960]).unwrap(), "hello ");
     }
 
     #[test]

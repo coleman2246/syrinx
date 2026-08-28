@@ -16,6 +16,7 @@
 //! | `sweep` | which constants are best, and how sharp is the cliff? |
 //! | `bench` | what does one session cost on one core? |
 //! | `lag` | how long must a chunk wait for a label to exist? |
+//! | `live` | what does a *session* do -- first-label and turn-switch latency? |
 //!
 //! **Models and audio live outside the repository**, in `$DIARIZE_SPIKE_DIR`
 //! (default `~/models/diarize-spike`) -- the directory the spike left behind,
@@ -55,12 +56,14 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 
 use syrinx_server::diarize::cluster::{
-    EMA_ALPHA, MIN_POOL, OnlineClusterer, T_ASSIGN, T_RETIRE, cosine,
+    EMA_ALPHA, MIN_POOL, OnlineClusterer, T_ASSIGN, T_CHANGE, T_MARGIN, T_RETIRE, cosine,
 };
 use syrinx_server::diarize::fbank::SAMPLE_RATE;
 use syrinx_server::diarize::real::{Embedder, Vad, norm_for};
-use syrinx_server::diarize::window::{FRAME, Framed, WINDOW_SAMPLES, WindowAssembler};
+use syrinx_server::diarize::window::{Cut, FRAME, Framed, WINDOW_SAMPLES, WindowAssembler};
+use syrinx_server::session::{LAG_CHUNKS, RELABEL_WINDOW};
 
+mod live;
 mod reference;
 use reference::Reference;
 
@@ -210,7 +213,11 @@ fn agrees_with_the_shipped_assembler(
             first_frame,
             samples: samples[first_frame * FRAME..(first_frame + n) * FRAME].to_vec(),
         };
-        for window in assembler.push(&framed, &voiced[first_frame..first_frame + n]) {
+        for cut in assembler.push(&framed, &voiced[first_frame..first_frame + n]) {
+            // Hops are the harness's blind spot on purpose: it scores whole
+            // files and has no use for a 0.75 s embedding, so this check is
+            // about the windows the numbers were measured on.
+            let Cut::Window(window) = cut else { continue };
             let expected = mine.get(matched).with_context(|| {
                 format!(
                     "the shipped assembler produced window {matched}, the harness \
@@ -556,7 +563,11 @@ fn label_frames(
     let mut clusterer = params.clusterer();
 
     for i in 0..emb.len() {
-        let Some(label) = clusterer.observe(emb.get(i)) else {
+        // `label`, not `settled`: a window the clusterer will not stand behind
+        // still reaches a reader, as a provisional label a later mint may
+        // correct, so scoring only the settled ones would measure a transcript
+        // nobody is shown.
+        let Some(label) = clusterer.observe(emb.get(i)).label() else {
             continue;
         };
         let (t0, t1) = emb.times[i];
@@ -583,10 +594,10 @@ fn label_frames(
     (labels, clusterer)
 }
 
-/// The clusterer's four thresholds, as the sweep varies them.
+/// The clusterer's five thresholds, as the sweep varies them.
 ///
 /// Deliberately not a type in `diarize::cluster`: the server has no
-/// configuration surface here, and the one place these four travel together is
+/// configuration surface here, and the one place these five travel together is
 /// this harness. [`Default`] reads the shipped constants, so a no-flags `run`
 /// is the shipped configuration and there is no second copy of the numbers.
 #[derive(Clone, Copy, Debug)]
@@ -595,6 +606,10 @@ struct Params {
     t_retire: f32,
     alpha: f32,
     min_pool: usize,
+    /// How far the best centroid must beat the second best. 0 is the rule the
+    /// server used before 2026-08-27, which is what makes `--margin 0` the
+    /// before-and-after comparison for every number this harness reports.
+    margin: f32,
 }
 
 impl Default for Params {
@@ -604,13 +619,20 @@ impl Default for Params {
             t_retire: T_RETIRE,
             alpha: EMA_ALPHA,
             min_pool: MIN_POOL,
+            margin: T_MARGIN,
         }
     }
 }
 
 impl Params {
     fn clusterer(&self) -> OnlineClusterer {
-        OnlineClusterer::with_params(self.t_assign, self.t_retire, self.alpha, self.min_pool)
+        OnlineClusterer::with_params(
+            self.t_assign,
+            self.t_retire,
+            self.alpha,
+            self.min_pool,
+            self.margin,
+        )
     }
 }
 
@@ -703,6 +725,11 @@ const MIN_POOL_FLAG: Flag = (
     true,
     "agreeing orphans before a new speaker is minted",
 );
+const MARGIN_FLAG: Flag = (
+    "--margin",
+    true,
+    "how far the best centroid must beat the second; 0 is the pre-2026-08-27 rule",
+);
 const WINDOW_FLAG: Flag = ("--window", true, "window length in seconds");
 const HOP_FLAG: Flag = ("--hop", true, "hop in seconds; 0 means half the window");
 const MODEL_FLAG: Flag = ("--model", true, "embedding model filename, or a path");
@@ -721,6 +748,7 @@ const RUN: Spec = Spec {
         T_RETIRE_FLAG,
         ALPHA_FLAG,
         MIN_POOL_FLAG,
+        MARGIN_FLAG,
         ("--quiet", false, "suppress the per-segment listing"),
     ],
 };
@@ -753,6 +781,7 @@ const SWEEP: Spec = Spec {
         ("--assigns", true, "comma-separated T_assign values"),
         ("--retires", true, "comma-separated T_retire values"),
         ("--alphas", true, "comma-separated EMA alphas"),
+        ("--margins", true, "comma-separated assignment margins"),
     ],
 };
 const BENCH: Spec = Spec {
@@ -765,6 +794,39 @@ const BENCH: Spec = Spec {
         WINDOW_FLAG,
         HOP_FLAG,
         ("--runs", true, "windows to average over"),
+    ],
+};
+const LIVE: Spec = Spec {
+    name: "live",
+    what: "replay a real session and measure the two latencies it is judged on",
+    operand: "<wav>",
+    // No `--model`: this subcommand drives `RealDiarizerFactory`, which
+    // resolves the embedding model from the directory by the server's own
+    // rules -- the calibrated one wins by name whenever it is present. A flag
+    // that was accepted and then ignored would print one model's name beside
+    // another model's numbers, which in the subcommand meant to replace five
+    // unmeasured constants is worse than not offering the choice.
+    flags: &[
+        (
+            "--wav",
+            true,
+            "comma-separated recordings; several are spliced into one larger room",
+        ),
+        ("--chunk", true, "ASR chunk length in seconds"),
+        ("--lag", true, "diarize_lag_chunks"),
+        MIN_POOL_FLAG,
+        MARGIN_FLAG,
+        ("--change", true, "diarize_change_threshold"),
+        (
+            "--relabel-window",
+            true,
+            "diarize_relabel_window, in seconds",
+        ),
+        (
+            "--slice",
+            true,
+            "seconds of each recording per turn when splicing",
+        ),
     ],
 };
 const LAG: Spec = Spec {
@@ -876,6 +938,7 @@ impl Args {
             t_retire: self.num("--t-retire", shipped.t_retire)?,
             alpha: self.num("--alpha", shipped.alpha)?,
             min_pool: self.num("--min-pool", shipped.min_pool as f32)? as usize,
+            margin: self.num("--margin", shipped.margin)?,
         })
     }
     /// Window and hop in seconds; a hop of zero means half the window.
@@ -898,6 +961,7 @@ const SPECS: &[Subcommand] = &[
     (&SWEEP, sweep),
     (&BENCH, bench),
     (&LAG, lag),
+    (&LIVE, live),
 ];
 
 fn usage() -> String {
@@ -1220,9 +1284,12 @@ fn sweep(args: &Args) -> Result<()> {
     )?;
     let retires: Vec<f32> = args.nums("--retires", "0.60,0.70,0.80,0.85")?;
     let alphas: Vec<f32> = args.nums("--alphas", "0.05")?;
+    // 0 is the pre-2026-08-27 rule and the shipped value is 0.10, so the
+    // default grid answers "what did the margin change?" without a flag.
+    let margins: Vec<f32> = args.nums("--margins", "0.00,0.10")?;
 
     println!(
-        "model\tmeeting\twindow\tt_assign\tt_retire\tmin_pool\talpha\tref\thyp\tsplits\tmerges\tmiss%\tconf%\tminted\tactive\tcrowd"
+        "model\tmeeting\twindow\tt_assign\tt_retire\tmin_pool\talpha\tmargin\tref\thyp\tsplits\tmerges\tmiss%\tconf%\tminted\tactive\tcrowd"
     );
 
     for model in &models {
@@ -1241,33 +1308,36 @@ fn sweep(args: &Args) -> Result<()> {
                     for &t_assign in &assigns {
                         for &t_retire in &retires {
                             for &alpha in &alphas {
-                                let params = Params {
-                                    t_assign,
-                                    t_retire,
-                                    alpha,
-                                    min_pool,
-                                };
-                                let (hyp, clusterer) =
-                                    label_frames(&emb, params, reference.frames.len());
-                                let m = reference::score(&hyp, &reference);
-                                // The closest surviving pair: how much room a
-                                // meeting with more people would have had.
-                                let crowd = clusterer
-                                    .crowding()
-                                    .first()
-                                    .map_or(f32::NAN, |&(_, _, sim)| sim);
-                                println!(
-                                    "{}\t{meeting}\t{window_s}\t{t_assign}\t{t_retire}\t{min_pool}\t{alpha}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{crowd:.3}",
-                                    stem(&model),
-                                    m.ref_speakers,
-                                    m.hyp_speakers,
-                                    m.splits,
-                                    m.merges,
-                                    100.0 * m.miss,
-                                    100.0 * m.confusion,
-                                    clusterer.minted(),
-                                    clusterer.active(),
-                                );
+                                for &margin in &margins {
+                                    let params = Params {
+                                        t_assign,
+                                        t_retire,
+                                        alpha,
+                                        min_pool,
+                                        margin,
+                                    };
+                                    let (hyp, clusterer) =
+                                        label_frames(&emb, params, reference.frames.len());
+                                    let m = reference::score(&hyp, &reference);
+                                    // The closest surviving pair: how much room a
+                                    // meeting with more people would have had.
+                                    let crowd = clusterer
+                                        .crowding()
+                                        .first()
+                                        .map_or(f32::NAN, |&(_, _, sim)| sim);
+                                    println!(
+                                        "{}\t{meeting}\t{window_s}\t{t_assign}\t{t_retire}\t{min_pool}\t{alpha}\t{margin}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{crowd:.3}",
+                                        stem(&model),
+                                        m.ref_speakers,
+                                        m.hyp_speakers,
+                                        m.splits,
+                                        m.merges,
+                                        100.0 * m.miss,
+                                        100.0 * m.confusion,
+                                        clusterer.minted(),
+                                        clusterer.active(),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1404,6 +1474,148 @@ fn lag(args: &Args) -> Result<()> {
             pct(0.9),
             pct(0.99),
             pct(0.9) / chunk
+        );
+    }
+    Ok(())
+}
+
+/// Replay a real session over a recording and report the two latencies the
+/// 2026-08-27 design is judged on.
+///
+/// The other subcommands measure a batch diarization: `label_frames` paints
+/// each frame with the majority of the windows covering it, which is backwards
+/// painting and cannot see either latency a live session has. This one runs
+/// `RealDiarizerFactory` and a real `Session`, so every rule that decides a
+/// label -- carry-forward, the majority vote, the lag, change detection,
+/// corrections -- is the server's own rather than a copy of it.
+///
+/// **Nothing here has been run.** `T_MARGIN`, `T_CHANGE`, `T_ZNORM`,
+/// `T_MARGIN_SHORT` and `RELABEL_WINDOW` are engineering estimates, and these
+/// are the measurements that replace them.
+fn live(args: &Args) -> Result<()> {
+    let names = match args.positional() {
+        Some(one) => vec![one.to_string()],
+        None => args.list("--wav", "ES2002a.Mix-Headset.wav"),
+    };
+    let chunk_s = args.num("--chunk", 0.56)?;
+    let chunk_samples = (chunk_s * SAMPLE_RATE) as usize;
+    ensure!(
+        chunk_samples.is_multiple_of(160),
+        "--chunk {chunk_s} is {chunk_samples} samples, which is not a whole \
+         number of 10 ms reference frames; the painting below aligns to those"
+    );
+
+    let tuning = syrinx_server::diarize::DiarizeTuning {
+        min_pool: args.num("--min-pool", MIN_POOL as f32)? as usize,
+        margin: args.num("--margin", T_MARGIN)?,
+        change_threshold: args.num("--change", T_CHANGE)?,
+    };
+    let session_tuning = syrinx_server::session::SessionTuning {
+        lag_chunks: args.num("--lag", LAG_CHUNKS as f32)? as usize,
+        relabel_window: args.num("--relabel-window", RELABEL_WINDOW as f32)? as u64,
+    };
+
+    // Every recording, with its annotation, then spliced if there is more than
+    // one. A single recording goes through the same path, so a one-wav run and
+    // the first slice of a two-wav run differ in nothing but the room.
+    let mut sources = Vec::new();
+    for name in &names {
+        let wav = resolve("audio", name);
+        let reference = Reference::load_ami(&format!("{}/annot", probe_dir()), &meeting_of(&wav))?;
+        sources.push((reference::read_wav(&wav)?, reference));
+    }
+    let slice_frames = (args.num("--slice", 10.0)? / reference::FRAME_MS) as usize;
+    let (samples, reference) = if sources.len() == 1 {
+        sources.pop().expect("one source")
+    } else {
+        live::splice(sources, slice_frames)?
+    };
+
+    eprintln!(
+        "{} / {} speakers / {:.1} min / {:?} {:?}",
+        names.join(" + "),
+        reference.names.len(),
+        samples.len() as f32 / SAMPLE_RATE / 60.0,
+        tuning,
+        session_tuning,
+    );
+
+    // The factory checks the models at load, exactly as the server does at
+    // startup, so a broken directory fails here rather than mid-replay. It
+    // also chooses the embedding model, and reports which -- the numbers below
+    // are that model's, so the name printed has to be the one that ran.
+    let factory = live::factory(&probe_dir(), tuning)?;
+    eprintln!(
+        "  model directory {} ({})",
+        probe_dir(),
+        basename(&factory.embed_model().to_string_lossy())
+    );
+
+    let started = std::time::Instant::now();
+    let replay = live::replay(&samples, &factory, chunk_samples, session_tuning)?;
+    eprintln!(
+        "  replayed {:.1} min in {:.0}s ({:.1}x real time)",
+        samples.len() as f32 / SAMPLE_RATE / 60.0,
+        started.elapsed().as_secs_f32(),
+        (samples.len() as f32 / SAMPLE_RATE) / started.elapsed().as_secs_f32().max(0.001),
+    );
+
+    let frames = reference.frames.len();
+    let painted = [
+        ("live", live::paint(&replay.live, chunk_samples, frames)),
+        (
+            "corrected",
+            live::paint(&replay.corrected, chunk_samples, frames),
+        ),
+    ];
+
+    println!(
+        "  {} corrections covering {} commits",
+        replay.relabels, replay.relabelled_commits
+    );
+
+    for (what, hyp) in &painted {
+        let m = reference::score(hyp, &reference);
+        println!(
+            "  {what:<10} {} labels for {} speakers, splits {}, merges {}, \
+             miss {:.1}%, confusion {:.1}%",
+            m.hyp_speakers,
+            m.ref_speakers,
+            m.splits,
+            m.merges,
+            100.0 * m.miss,
+            100.0 * m.confusion
+        );
+
+        let first =
+            live::first_label_latency(hyp, &reference, chunk_samples, session_tuning.lag_chunks);
+        let shown: Vec<String> = reference
+            .names
+            .iter()
+            .zip(&first)
+            .map(|(name, latency)| match latency {
+                Some(s) => format!("{name} {s:.2}s"),
+                None => format!("{name} never"),
+            })
+            .collect();
+        println!(
+            "    first label reaching a client, in that speaker's own speech: {}",
+            shown.join(", ")
+        );
+
+        let (switches, real) =
+            live::turn_switch_latency(hyp, &reference, chunk_samples, session_tuning.lag_chunks);
+        if switches.is_empty() {
+            println!("    turn switch: none of {real} real turn changes was followed");
+            continue;
+        }
+        let pct = |p: f32| switches[((switches.len() - 1) as f32 * p) as usize];
+        println!(
+            "    turn switch: {} of {real} followed, p50 {:.2}s p90 {:.2}s p99 {:.2}s",
+            switches.len(),
+            pct(0.5),
+            pct(0.9),
+            pct(0.99),
         );
     }
     Ok(())
