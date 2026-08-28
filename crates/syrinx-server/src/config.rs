@@ -146,11 +146,19 @@ pub struct Config {
     /// derived from it. That one is a lead between one 1.5 s window's cosines,
     /// measured against the spike's same-speaker median of 0.517; this one is
     /// a cosine between an *average* of `diarize_min_pool` windows and a
-    /// centroid, which for a single voice sits much higher. Accepted range 0
-    /// to 1, a cosine's own range: at or below `T_assign` this clause is inert
-    /// and the pre-2026-08-27 mint rule is all that is left, and from
-    /// `T_retire` upwards the retirement threshold caps it, so both ends
-    /// saturate into settings rather than into nonsense.
+    /// centroid, which for a single voice sits much higher.
+    ///
+    /// Accepted range 0 to 1, a cosine's own range, because both ends saturate
+    /// into settings rather than into nonsense. At or below `T_assign` the
+    /// clause is inert and the pre-2026-08-27 mint rule is all that is left.
+    /// At the far end what binds is `T_MINT_MARGIN` rather than `T_retire`: a
+    /// pool agrees with itself at `T_assign` by construction, which floors its
+    /// cohesion at `sqrt((1 + (min_pool - 1) * T_assign) / min_pool)`, and
+    /// requiring it to beat its nearest rival by `T_MINT_MARGIN` then holds
+    /// that rival under 0.566 at the shipped pool of four and under 0.651 at a
+    /// pool of two. Only a perfectly cohesive pool reaches 0.80, which is
+    /// where `T_retire`'s cap finally coincides. So 1 means "let the cohesion
+    /// rule decide", not "mint anything".
     ///
     /// **The default is an engineering estimate, not a measurement**, and the
     /// design names it the single most important number the probe has to
@@ -217,10 +225,12 @@ const DIARIZE_MARGIN: RangeInclusive<f32> = 0.0..=0.5;
 /// because unlike the margin this one has no interior value that stops meaning
 /// anything. Both ends saturate into settings instead -- at or below `T_assign`
 /// the ceiling clause is inert and minting is the pre-2026-08-27 rule alone,
-/// and from `T_retire` up the retirement threshold is the cap, so the far end
-/// says "let retirement decide" rather than "mint anything". Refusing the ends
-/// would make an operator work out where the useful band stops from constants
-/// no config file names.
+/// and at the top the cohesion rule takes over, `T_MINT_MARGIN` holding the
+/// rival under 0.566 at the shipped pool where only a perfectly cohesive one
+/// would reach `T_retire`'s cap of 0.80. So the far end says "let the cohesion
+/// rule decide" rather than "mint anything". Refusing the ends would make an
+/// operator work out where the useful band stops from constants no config file
+/// names.
 const DIARIZE_MINT_CEILING: RangeInclusive<f32> = 0.0..=1.0;
 
 /// What [`Config::diarize_change_threshold`] will accept: a cosine's range,
@@ -693,9 +703,10 @@ mod tests {
     #[test]
     fn a_mint_ceiling_outside_a_cosine_is_refused_at_load_by_name() {
         // The whole of a cosine is accepted because both ends saturate into
-        // settings: at or below T_assign the ceiling clause is inert, and from
-        // T_retire up the retirement threshold is the cap. Outside that there
-        // is no number left to mean anything.
+        // settings: at or below T_assign the ceiling clause is inert, and at
+        // the top the cohesion rule takes over, T_MINT_MARGIN binding at the
+        // shipped pool well before T_retire's cap would. Outside that there is
+        // no number left to mean anything.
         let err = with("diarize_mint_ceiling = 1.1").expect_err("above the range");
         let message = format!("{err:#}");
         assert!(message.contains("diarize_mint_ceiling"), "{message}");
