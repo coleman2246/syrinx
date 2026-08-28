@@ -78,6 +78,11 @@ fn build_diarizer(config: &Config) -> Option<Arc<dyn DiarizerFactory>> {
         margin: config.diarize_margin,
         mint_ceiling: config.diarize_mint_ceiling,
         change_threshold: config.diarize_change_threshold,
+        // No config key, deliberately: this one decides how far a correction
+        // reaches, its value came from a sweep of `diarize_probe live` rather
+        // than from an estimate, and a deployment has no measurement of its
+        // own to beat that with yet.
+        gap_change_threshold: syrinx_server::diarize::cluster::T_GAP_CHANGE,
     };
     match RealDiarizerFactory::load(std::path::Path::new(dir), tuning) {
         Ok(factory) => Some(Arc::new(factory) as Arc<dyn DiarizerFactory>),

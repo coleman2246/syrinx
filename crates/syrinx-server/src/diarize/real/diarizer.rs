@@ -83,6 +83,7 @@ impl RealDiarizerFactory {
             margin = tuning.margin,
             mint_ceiling = tuning.mint_ceiling,
             change_threshold = tuning.change_threshold,
+            gap_change_threshold = tuning.gap_change_threshold,
             "speaker labelling available"
         );
         Ok(Self { models, tuning })
@@ -410,6 +411,32 @@ impl Fuse {
     }
 }
 
+/// What a silence that cleared the window accumulator is still owed.
+///
+/// Three states rather than an `Option`, because "the hop I am holding is from
+/// before a pause" and "a seam is waiting on evidence" stop being the same fact
+/// the moment a correction has to be emitted in between. Losing that
+/// distinction would let the hop after a pause claim a *turn boundary* against
+/// the hop before it, which is a decision `window::MAX_GAP_FRAMES` measured and
+/// declined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gap {
+    /// Nothing outstanding: the next hop adjoins the one being held.
+    Closed,
+    /// A silence at this chunk, with no hop yet able to say whether the voice
+    /// changed across it.
+    ///
+    /// The chunk is where the seam goes if the answer never comes -- see
+    /// [`RealDiarizer::assume_gap_hid_a_change`]. A hop that *does* answer
+    /// puts it at itself instead, which is later and so tighter.
+    Pending(u64),
+    /// The same silence, after something had to assume it hid a change and
+    /// committed the seam. The evidence is no longer wanted -- it could only
+    /// loosen a bound already given out -- but the next hop still follows a
+    /// pause rather than adjoining anything.
+    Assumed,
+}
+
 /// One session's speaker attribution.
 ///
 /// Per [`Diarizer::push`]: one ASR chunk in, one [`Attribution`] out. The
@@ -454,16 +481,41 @@ impl Fuse {
 /// audio before it has provenance this diarizer cannot vouch for: a *detected*
 /// turn change; the first completed hop of the session, which had nothing
 /// before it to be compared against, so no change could have been detected
-/// there even in principle; and a silence long enough to have cleared the
-/// accumulator, across which the same is true. A run is also ended by any
-/// window that settles a label, since a confident label is not correctable.
+/// there even in principle; and a silence that cleared the accumulator with a
+/// different voice on the far side of it from the one that stopped. A run is
+/// also ended by any window that settles a label, since a confident label is
+/// not correctable.
+///
+/// **The silence is the one of the three that is measured rather than
+/// assumed**, and it is measured late. Half a second of quiet is constant in
+/// conversation -- a breath, an "um", a thought -- so treating every one of
+/// them as a seam truncated the backfill to whatever followed the most recent
+/// pause: 2 corrections over 21 minutes of ES2002a, where the complaint that
+/// it "doesn't go far enough back" came from. The seam is therefore recorded
+/// as *pending* at the silence rather than committed, the hop from before the
+/// pause is kept instead of dropped, and the next hop to complete is compared
+/// against it under [`crate::diarize::cluster::T_GAP_CHANGE`]. Voices that
+/// match discard the seam, and a correction reaches through the pause; voices
+/// that differ commit it, which is the behaviour that shipped. A silence still
+/// claims no *boundary* either way -- that decision is `MAX_GAP_FRAMES`'s and
+/// its measurement stands.
+///
+/// **Anything that would emit a correction while the answer is outstanding
+/// commits the seam first.** No correction ever crosses an unresolved seam,
+/// because the case a seam exists for is precisely the one where the missing
+/// evidence would have said "somebody else".
 ///
 /// **What that does not guarantee.** A turn change entirely inside one hop is
 /// invisible to a detector that compares whole hops, so a correction can in
 /// principle reach over an interjection shorter than 0.736 s of voiced audio
 /// that carried no label of its own. The exposure is bounded to one hop and
 /// to the opening of a run -- anywhere else the incumbent's carried-forward
-/// label is on those chunks, and `session.rs` will not overwrite one.
+/// label is on those chunks, and `session.rs` will not overwrite one. Deferring
+/// the gap seam adds one shape to that bound and no others: an interjection too
+/// short to complete a hop, sitting *between* two silences, is never embedded
+/// on its own -- so the comparison that resolves the seam is made across it,
+/// between the voices either side, and a correction may reach over it when
+/// those two agree.
 ///
 /// **On failure:** `session.rs` warns per failed chunk and retires the
 /// diarizer after five *consecutive* ones, so every error path here has to be
@@ -501,25 +553,36 @@ pub struct RealDiarizer {
     /// The cosine below which two consecutive hops are two different people:
     /// the server's `diarize_change_threshold`.
     change_threshold: f32,
+    /// The cosine below which the hops either side of a silence are two
+    /// different people. Stricter than `change_threshold`, and used for one
+    /// decision only: whether a pending gap seam is committed or discarded.
+    gap_change_threshold: f32,
     /// The label most recently settled on, and the answer for every chunk with
     /// voice in it until something changes it. `None` while the clusterer is
     /// undecided -- before the first speaker is minted, after any window it
     /// could not place, and after a detected turn change.
     last_label: Option<u32>,
     /// The previous hop's embedding, for the change-point comparison. `None`
-    /// before the first hop and after a gap long enough to have cleared the
-    /// accumulator, where there is nothing to compare against -- the second is
-    /// enforced from `WindowAssembler::restarted`, since a hop from before
-    /// half a second of silence is not the hop before this one.
+    /// only before the first hop of the session, which is the one place there
+    /// is genuinely nothing to compare against.
+    ///
+    /// It survives a silence, and what a silence changes is the question being
+    /// asked of it: `gap` says whether the hop about to arrive adjoins this one
+    /// or merely follows it across a pause, and the two are held to different
+    /// thresholds and decide different things.
     previous_hop: Option<Vec<f32>>,
+    /// What a silence that cleared the accumulator is still owed an answer
+    /// about.
+    gap: Gap,
     /// The earliest chunk a correction may still reach back to, or `None`
     /// while the current chunk carries a settled label.
     ///
     /// Not simply "where the unlabelled run began": it is bounded by the last
     /// point this diarizer can vouch for the audio's provenance, which is a
-    /// detected turn change, the first hop of the session, or a silence that
-    /// cleared the accumulator. See the type's own notes -- the safety of
-    /// every relabel emitted here rests on this field and on nothing else.
+    /// detected turn change, the first hop of the session, or a silence with a
+    /// different voice on the far side of it. See the type's own notes -- the
+    /// safety of every relabel emitted here rests on this field, on nothing
+    /// else, and only while `gap` holds no unresolved seam.
     correctable_since: Option<u64>,
     /// The provisional label currently being asserted and the chunk it started
     /// at. What a contradicting window relabels.
@@ -562,8 +625,10 @@ impl RealDiarizer {
             assembler: WindowAssembler::default(),
             clusterer: OnlineClusterer::with_config(tuning),
             change_threshold: tuning.change_threshold,
+            gap_change_threshold: tuning.gap_change_threshold,
             last_label: None,
             previous_hop: None,
+            gap: Gap::Closed,
             correctable_since: None,
             provisional: None,
             chunks_seen: 0,
@@ -588,11 +653,68 @@ impl RealDiarizer {
     ///
     /// A correction may reach back to here and no further, because whatever
     /// was said before it might have been somebody else and this diarizer has
-    /// no way to know. Three callers, and they are the three such points: a
-    /// detected turn change, the first hop of a session, and a silence that
-    /// cleared the accumulator.
+    /// no way to know. Two callers, and they are the two points where that is
+    /// known at the time: a detected turn change, and the first hop of a
+    /// session. The third, a silence, is decided later -- see [`Gap`] and
+    /// [`RealDiarizer::commit_gap_seam`].
     fn seam(&mut self, chunk: u64) {
         self.correctable_since = Some(chunk);
+    }
+
+    /// Give up on a pending gap seam and apply it, wherever the run has got to
+    /// since.
+    ///
+    /// A floor rather than an assignment, which is the one way this differs
+    /// from [`RealDiarizer::seam`] and it matters: chunks have gone by since
+    /// the silence, and one of them may have carried a window that settled a
+    /// label and ended the correctable run outright. Writing the seam's chunk
+    /// in would reopen that run and let a correction reach back over text a
+    /// full window placed.
+    fn commit_gap_seam(&mut self, chunk: u64) {
+        if let Some(since) = self.correctable_since {
+            self.correctable_since = Some(since.max(chunk));
+        }
+    }
+
+    /// Resolve any pending gap seam the cautious way, because something is
+    /// about to emit a correction and the evidence has not arrived.
+    ///
+    /// The hop that would have answered is still to come, so the only safe
+    /// answer is the one the seam was recorded for: assume the silence hid a
+    /// speaker change. `Gap::Assumed` rather than `Gap::Closed`, so the hop
+    /// when it does arrive still knows it follows a pause.
+    ///
+    /// **Not an unreachable precaution**, though the shipped geometry hides
+    /// how it is reached: a hop completes at 23 voiced frames and a window at
+    /// 47, so the answer normally arrives first. It does not when the hop's
+    /// embedding *failed* -- the one transient [`Fuse`] exists to survive --
+    /// leaving the window that follows it to mint with the silence still
+    /// unaccounted for. Making the guard a rule rather than a consequence of
+    /// that arithmetic is the point: the promise being kept here is the one
+    /// the protocol makes about never renaming somebody's sentence.
+    fn assume_gap_hid_a_change(&mut self) {
+        if let Gap::Pending(chunk) = self.gap {
+            self.commit_gap_seam(chunk);
+            self.gap = Gap::Assumed;
+        }
+    }
+
+    /// Whether the voice in `embedding` is a different one from the hop held
+    /// across the silence before it.
+    ///
+    /// Three ways to answer yes, and each is a reason the seam has to stand.
+    /// Comparison may be switched off, at `diarize_change_threshold = 0`,
+    /// where no cosine between hops is allowed to decide anything and the
+    /// reach of a correction is a decision. There may be no earlier hop to
+    /// compare against, which is the opening of a session and the case the
+    /// seam was invented for. Or the two may genuinely differ, at the stricter
+    /// bar a comparison across silence is held to.
+    fn voice_changed_across_the_gap(&self, embedding: &[f32]) -> bool {
+        self.change_threshold <= 0.0
+            || self
+                .previous_hop
+                .as_ref()
+                .is_none_or(|before| cosine(before, embedding) < self.gap_change_threshold)
     }
 
     /// A hop: the turn-change test, then a provisional label if there is
@@ -601,6 +723,31 @@ impl RealDiarizer {
     /// Returns whether this hop was an accepted change point, which the caller
     /// needs in order to throw away the windows behind it.
     fn hop(&mut self, embedding: Vec<f32>, chunk: u64, out: &mut Attribution) -> bool {
+        // The first hop after a silence is asked a different question from
+        // every other one -- not "has the voice changed since the hop before"
+        // but "is this the voice that stopped" -- and only a pending seam turns
+        // on the answer. It claims no boundary whatever it finds: a silence is
+        // a poor turn-change detector, which is what the 151 breaks behind
+        // `window::MAX_GAP_FRAMES` measured, and none of this reopens that.
+        let gap = std::mem::replace(&mut self.gap, Gap::Closed);
+        if gap != Gap::Closed {
+            if let Gap::Pending(_) = gap
+                && self.voice_changed_across_the_gap(&embedding)
+            {
+                // At this hop rather than at the pause, which is the tighter
+                // of the two and exactly where the rule this replaces put it.
+                // Half a second is under half a chunk, so the chunk a silence
+                // begins in can carry the outgoing speaker's last words as
+                // well as the incoming speaker's first, and a bound drawn
+                // there would let a correction reach into the sentence it is
+                // meant to stop at.
+                self.commit_gap_seam(chunk);
+            }
+            self.previous_hop = Some(embedding.clone());
+            self.guess(&embedding, chunk);
+            return false;
+        }
+
         // A threshold of 0 is the documented way to switch detection off, and
         // it has to be checked for rather than reached by arithmetic:
         // different-speaker cosines are routinely negative, so `cosine < 0`
@@ -636,16 +783,23 @@ impl RealDiarizer {
             self.seam(chunk);
         }
 
-        // Only where there is nothing better. A hop's guess never overwrites
-        // an answer a full window settled: it is the faster of the two, not
-        // the more trustworthy one.
+        self.guess(&embedding, chunk);
+        changed
+    }
+
+    /// Offer a hop's provisional label, where there is nothing better.
+    ///
+    /// A hop's guess never overwrites an answer a full window settled: it is
+    /// the faster of the two, not the more trustworthy one. Reached from both
+    /// halves of [`RealDiarizer::hop`], because a hop across a silence is
+    /// still 0.75 s of somebody talking and the reader wants a name for it.
+    fn guess(&mut self, embedding: &[f32], chunk: u64) {
         if self.last_label.is_none()
-            && let Some(label) = self.clusterer.observe_short(&embedding)
+            && let Some(label) = self.clusterer.observe_short(embedding)
         {
             self.last_label = Some(label);
             self.provisional = Some((label, chunk));
         }
-        changed
     }
 
     /// A full 1.5 s window: the only thing that moves a centroid, mints a
@@ -662,6 +816,7 @@ impl RealDiarizer {
             // complaint 1, fixed without touching the four-window reluctance
             // that made it.
             (Heard::Settled(speaker), true) => {
+                self.assume_gap_hid_a_change();
                 out.relabels.push(Relabel {
                     from_chunk: self.correctable_since.unwrap_or(chunk),
                     to_chunk: chunk,
@@ -675,6 +830,7 @@ impl RealDiarizer {
                 if let Some((provisional, since)) = self.provisional
                     && provisional != speaker
                 {
+                    self.assume_gap_hid_a_change();
                     out.relabels.push(Relabel {
                         from_chunk: since.max(self.correctable_since.unwrap_or(since)),
                         to_chunk: chunk,
@@ -767,21 +923,6 @@ impl Diarizer for RealDiarizer {
         // nothing either way.
         let mut cut = false;
         let pieces = self.assembler.push(&framed, &voiced);
-        if self.assembler.restarted() {
-            // Half a second of silence cleared the accumulator, so the hop
-            // being held for the change-point test is from before it. Two
-            // stretches of a meeting either side of a pause are not "the voice
-            // just now and the voice before that", and comparing them answers
-            // a question nobody asked.
-            self.previous_hop = None;
-            // Nor can anything before the silence be vouched for: the gap is
-            // where a turn change goes undetected most often, which is the
-            // measurement `window::MAX_GAP_FRAMES` records. The label carries
-            // across -- 48 of 51 decidable breaks had the same speaker either
-            // side -- but a *correction* may not, because carrying a label is
-            // reversible and rewriting somebody's sentence is not.
-            self.seam(chunk);
-        }
         for piece in pieces {
             let (Cut::Hop(audio) | Cut::Window(audio)) = &piece;
             if matches!(piece, Cut::Window(_)) && cut {
@@ -802,6 +943,35 @@ impl Diarizer for RealDiarizer {
                 Cut::Hop(_) => cut |= self.hop(embedding, chunk, &mut out),
                 Cut::Window(_) => self.window(&embedding, chunk, &mut out),
             }
+        }
+
+        // After the pieces, not before them, and the ordering is the whole
+        // correctness of the deferral: every piece in a batch that restarted
+        // was assembled *before* the silence. The restart empties the
+        // accumulator and a chunk carries at most 18 frames against a hop's
+        // 23, so nothing can complete on the far side of it in the same push
+        // -- the arithmetic `WindowAssembler::push` states and
+        // `asr::parakeet::CHUNK_SAMPLES` fixes at 0.56 s. Recording the gap
+        // first would hand the pre-gap hop to the comparison meant for the
+        // post-gap one, which would answer "same voice" for the trivial reason
+        // that both sides of it are the same stretch of speech.
+        //
+        // A backend with a chunk longer than a hop would break that, and it is
+        // worth knowing how far: the post-gap hop would arrive here as an
+        // ordinary one and be put to the ordinary change test, which is looser
+        // but is the same question, and a boundary it accepted would lay the
+        // seam itself. The deferral would lose its evidence, not its guard.
+        if self.assembler.restarted() {
+            // Half a second of silence cleared the accumulator, so the hop
+            // being held is from before it. That makes it the wrong thing to
+            // ask "did the voice just change" of -- two stretches of a meeting
+            // either side of a pause are not the voice now and the voice a
+            // moment ago -- and the right thing to ask "is this the same person
+            // again" of, which is the only question a correction's reach turns
+            // on. So it is kept, and the seam waits for it to be asked. A
+            // second silence before that happens moves the seam forward to the
+            // later one, which is the tighter bound.
+            self.gap = Gap::Pending(chunk);
         }
 
         // Silence answers None rather than repeating itself. Carrying a label
@@ -1178,6 +1348,272 @@ mod tests {
         assert!(!d.hop(opposite, 1, &mut out));
         assert!(!out.boundary);
         assert_eq!(d.last_label, Some(1), "a refused cut blanked the label");
+    }
+
+    // --------------------------------------------------- the deferred seam
+    //
+    // Half a second of quiet is constant in conversation, and treating every
+    // one of it as a provenance seam is what held the backfill to 2
+    // corrections over 21 minutes of ES2002a. These drive the state machine
+    // that measures the silence instead of assuming about it; `window.rs`
+    // owns the half that decides when the accumulator restarted at all.
+
+    /// A unit vector at exactly `cos` from `axis(0)`: the two thresholds a
+    /// pair of hops can fall between are 0.30 and 0.45, so the interesting
+    /// fixtures are the ones in there.
+    fn at_cosine(cos: f32) -> Vec<f32> {
+        vec![cos, (1.0 - cos * cos).sqrt(), 0.0, 0.0]
+    }
+
+    #[test]
+    fn a_silence_the_same_voice_resumes_after_lets_a_correction_reach_through_it() {
+        // The complaint this exists for: a correction "doesn't go far enough
+        // back -- it might get a few words but it's still missing a couple",
+        // because the breath in the middle of the sentence was read as a
+        // change of speaker.
+        let mut d = headless(DiarizeTuning::default());
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        assert_eq!(d.correctable_since, Some(3), "the session's first hop");
+
+        // Half a second of quiet at chunk 10, and the same voice at chunk 13.
+        d.gap = Gap::Pending(10);
+        let mut out = Attribution::default();
+        assert!(!d.hop(axis(0), 13, &mut out));
+        assert_eq!(d.gap, Gap::Closed, "the silence has its answer");
+        assert_eq!(
+            d.correctable_since,
+            Some(3),
+            "the same person resumed, so the reach should survive the pause"
+        );
+
+        // And the mint that finally names them reaches over it.
+        let mut relabels = Vec::new();
+        for chunk in 14..18 {
+            let mut out = Attribution::default();
+            d.window(&axis(0), chunk, &mut out);
+            relabels.extend(out.relabels);
+        }
+        assert_eq!(
+            relabels,
+            vec![Relabel {
+                from_chunk: 3,
+                to_chunk: 17,
+                speaker: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn a_silence_a_different_voice_follows_holds_the_seam_at_the_pause() {
+        // The bug the seam exists for, and the one this change must keep
+        // impossible: A talks and is never minted, so their words are
+        // committed with nobody's name on them; a pause; B talks and *is*
+        // minted. If the correction reached back over the pause it would
+        // rename A's sentence to B, which the protocol promises cannot happen.
+        let mut d = headless(DiarizeTuning::default());
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+
+        d.gap = Gap::Pending(10);
+        let mut out = Attribution::default();
+        assert!(!d.hop(axis(1), 13, &mut out));
+        assert_eq!(
+            d.correctable_since,
+            Some(13),
+            "a different voice resumed, so the pause is a seam after all -- \
+             drawn at the hop that measured the change, not at the pause"
+        );
+
+        let mut relabels = Vec::new();
+        for chunk in 14..18 {
+            let mut out = Attribution::default();
+            d.window(&axis(1), chunk, &mut out);
+            relabels.extend(out.relabels);
+        }
+        assert_eq!(
+            relabels,
+            vec![Relabel {
+                from_chunk: 13,
+                to_chunk: 17,
+                speaker: 1
+            }],
+            "the correction reached back over somebody else's words"
+        );
+    }
+
+    #[test]
+    fn a_mint_while_the_silence_is_unanswered_gets_the_cautious_answer() {
+        // Reachable when the hop that would have answered failed to embed,
+        // which `Fuse` exists to survive: the window that mints arrives with
+        // the pause still unaccounted for, and there is no evidence to be had
+        // in time. A correction may not cross a silence nobody has vouched
+        // for, so the seam is committed rather than waited on.
+        let mut d = headless(DiarizeTuning::default());
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        d.gap = Gap::Pending(10);
+
+        let mut relabels = Vec::new();
+        for chunk in 14..18 {
+            let mut out = Attribution::default();
+            d.window(&axis(0), chunk, &mut out);
+            relabels.extend(out.relabels);
+        }
+        assert_eq!(
+            relabels,
+            vec![Relabel {
+                from_chunk: 10,
+                to_chunk: 17,
+                speaker: 1
+            }],
+            "a correction crossed a silence nothing had answered for"
+        );
+        assert_eq!(
+            d.gap,
+            Gap::Assumed,
+            "the hop still has to know it follows a pause"
+        );
+    }
+
+    #[test]
+    fn a_silence_with_no_hop_before_it_is_a_seam() {
+        // A meeting opening with "Right." -- under 0.736 s, so no hop ever
+        // completes on it -- and then a pause. There is nothing on the near
+        // side of the silence to compare the far side against, so no evidence
+        // can arrive and the seam stands. It stands at the hop rather than at
+        // the pause, which is the tighter of the two and exactly where the
+        // first hop of a session puts it anyway.
+        let mut d = headless(DiarizeTuning::default());
+        d.correctable_since = Some(0);
+        d.gap = Gap::Pending(4);
+
+        let mut out = Attribution::default();
+        assert!(!d.hop(axis(1), 7, &mut out));
+        assert_eq!(d.correctable_since, Some(7));
+    }
+
+    #[test]
+    fn a_deferred_seam_never_reopens_a_run_a_settled_label_ended() {
+        // The seam is applied as a floor rather than written in, and this is
+        // why: chunks go by between the pause and the answer, and one of them
+        // may carry a window that settles a label. Writing the pause's chunk
+        // in would let a later correction reach back over text a full window
+        // placed, which is the one thing `session.rs` cannot catch on its own.
+        let mut d = headless(DiarizeTuning::default());
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        mint(&mut d, &axis(0));
+        d.gap = Gap::Pending(10);
+
+        let mut out = Attribution::default();
+        d.window(&axis(0), 12, &mut out);
+        assert_eq!(d.correctable_since, None, "a settled label ends the run");
+
+        let mut out = Attribution::default();
+        d.hop(axis(1), 13, &mut out);
+        assert_eq!(
+            d.correctable_since, None,
+            "a deferred seam reopened a run a settled label had ended"
+        );
+    }
+
+    #[test]
+    fn the_silence_and_the_hop_boundary_are_judged_at_different_thresholds() {
+        // A pair halfway between the two thresholds: alike enough to be one
+        // person talking on from one hop to the next, not alike enough to
+        // carry somebody's name across half a second of silence. Two 0.75 s
+        // embeddings with a pause between them are the noisiest comparison
+        // this pipeline makes, and the error that costs a sentence its author
+        // is not the error that costs a few words of backfill.
+        //
+        // Read from the shipped values rather than written down, so that
+        // retuning either one re-aims this test instead of rotting it.
+        let shipped = DiarizeTuning::default();
+        let voice = at_cosine(0.5 * (shipped.change_threshold + shipped.gap_change_threshold));
+
+        let mut d = headless(shipped);
+        fill_the_accumulator(&mut d);
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        assert!(
+            !d.hop(voice.clone(), 4, &mut out),
+            "the pair is above the hop threshold, and the accumulator would \
+             have accepted the cut"
+        );
+
+        let mut d = headless(shipped);
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        d.gap = Gap::Pending(10);
+        d.hop(voice, 13, &mut out);
+        assert_eq!(
+            d.correctable_since,
+            Some(13),
+            "the same pair should not carry a correction across a pause"
+        );
+    }
+
+    #[test]
+    fn a_hop_after_a_silence_claims_no_turn_boundary() {
+        // What a silence decides is how far a correction reaches, and nothing
+        // else. It is a poor turn-change detector -- 48 of 51 decidable breaks
+        // had the same speaker either side, which is the measurement behind
+        // `window::MAX_GAP_FRAMES` -- so it still never blanks a label or cuts
+        // the accumulator, whichever way the comparison goes.
+        for gap in [Gap::Pending(10), Gap::Assumed] {
+            let mut d = headless(DiarizeTuning::default());
+            let mut out = Attribution::default();
+            d.hop(axis(0), 3, &mut out);
+            fill_the_accumulator(&mut d);
+            d.last_label = Some(1);
+            d.gap = gap;
+
+            let mut out = Attribution::default();
+            assert!(!d.hop(axis(1), 13, &mut out), "{gap:?} claimed a boundary");
+            assert!(!out.boundary, "{gap:?}");
+            assert_eq!(d.last_label, Some(1), "{gap:?} blanked the label");
+        }
+    }
+
+    #[test]
+    fn a_gap_threshold_of_one_makes_every_silence_a_seam() {
+        // The sweep's own control, and the reason it can have one: two 0.75 s
+        // embeddings of real audio are never the same vector, so at 1 the
+        // pause is committed whatever followed it -- which is the rule that
+        // shipped before any of this. The fixture is 0.999 rather than an
+        // identical vector for exactly that reason: the identical pair is the
+        // one case the corpus cannot produce, and asserting on it would pin
+        // the boundary condition instead of the rule.
+        let old = DiarizeTuning {
+            gap_change_threshold: 1.0,
+            ..Default::default()
+        };
+        let mut d = headless(old);
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        d.gap = Gap::Pending(10);
+        d.hop(at_cosine(0.999), 13, &mut out);
+        assert_eq!(d.correctable_since, Some(13));
+    }
+
+    #[test]
+    fn switching_change_detection_off_leaves_every_silence_a_seam() {
+        // `diarize_change_threshold = 0` is documented as the way to stop any
+        // cosine between two hops deciding anything, and how far a correction
+        // reaches is something decided. A deployment that has taken that hatch
+        // gets the rule that shipped before the deferral existed, rather than
+        // a second comparison it never asked for.
+        let off = DiarizeTuning {
+            change_threshold: 0.0,
+            ..Default::default()
+        };
+        let mut d = headless(off);
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        d.gap = Gap::Pending(10);
+        d.hop(axis(0), 13, &mut out);
+        assert_eq!(d.correctable_since, Some(13));
     }
 
     #[test]

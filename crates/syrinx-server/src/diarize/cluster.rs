@@ -32,7 +32,8 @@
 //! -- [`T_MARGIN`], [`SHORT_MARGIN_FACTOR`], [`T_ZNORM`], [`T_MINT_MARGIN`],
 //! [`T_MINT_CEILING`], [`MAX_POOLS`], [`POOL_AGE`] -- are **engineering
 //! estimates and have not been measured**; the probe's live-emulation mode
-//! exists to replace them.
+//! exists to replace them. [`T_GAP_CHANGE`] is the first one it has: its value
+//! was swept there rather than reasoned about, and its doc records the table.
 //!
 //! Pure arithmetic. No models, no `ort`, no feature gate -- which is what lets
 //! the whole of the labelling policy be tested in CI on synthetic embeddings.
@@ -190,6 +191,52 @@ pub const T_ZNORM: f32 = 2.0;
 /// boundary may arrive; this is the only switch that turns them off entirely.
 #[doc(hidden)]
 pub const T_CHANGE: f32 = 0.30;
+
+/// Cosine between the hop before a silence and the hop after it above which
+/// the same person is taken to have resumed.
+///
+/// The same comparison [`T_CHANGE`] makes and a different question, which is
+/// why it is a different number. `T_CHANGE` asks whether the voice changed
+/// between two adjoining hops; this asks whether the voice on the far side of
+/// a pause is the voice that stopped, and the only thing that turns on the
+/// answer is how far back a correction may reach -- a silence never claims a
+/// turn boundary, because `window::MAX_GAP_FRAMES` measured that it is bad at
+/// it (48 of 51 decidable breaks had the same speaker either side).
+///
+/// **Stricter than `T_CHANGE`, and the sweep agreed.** Two 0.75 s embeddings
+/// with half a second of silence between them are the noisiest comparison this
+/// pipeline makes, and the two errors are not symmetric: answering "same"
+/// wrongly lets a correction cross a real speaker change and write one
+/// person's name over another's sentence, which the protocol promises cannot
+/// happen, while answering "changed" wrongly costs a few words of backfill
+/// nobody was promised. The measurement put the safe floor at 0.34, above
+/// `T_CHANGE` -- which was the argument's prediction and is now its result.
+///
+/// **Unmeasured as a separability threshold**, and chosen by sweep instead.
+/// Nothing has measured where same-speaker and different-speaker hop pairs sit
+/// *across a silence*, which is the population a number like this would have
+/// to be placed inside; what was measured is the end of the argument rather
+/// than the middle of it. Every candidate ran through `diarize_probe live` on
+/// three AMI meetings, scored on the confusion a correction crossing a real
+/// change would produce -- the design doc carries the table.
+///
+/// 0.35 is the middle of the band the sweep left standing. From 0.34 to 0.37
+/// ES2002a's backfill covers 31 commits instead of 3 and its corrected
+/// confusion *falls*, while EN2001a and IS1000a do not move at all. At 0.33
+/// one more correction lands on EN2001a and its corrected confusion rises from
+/// 5.3% to 5.4%, which is a correction crossing a real speaker change and is
+/// the one thing this threshold exists to prevent -- so the floor is where the
+/// guard rail moved and not where the gain stopped. Above 0.38 the gain is
+/// gone. The middle of the band rather than either edge, because the two
+/// cliffs cost different things: one costs a few words of backfill, the other
+/// costs a sentence its author.
+///
+/// **1 makes every silence a seam**, which is the rule that shipped before
+/// this constant existed: two 0.75 s embeddings of real audio are never the
+/// same vector, so the seam is always committed. That is what makes it the
+/// sweep's own control, and it reproduced the shipped numbers to the digit.
+#[doc(hidden)]
+pub const T_GAP_CHANGE: f32 = 0.35;
 
 /// How much more like itself than like any incumbent a pool of orphans must be
 /// before it becomes a speaker of its own.
@@ -1864,6 +1911,7 @@ mod tests {
             margin: T_MARGIN,
             mint_ceiling: T_MINT_CEILING,
             change_threshold: T_CHANGE,
+            gap_change_threshold: T_GAP_CHANGE,
         };
         assert_eq!(
             observe_all(OnlineClusterer::with_config(named), &script),
@@ -1901,13 +1949,14 @@ mod tests {
             margin: 0.11,
             mint_ceiling: 0.62,
             change_threshold: 0.99,
+            gap_change_threshold: 0.98,
         });
         assert_eq!(c.min_pool, 7);
         assert_eq!(c.margin, 0.11);
         assert_eq!(c.mint_ceiling, 0.62);
-        // `change_threshold` is the diarizer's, and travels with the rest only
-        // so that the boundary can be one struct. The other three are not a
-        // configuration surface at all and must survive any tuning.
+        // The two change thresholds are the diarizer's, and travel with the
+        // rest only so that the boundary can be one struct. The other three
+        // are not a configuration surface at all and must survive any tuning.
         assert_eq!(c.t_assign, T_ASSIGN);
         assert_eq!(c.t_retire, T_RETIRE);
         assert_eq!(c.alpha, EMA_ALPHA);

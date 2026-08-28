@@ -56,8 +56,8 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 
 use syrinx_server::diarize::cluster::{
-    EMA_ALPHA, MIN_POOL, OnlineClusterer, T_ASSIGN, T_CHANGE, T_MARGIN, T_MINT_CEILING, T_RETIRE,
-    cosine,
+    EMA_ALPHA, MIN_POOL, OnlineClusterer, T_ASSIGN, T_CHANGE, T_GAP_CHANGE, T_MARGIN,
+    T_MINT_CEILING, T_RETIRE, cosine,
 };
 use syrinx_server::diarize::fbank::SAMPLE_RATE;
 use syrinx_server::diarize::real::{Embedder, Vad, norm_for};
@@ -835,6 +835,12 @@ const LIVE: Spec = Spec {
         MINT_CEILING_FLAG,
         ("--change", true, "diarize_change_threshold"),
         (
+            "--gap-change",
+            true,
+            "cosine across a silence below which the voices differ; 1 makes \
+             every silence a seam, which is the rule that shipped before it",
+        ),
+        (
             "--relabel-window",
             true,
             "diarize_relabel_window, in seconds",
@@ -1537,6 +1543,7 @@ fn live(args: &Args) -> Result<()> {
         margin: args.num("--margin", T_MARGIN)?,
         mint_ceiling: args.num("--mint-ceiling", T_MINT_CEILING)?,
         change_threshold: args.num("--change", T_CHANGE)?,
+        gap_change_threshold: args.num("--gap-change", T_GAP_CHANGE)?,
     };
     let session_tuning = syrinx_server::session::SessionTuning {
         lag_chunks: args.num("--lag", LAG_CHUNKS as f32)? as usize,

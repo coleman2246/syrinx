@@ -82,6 +82,14 @@ const REFRACTORY_SAMPLES: usize = REFRACTORY_FRAMES * FRAME;
 /// that look alike and are not: this one asks how long the silence was, that
 /// one asks who is talking. So the measurement above still stands and this
 /// constant is unchanged.
+///
+/// The diarizer used to read a break here as a bound on how far back a
+/// *correction* may reach, which is the same inference in a quieter place and
+/// measurably had the same problem: it truncated the backfill to whatever
+/// followed the last breath. It now asks who is talking there too, comparing
+/// the hops either side of the break against `cluster::T_GAP_CHANGE`. What a
+/// break still decides on its own is only what it was measured for -- whether
+/// the audio either side of it may go into one embedding.
 const MAX_GAP_FRAMES: usize = 15;
 
 /// A piece of voiced audio the assembler has finished with.
@@ -190,10 +198,10 @@ pub struct WindowAssembler {
     /// Whether the gap rule cleared the accumulator during the most recent
     /// [`WindowAssembler::push`].
     ///
-    /// The diarizer needs to know: the hop it holds for the change-point
-    /// comparison came from before the silence, and comparing across a gap
-    /// that long asks whether two different stretches of the meeting sound
-    /// alike rather than whether the voice just changed.
+    /// The diarizer needs to know, because the hop it holds is from before the
+    /// silence and so answers a different question from the one it was kept
+    /// for: not "has the voice just changed" but "is this the same person
+    /// resuming", which is what decides how far back a correction may reach.
     restarted: bool,
 }
 

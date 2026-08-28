@@ -26,7 +26,7 @@ use anyhow::Result;
 /// because they are set together and every one of them is read exactly once,
 /// at session start.
 ///
-/// Held as a struct rather than passed as four arguments because three of them
+/// Held as a struct rather than passed as five arguments because four of them
 /// are cosines and a caller that swapped them would compile. For the same
 /// reason it is handed on whole: [`cluster::OnlineClusterer::with_config`]
 /// takes this type rather than the three fields it reads, so the last place a
@@ -45,6 +45,15 @@ pub struct DiarizeTuning {
     /// `diarize_change_threshold`: the cosine drop between hops that marks a
     /// turn change.
     pub change_threshold: f32,
+    /// How alike the hops either side of a silence must be before a correction
+    /// is allowed to reach across it. See [`cluster::T_GAP_CHANGE`].
+    ///
+    /// The one field here with no config key behind it. It decides how far
+    /// back a correction reaches and nothing else, its value was chosen by a
+    /// sweep of `diarize_probe live` rather than estimated, and a deployment
+    /// has no measurement of its own to beat that with; `--gap-change` is
+    /// where it is varied until one does.
+    pub gap_change_threshold: f32,
 }
 
 impl Default for DiarizeTuning {
@@ -56,6 +65,7 @@ impl Default for DiarizeTuning {
             margin: cluster::T_MARGIN,
             mint_ceiling: cluster::T_MINT_CEILING,
             change_threshold: cluster::T_CHANGE,
+            gap_change_threshold: cluster::T_GAP_CHANGE,
         }
     }
 }
@@ -227,5 +237,20 @@ mod tests {
         assert_eq!(t.margin, cluster::T_MARGIN);
         assert_eq!(t.mint_ceiling, cluster::T_MINT_CEILING);
         assert_eq!(t.change_threshold, cluster::T_CHANGE);
+        assert_eq!(t.gap_change_threshold, cluster::T_GAP_CHANGE);
+    }
+
+    #[test]
+    fn crossing_a_silence_is_judged_more_strictly_than_crossing_a_hop() {
+        // The two thresholds are not interchangeable and the ordering between
+        // them is the whole argument: a 0.75 s embedding either side of a
+        // pause is the noisiest comparison the pipeline makes, and the error
+        // it must not make -- reaching a correction across a real speaker
+        // change -- is the expensive one.
+        let t = DiarizeTuning::default();
+        assert!(
+            t.gap_change_threshold > t.change_threshold,
+            "a silence must be harder to call one voice than a hop boundary is"
+        );
     }
 }
