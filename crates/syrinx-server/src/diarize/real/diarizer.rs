@@ -81,6 +81,7 @@ impl RealDiarizerFactory {
             dim,
             min_pool = tuning.min_pool,
             margin = tuning.margin,
+            mint_ceiling = tuning.mint_ceiling,
             change_threshold = tuning.change_threshold,
             "speaker labelling available"
         );
