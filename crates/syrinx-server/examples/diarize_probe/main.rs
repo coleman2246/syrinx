@@ -595,12 +595,14 @@ fn label_frames(
     (labels, clusterer)
 }
 
-/// The clusterer's five thresholds, as the sweep varies them.
+/// The clusterer's six thresholds, as the sweep varies them.
 ///
 /// Deliberately not a type in `diarize::cluster`: the server has no
-/// configuration surface here, and the one place these five travel together is
-/// this harness. [`Default`] reads the shipped constants, so a no-flags `run`
-/// is the shipped configuration and there is no second copy of the numbers.
+/// configuration surface for most of these, and the one place all six travel
+/// together is this harness. [`Default`] reads the shipped constants, so a
+/// no-flags `run` is the shipped configuration and there is no second copy of
+/// the numbers. `Debug` is what `run` prints, which is why every field added
+/// here reaches a transcript without anything else being changed.
 #[derive(Clone, Copy, Debug)]
 struct Params {
     t_assign: f32,
@@ -1304,7 +1306,7 @@ fn sweep(args: &Args) -> Result<()> {
     let margins: Vec<f32> = args.nums("--margins", "0.00,0.10")?;
 
     println!(
-        "model\tmeeting\twindow\tt_assign\tt_retire\tmin_pool\talpha\tmargin\tref\thyp\tsplits\tmerges\tmiss%\tconf%\tminted\tactive\tcrowd"
+        "model\tmeeting\twindow\tt_assign\tt_retire\tmin_pool\talpha\tmargin\tmint_ceiling\tref\thyp\tsplits\tmerges\tmiss%\tconf%\tminted\tactive\tcrowd"
     );
 
     for model in &models {
@@ -1324,11 +1326,14 @@ fn sweep(args: &Args) -> Result<()> {
                         for &t_retire in &retires {
                             for &alpha in &alphas {
                                 for &margin in &margins {
-                                    // The ceiling is held at the shipped
-                                    // value rather than given an axis: it is
-                                    // the number the design says to sweep
-                                    // next, and a grid this size answers one
-                                    // question at a time.
+                                    // The ceiling is held at the shipped value
+                                    // rather than given an axis: it is the
+                                    // number the design says to sweep next,
+                                    // and a grid this size answers one
+                                    // question at a time. It is still a
+                                    // column, because a constant a later
+                                    // retune moves is exactly the kind a
+                                    // saved TSV must carry to stay readable.
                                     let params = Params {
                                         t_assign,
                                         t_retire,
@@ -1347,8 +1352,9 @@ fn sweep(args: &Args) -> Result<()> {
                                         .first()
                                         .map_or(f32::NAN, |&(_, _, sim)| sim);
                                     println!(
-                                        "{}\t{meeting}\t{window_s}\t{t_assign}\t{t_retire}\t{min_pool}\t{alpha}\t{margin}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{crowd:.3}",
+                                        "{}\t{meeting}\t{window_s}\t{t_assign}\t{t_retire}\t{min_pool}\t{alpha}\t{margin}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{crowd:.3}",
                                         stem(&model),
+                                        params.mint_ceiling,
                                         m.ref_speakers,
                                         m.hyp_speakers,
                                         m.splits,
