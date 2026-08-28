@@ -1172,41 +1172,54 @@ impl App {
                     path: None,
                 });
             }
-            // Streaming is a property of the next session, so it can be
-            // changed while one is running without disturbing it.
+            // Streaming is a property of the next session -- the writer opens
+            // at session start -- so a file can be chosen while one is running
+            // without disturbing it.
+            //
+            // The ellipsis is this window's convention for a button that opens
+            // a dialog, and it is honoured on every press now. It used to be a
+            // toggle, so the dialog was reached only while nothing was set;
+            // since the setting is persisted, the second run of the GUI opened
+            // reading "Streaming" before the user had touched anything, and
+            // pressing it stopped rather than asked.
             let streaming = self.state.stream_to.is_some();
-            // The word already carries the state, so the record dot was
-            // redundant -- and it rendered as a box on Windows.
-            let label = if streaming { "Streaming" } else { "Stream…" };
-            // Separate mode writes one file per source beside the chosen
-            // path, so a tooltip naming only that path would name a file
-            // nothing is being written to.
-            let split = self.state.source_mode == SourceMode::Separate
-                && self.state.source_keys.len() > 1;
-            let hover = match &self.state.stream_to {
-                Some(p) if split => {
-                    format!("Appending to one file per source beside {p}\nClick to stop")
+            if ui
+                .button("Stream…")
+                .on_hover_text(stream_hover(running))
+                .clicked()
+            {
+                let (dir, name) =
+                    stream_seed(self.state.stream_to.as_deref(), &save::timestamp());
+                let chosen = rfd::FileDialog::new()
+                    .set_file_name(name)
+                    .set_directory(dir)
+                    .save_file();
+                if let Some(p) = &chosen {
+                    self.status_line = Some((
+                        Severity::Ok,
+                        format!("The next session appends to {}", p.display()),
+                    ));
                 }
-                Some(p) => format!("Appending to {p}\nClick to stop"),
-                None => "Append the transcript to a file as you speak, so\n\
-                         nothing is lost if this crashes"
-                    .to_string(),
-            };
-            if ui.button(label).on_hover_text(hover).clicked() {
-                if streaming {
-                    action = Some(Request::SetStreamFile { path: None });
-                    self.status_line =
-                        Some((Severity::Ok, "Stopped streaming to file".into()));
-                } else if let Some(p) = rfd::FileDialog::new()
-                    .set_file_name(save::filename_for(&save::timestamp()))
-                    .set_directory(save::default_dir())
-                    .save_file()
-                {
-                    let path = p.display().to_string();
-                    self.status_line =
-                        Some((Severity::Ok, format!("Appending to {path}")));
-                    action = Some(Request::SetStreamFile { path: Some(path) });
+                // Cancelling leaves the setting alone: closing a dialog is not
+                // a way of asking for anything.
+                if let Some(req) = stream_choice(chosen) {
+                    action = Some(req);
                 }
+            }
+            // A bare verb, because it acts at once. Stopping is its own
+            // control now that the button beside it always asks, and it is
+            // shown only while there is something to stop.
+            if streaming
+                && ui
+                    .button("Stop streaming")
+                    .on_hover_text(
+                        "Stop appending to a file. Saving at the end still works.",
+                    )
+                    .clicked()
+            {
+                action = Some(Request::SetStreamFile { path: None });
+                self.status_line =
+                    Some((Severity::Ok, "Stopped streaming to file".into()));
             }
 
             if ui
@@ -1294,10 +1307,40 @@ impl App {
             });
         });
         self.server_row(ui, running);
+        // Under the row rather than in the button's tooltip: what is being
+        // written is worth reading without hovering, and in separate mode the
+        // path that was chosen is not one of the files that gets written.
+        if let Some(target) = self.state.stream_to.clone() {
+            let targets =
+                stream_targets(&target, self.state.source_mode, &self.source_names());
+            if let Some(label) = stream_target_label(&targets) {
+                ui.weak(label);
+            }
+        }
         ui.weak("Closing this window leaves dictation running in the tray.");
         if let Some(a) = action {
             self.send(a);
         }
+    }
+
+    /// The selected sources under the names their files would take.
+    ///
+    /// `Source::short_label` is what `DaemonRuntime::start` hands to
+    /// `save::path_for_source`, so these are the names the split files
+    /// actually get. A key whose device has gone keeps the key, which is at
+    /// least something to recognise it by.
+    fn source_names(&self) -> Vec<String> {
+        self.state
+            .source_keys
+            .iter()
+            .map(|k| {
+                self.sources
+                    .iter()
+                    .find(|s| &s.stable_key() == k)
+                    .map(|s| s.short_label())
+                    .unwrap_or_else(|| k.clone())
+            })
+            .collect()
     }
 }
 
@@ -1327,6 +1370,83 @@ fn normalise_server(input: &str) -> Result<String> {
         anyhow::bail!("the address names no host");
     }
     Ok(s.to_string())
+}
+
+/// Where the Save dialog opens, and what it proposes to call the file.
+///
+/// Recomputed on every press. The chosen path is persisted, so the last one is
+/// still there on the next run -- and reusing its *name* is what appended
+/// tonight's meeting to a file created a fortnight ago and named for that day.
+/// The folder is worth remembering; the filename is not.
+fn stream_seed(remembered: Option<&str>, stamp: &str) -> (PathBuf, String) {
+    let dir = remembered
+        // The config documents `~/transcripts/notes.txt`, and nothing has
+        // expanded that by the time it reaches a dialog.
+        .map(syrinx_client::config::expand_tilde)
+        .and_then(|p| p.parent().map(PathBuf::from))
+        // A dialog pointed at a folder that has since gone opens wherever the
+        // toolkit decides, which is worse than opening where transcripts live.
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(save::default_dir);
+    (dir, save::filename_for(stamp))
+}
+
+/// What a press of Stream asks the daemon for.
+///
+/// Cancelling is not stopping. A dialog closed with nothing chosen leaves the
+/// current target exactly as it was, so there is no request at all rather than
+/// one clearing it.
+fn stream_choice(chosen: Option<PathBuf>) -> Option<Request> {
+    chosen.map(|p| Request::SetStreamFile {
+        path: Some(p.display().to_string()),
+    })
+}
+
+/// The files a session started now would actually append to.
+///
+/// Separate mode with more than one source writes one beside the chosen path
+/// per source and never writes the chosen path itself. The rule is
+/// `DaemonRuntime::start`'s, and has to stay the same one, or this names files
+/// that never appear.
+fn stream_targets(target: &str, mode: SourceMode, sources: &[String]) -> Vec<String> {
+    if mode != SourceMode::Separate || sources.len() < 2 {
+        return vec![target.to_string()];
+    }
+    let base = std::path::Path::new(target);
+    sources
+        .iter()
+        .map(|s| save::path_for_source(base, s).display().to_string())
+        .collect()
+}
+
+/// Hover text for the Stream button.
+///
+/// Two answers, because there are two truths. `session::run` opens the writer
+/// once, at session start, from the options that session captured, so a file
+/// chosen now cannot redirect a session already under way -- which the old
+/// text claimed it did, in the present tense, from the moment the setting
+/// existed.
+fn stream_hover(running: bool) -> &'static str {
+    if running {
+        "Choose a file to append the transcript to.\n\
+         The file is opened when a session starts, so this applies to\n\
+         the next session and not to the one running."
+    } else {
+        "Choose a file to append the transcript to as you speak, so\n\
+         nothing is lost if this crashes."
+    }
+}
+
+/// The target as it reads beneath the controls.
+fn stream_target_label(targets: &[String]) -> Option<String> {
+    match targets {
+        [] => None,
+        [one] => Some(format!("Stream target: {one}")),
+        many => Some(format!(
+            "Stream target, one file per source: {}",
+            many.join(", ")
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1377,6 +1497,130 @@ mod tests {
     fn an_address_without_a_scheme_is_refused() {
         assert!(normalise_server("192.168.1.10").is_err());
         assert!(normalise_server("dictate.example.com").is_err());
+    }
+
+    #[test]
+    fn the_dialog_is_seeded_with_todays_name_in_the_remembered_folder() {
+        // The bug this exists for. `stream_to` is persisted, so a file chosen
+        // on the 20th came back on every run afterwards and a fortnight of
+        // meetings piled into one file still called 2026-08-20_09-14-03.txt.
+        let stale = std::env::temp_dir().join("2026-08-20_09-14-03.txt");
+        let (folder, name) =
+            stream_seed(Some(&stale.display().to_string()), "2026-08-27_18-02-11");
+        assert_eq!(folder, stale.parent().unwrap(), "the folder is worth keeping");
+        assert_eq!(name, "2026-08-27_18-02-11.txt", "the stale name came back");
+    }
+
+    #[test]
+    fn a_remembered_folder_that_has_gone_falls_back_to_the_default() {
+        // A dialog opened on a directory that no longer exists opens
+        // somewhere arbitrary, which is worse than opening where transcripts
+        // normally go.
+        let (folder, name) =
+            stream_seed(Some("/no-such-place-9d3f/notes.txt"), "2026-08-27_18-02-11");
+        assert_eq!(folder, save::default_dir());
+        assert_eq!(name, "2026-08-27_18-02-11.txt");
+    }
+
+    #[test]
+    fn nothing_remembered_opens_where_transcripts_go() {
+        assert_eq!(stream_seed(None, "s").0, save::default_dir());
+    }
+
+    #[test]
+    fn a_remembered_path_written_with_a_tilde_still_names_a_folder() {
+        // The generated config documents `~/transcripts/notes.txt`, and no
+        // shell has expanded it by the time it reaches a file dialog.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap();
+        assert_eq!(stream_seed(Some("~/notes.txt"), "s").0, PathBuf::from(home));
+    }
+
+    #[test]
+    fn cancelling_the_dialog_is_not_a_stop() {
+        // The button used to be a toggle, so a second press stopped
+        // streaming. It always asks now, and a dialog closed with nothing
+        // chosen has to leave the setting exactly as it was.
+        assert_eq!(stream_choice(None), None);
+        assert_eq!(
+            stream_choice(Some(PathBuf::from("/tmp/notes.txt"))),
+            Some(Request::SetStreamFile {
+                path: Some("/tmp/notes.txt".into())
+            })
+        );
+    }
+
+    #[test]
+    fn separate_mode_names_the_file_each_source_really_gets() {
+        // `save::path_for_source` splits the chosen path, so naming only the
+        // path that was chosen would name a file nothing is written to.
+        assert_eq!(
+            stream_targets(
+                "/tmp/meeting.txt",
+                SourceMode::Separate,
+                &["Yeti".to_string(), "System audio".to_string()],
+            ),
+            ["/tmp/meeting-yeti.txt", "/tmp/meeting-system-audio.txt"]
+        );
+    }
+
+    #[test]
+    fn one_source_streams_to_the_path_that_was_chosen() {
+        // The daemon splits only in separate mode and only with more than one
+        // source; the window has to say the same or it names files that never
+        // appear.
+        assert_eq!(
+            stream_targets("/tmp/meeting.txt", SourceMode::Separate, &["Yeti".into()]),
+            ["/tmp/meeting.txt"]
+        );
+        assert_eq!(
+            stream_targets(
+                "/tmp/meeting.txt",
+                SourceMode::Combined,
+                &["Yeti".into(), "System audio".into()],
+            ),
+            ["/tmp/meeting.txt"]
+        );
+    }
+
+    #[test]
+    fn a_running_session_is_told_the_target_is_for_the_next_one() {
+        // The writer is opened once, at session start, from the options the
+        // session captured -- so choosing a file now cannot redirect the
+        // session already running. The old text said "Appending to ..." the
+        // moment the setting existed, which was a claim about a file this
+        // session may never touch.
+        let running = stream_hover(true);
+        assert!(running.contains("next session"), "{running}");
+        assert_ne!(running, stream_hover(false));
+    }
+
+    #[test]
+    fn an_idle_window_is_told_what_the_button_is_for() {
+        // Nothing is running, so there is no other session to distinguish it
+        // from, and the sentence that explains why anyone would stream is the
+        // useful one.
+        let idle = stream_hover(false);
+        assert!(!idle.contains("next session"), "{idle}");
+        assert!(idle.contains("crashes"), "{idle}");
+    }
+
+    #[test]
+    fn the_target_is_readable_without_hovering() {
+        let one = stream_target_label(&["/tmp/notes.txt".to_string()])
+            .expect("a chosen target has something to say");
+        assert!(one.contains("/tmp/notes.txt"), "{one}");
+
+        let split = stream_target_label(&[
+            "/tmp/a-mic.txt".to_string(),
+            "/tmp/a-system-audio.txt".to_string(),
+        ])
+        .unwrap();
+        assert!(split.contains("/tmp/a-mic.txt"), "{split}");
+        assert!(split.contains("/tmp/a-system-audio.txt"), "{split}");
+
+        assert_eq!(stream_target_label(&[]), None, "nothing set, nothing to say");
     }
 
     #[test]
