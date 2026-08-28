@@ -566,6 +566,12 @@ async fn run(
                             label: label.clone(),
                             rms,
                             silent: last_audio.elapsed() >= STARVE_AFTER,
+                            // A lone source is opened directly, with no queue
+                            // behind it to trim, and one that would not open
+                            // failed the whole session rather than reaching
+                            // here -- there is only the one.
+                            dropped: 0,
+                            error: None,
                         }]
                     }
                     (None, None) => Vec::new(),

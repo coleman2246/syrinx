@@ -14,10 +14,15 @@
 //! silenced the microphone beside it. Silence is the correct rendering of an
 //! idle output; the clock is what makes it expressible.
 //!
-//! Gain stays at 1/N whether or not a source contributed. Averaging over only
-//! the sources that had data would move the output 6 dB the moment one woke or
-//! went quiet, mid-utterance, which costs the recogniser more than a constant
-//! halving does.
+//! Gain is 1/N over the sources that are *live*, not over every source
+//! selected. A source that has delivered nothing for [`STARVE_AFTER`] is left
+//! out of the divisor, so a microphone beside a Windows loopback with nothing
+//! playing reaches the server at full amplitude instead of half. Dividing by
+//! whatever happened to arrive in the last 20 ms would be the dangerous
+//! version of this: it would move the output 6 dB every time a source paused
+//! between words. Starvation is five seconds of hysteresis, which no utterance
+//! is long enough to straddle, so the divisor only moves on an edge that is
+//! already slow.
 //!
 //! Sources are independent devices on independent clocks, so they never
 //! deliver the same amount at the same moment. Each gets a short queue, trimmed
@@ -32,18 +37,25 @@ use tokio::sync::mpsc;
 
 use crate::{Capture, Source};
 
-/// Average several equal-length frames into one.
+/// Average several equal-length frames into one, dividing by `live`.
 ///
 /// Averaged rather than summed: two full-scale inputs added together clip, and
 /// clipping is both audible and destructive to recognition. Averaging cannot
 /// exceed full scale whatever the inputs do, and preserves which source was
 /// actually louder.
-pub fn mix_frames(frames: &[Vec<f32>]) -> Vec<f32> {
+///
+/// `live` is how many of these sources are currently carrying audio, which is
+/// not always how many there are; see the module doc for why the divisor is
+/// the smaller of the two.
+pub fn mix_frames(frames: &[Vec<f32>], live: usize) -> Vec<f32> {
     if frames.is_empty() {
         return Vec::new();
     }
     let len = frames.iter().map(|f| f.len()).min().unwrap_or(0);
-    let n = frames.len() as f32;
+    // At least one, so a mix whose every source has starved still divides by
+    // something. Every frame is silence in that case and the value cannot
+    // change the answer, but a zero would.
+    let n = live.max(1) as f32;
     (0..len)
         .map(|i| frames.iter().map(|f| f[i]).sum::<f32>() / n)
         .collect()
@@ -58,16 +70,15 @@ const TICK: Duration = Duration::from_millis(20);
 /// backend normalises to.
 const FRAME: usize = syrinx_proto::SAMPLE_RATE as usize / 50;
 
-/// How much audio a source may buffer before its oldest is dropped.
+/// How much audio a source may buffer before its oldest is dropped: 200 ms.
 ///
-/// 200 ms, where this was two seconds while the mix waited for its slowest
-/// source. With the clock driving emission, a queue that keeps growing means
-/// that source runs fast relative to the tick -- which happens for real:
+/// With the clock driving emission, a queue that keeps growing means that
+/// source runs fast relative to the tick -- which happens for real:
 /// `resample_to_16k` decimates with `chunks_exact`, silently dropping up to
 /// `factor - 1` samples per callback whenever the device's period is not a
 /// multiple of the ratio, and two devices on independent crystals drift
-/// regardless. Trimming here keeps the sources loosely aligned instead of
-/// letting one run two seconds ahead of the other.
+/// regardless. A backlog is latency the listener pays for on every word, so
+/// the bound is kept short enough that the mix stays near the present.
 const MAX_QUEUED: usize = FRAME * 10;
 
 /// How long a source may contribute nothing before it is reported as silent.
@@ -89,8 +100,22 @@ pub struct SourceHealth {
     pub label: String,
     /// Level of what this source contributed last tick, 0.0 to 1.0.
     pub rms: f32,
-    /// Nothing has arrived from this source for [`STARVE_AFTER`].
+    /// Nothing has arrived from this source for [`STARVE_AFTER`], or nothing
+    /// ever will because it did not open.
     pub silent: bool,
+    /// Samples trimmed from this source's queue since the session began.
+    ///
+    /// Carried to the window rather than only logged: trimming is words going
+    /// missing mid-utterance, continuously, and somebody reading a transcript
+    /// with holes in it has no other way to discover that is what happened.
+    #[serde(default)]
+    pub dropped: u64,
+    /// Why this source contributes nothing, when its device would not open.
+    ///
+    /// `None` for a working source and for one that is merely silent -- an
+    /// idle loopback is not a fault, and saying so in red would be a lie.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Lets a repeated message through at most once per interval.
@@ -128,10 +153,12 @@ struct SourceQueue {
     last_data: Instant,
     /// Level of the last frame taken from this source.
     rms: f32,
-    /// Samples discarded because this source ran ahead of the clock.
+    /// Samples discarded because this queue overflowed.
     dropped: u64,
     /// The capture behind this queue has ended and will send nothing more.
     finished: bool,
+    /// Why there is no capture behind this queue at all.
+    error: Option<String>,
 }
 
 impl SourceQueue {
@@ -143,6 +170,20 @@ impl SourceQueue {
             rms: 0.0,
             dropped: 0,
             finished: false,
+            error: None,
+        }
+    }
+
+    /// A queue for a source whose device would not open.
+    ///
+    /// It holds a place in the row order and carries the reason, so the
+    /// window can name the source that is missing rather than simply showing
+    /// one row where the user selected two.
+    fn failed(label: String, why: String) -> Self {
+        Self {
+            finished: true,
+            error: Some(why),
+            ..Self::new(label)
         }
     }
 
@@ -181,8 +222,13 @@ impl SourceQueue {
         frame
     }
 
+    /// Nothing has arrived for [`STARVE_AFTER`], or nothing ever will.
+    ///
+    /// Also the mix's test for whether this source counts towards the gain
+    /// divisor, which is why a source that never opened has to answer true
+    /// here at once rather than after five seconds of pretending.
     fn silent_at(&self, now: Instant) -> bool {
-        now.duration_since(self.last_data) >= STARVE_AFTER
+        self.error.is_some() || now.duration_since(self.last_data) >= STARVE_AFTER
     }
 
     /// Nothing left to emit and nothing more coming.
@@ -210,62 +256,103 @@ impl Health {
                     label: q.label.clone(),
                     rms: q.rms,
                     silent: q.silent_at(now),
+                    dropped: q.dropped,
+                    error: q.error.clone(),
                 }
             })
             .collect()
     }
 }
 
-/// Drive the mix from `inputs` onto the clock, into `out`.
+/// What the mix has to work with for one source.
+enum Feed {
+    /// A capture that started, delivering into this channel.
+    Live(mpsc::Receiver<Vec<f32>>),
+    /// A device that would not open, and why. The mix runs without it.
+    Failed(String),
+}
+
+/// Drive the mix from `feeds` onto the clock, into `out`.
 ///
 /// Split out from [`MixedCapture::start`] so it can be driven from synthetic
 /// senders. Every fault this exists to prevent is about what happens when a
 /// device produces nothing, and no test can arrange that through a real one.
-fn spawn_mix(
-    labels: &[String],
-    inputs: Vec<mpsc::Receiver<Vec<f32>>>,
-    out: mpsc::Sender<Vec<f32>>,
-) -> Health {
-    let queues: Vec<Arc<Mutex<SourceQueue>>> = labels
-        .iter()
-        .map(|l| Arc::new(Mutex::new(SourceQueue::new(l.clone()))))
-        .collect();
+fn spawn_mix(feeds: Vec<(String, Feed)>, out: mpsc::Sender<Vec<f32>>) -> Health {
+    let mut queues: Vec<Arc<Mutex<SourceQueue>>> = Vec::with_capacity(feeds.len());
 
-    for (mut rx, queue) in inputs.into_iter().zip(&queues) {
-        let q = queue.clone();
+    for (label, feed) in feeds {
+        let mut rx = match feed {
+            Feed::Live(rx) => rx,
+            Feed::Failed(why) => {
+                queues.push(Arc::new(Mutex::new(SourceQueue::failed(label, why))));
+                continue;
+            }
+        };
+        let queue = Arc::new(Mutex::new(SourceQueue::new(label.clone())));
+        queues.push(queue.clone());
         tokio::spawn(async move {
             let mut trim_log = Rate::new(TRIM_LOG_EVERY);
+            // `label` is read at most once every five seconds and cloning it
+            // per chunk would be fifty clones a second to feed one of them.
             while let Some(chunk) = rx.recv().await {
-                let (dropped, label) = {
-                    let mut q = q.lock().expect("mixer queue poisoned");
-                    (q.push(chunk), q.label.clone())
+                let (dropped, total) = {
+                    let mut q = queue.lock().expect("mixer queue poisoned");
+                    (q.push(chunk), q.dropped)
                 };
                 if dropped > 0 && trim_log.allow(Instant::now()) {
+                    // The cumulative figure, not this call's: trimming happens
+                    // on nearly every callback once it starts, so the count
+                    // from the one call that won the rate limit understates
+                    // the loss by orders of magnitude.
+                    //
+                    // Which side is at fault is genuinely not known here. A
+                    // queue overflows when the source outruns the clock and
+                    // equally when the mix falls behind its own tick, and the
+                    // queue cannot tell the two apart.
                     tracing::warn!(
-                        "{label} is running ahead of the mix; trimming its queue \
-                         (dropped {dropped} samples this time)"
+                        "trimming {label}'s queue: {total} samples dropped so far. \
+                         Either this source is running ahead of the mix or the mix \
+                         is running late; both overflow a queue that holds \
+                         {MAX_QUEUED} samples."
                     );
                 }
             }
-            q.lock().expect("mixer queue poisoned").finished = true;
+            queue.lock().expect("mixer queue poisoned").finished = true;
         });
     }
 
     let mix = queues.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(TICK);
-        // Delay, not Burst: a consumer that stalls must not be repaid with a
-        // flood of catch-up frames drawn from queues that only hold 200 ms,
-        // which would be a burst of silence rather than the audio it missed.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Burst, not Delay. A tick that runs late has the audio it missed
+        // sitting in the queues waiting for it, and `Delay` forfeits that
+        // audio outright: it restarts the schedule from now, so the frames
+        // that were due are never taken and are trimmed away unheard.
+        // Bursting hands them over across the next few ticks instead, which
+        // is what the speaker actually said. Measured under a consumer
+        // stalling 60 ms once a second, `Delay` discarded 180 ms per source
+        // per ten seconds and pinned both queues at their bound; `Burst`
+        // dropped nothing and left the queues empty.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
         loop {
             ticker.tick().await;
+            let now = Instant::now();
             let mut frames = Vec::with_capacity(mix.len());
             let mut spent = true;
+            let mut live = 0usize;
             for q in &mix {
                 let mut q = q.lock().expect("mixer queue poisoned");
-                frames.push(q.take_frame());
+                // Read before `take_frame`, which is what empties the queue.
+                // A source whose last samples this tick is about to emit is
+                // not spent until they have gone out; reading it afterwards
+                // threw away the final frame of every source at stop, and
+                // threw away everything when a capture ended with less than
+                // one frame buffered.
                 spent &= q.spent();
+                if !q.silent_at(now) {
+                    live += 1;
+                }
+                frames.push(q.take_frame());
             }
             // Every capture has ended and been drained. Dropping `out` here is
             // what tells the session its audio is over; ticking silence for
@@ -273,7 +360,7 @@ fn spawn_mix(
             if spent {
                 break;
             }
-            if out.send(mix_frames(&frames)).await.is_err() {
+            if out.send(mix_frames(&frames, live)).await.is_err() {
                 break;
             }
         }
@@ -289,23 +376,47 @@ pub struct MixedCapture {
 }
 
 impl MixedCapture {
-    /// Start every source and mix them into `out`.
+    /// Start every source that will start, and mix them into `out`.
+    ///
+    /// A device that refuses to open costs its own row and nothing else. The
+    /// point of selecting two sources is that one of them is a Windows
+    /// loopback, which is the one that fails -- and failing the whole session
+    /// for it would take away the working microphone beside it, which is the
+    /// opposite of what the user asked for. The reason travels out on that
+    /// source's health row, so the window can say which one is missing and
+    /// why rather than quietly recording one source where two were ticked.
+    ///
+    /// Every source failing is still an error: there is nothing to record,
+    /// and an empty mix would report `Listening` for ever.
     pub fn start(sources: &[Source], out: mpsc::Sender<Vec<f32>>) -> Result<Self> {
         if sources.is_empty() {
             anyhow::bail!("no sources to combine");
         }
 
-        let labels: Vec<String> = sources.iter().map(|s| s.short_label()).collect();
         let mut captures = Vec::new();
-        let mut inputs = Vec::new();
+        let mut feeds: Vec<(String, Feed)> = Vec::with_capacity(sources.len());
+        let mut failures: Vec<String> = Vec::new();
         for source in sources {
             let (tx, rx) = mpsc::channel::<Vec<f32>>(32);
-            captures.push(Capture::start(source, tx)?);
-            inputs.push(rx);
+            match Capture::start(source, tx) {
+                Ok(c) => {
+                    captures.push(c);
+                    feeds.push((source.short_label(), Feed::Live(rx)));
+                }
+                Err(e) => {
+                    let why = format!("{e:#}");
+                    tracing::warn!("leaving {} out of the mix: {why}", source.display());
+                    failures.push(format!("{}: {why}", source.display()));
+                    feeds.push((source.short_label(), Feed::Failed(why)));
+                }
+            }
+        }
+        if captures.is_empty() {
+            anyhow::bail!("no selected source would open ({})", failures.join("; "));
         }
 
         Ok(Self {
-            health: spawn_mix(&labels, inputs, out),
+            health: spawn_mix(feeds, out),
             _captures: captures,
         })
     }
@@ -323,45 +434,61 @@ mod tests {
     fn two_sources_are_averaged_not_summed() {
         // Summing would put this at 2.0, which clips. Averaging keeps it in
         // range whatever the inputs do.
-        let out = mix_frames(&[vec![1.0, 1.0], vec![1.0, 1.0]]);
+        let out = mix_frames(&[vec![1.0, 1.0], vec![1.0, 1.0]], 2);
         assert_eq!(out, vec![1.0, 1.0]);
     }
 
     #[test]
     fn full_scale_opposites_cancel_rather_than_overflow() {
-        assert_eq!(mix_frames(&[vec![1.0], vec![-1.0]]), vec![0.0]);
+        assert_eq!(mix_frames(&[vec![1.0], vec![-1.0]], 2), vec![0.0]);
     }
 
     #[test]
     fn a_quiet_source_stays_quiet_next_to_a_loud_one() {
         // Relative level is information: it says who was actually louder.
-        let out = mix_frames(&[vec![1.0], vec![0.0]]);
+        let out = mix_frames(&[vec![1.0], vec![0.0]], 2);
         assert_eq!(out, vec![0.5]);
+    }
+
+    #[test]
+    fn a_source_left_out_of_the_divisor_costs_the_others_nothing() {
+        // The permanently-idle loopback. Counting it in the divisor put a
+        // microphone beside it on the wire at exactly half amplitude, for the
+        // whole session, in the commonest two-source configuration there is.
+        assert_eq!(mix_frames(&[vec![1.0], vec![0.0]], 1), vec![1.0]);
     }
 
     #[test]
     fn mixing_takes_the_shortest_frame() {
         // Sources never deliver the same amount at the same moment, so the mix
         // is bounded by whichever has least.
-        let out = mix_frames(&[vec![1.0, 1.0, 1.0], vec![1.0]]);
+        let out = mix_frames(&[vec![1.0, 1.0, 1.0], vec![1.0]], 2);
         assert_eq!(out.len(), 1);
     }
 
     #[test]
     fn one_source_passes_through_unchanged() {
         // Combined mode with a single source must not alter it.
-        assert_eq!(mix_frames(&[vec![0.25, -0.5]]), vec![0.25, -0.5]);
+        assert_eq!(mix_frames(&[vec![0.25, -0.5]], 1), vec![0.25, -0.5]);
     }
 
     #[test]
     fn no_sources_yields_nothing_rather_than_panicking() {
-        assert!(mix_frames(&[]).is_empty());
-        assert!(mix_frames(&[vec![], vec![]]).is_empty());
+        assert!(mix_frames(&[], 0).is_empty());
+        assert!(mix_frames(&[vec![], vec![]], 0).is_empty());
+    }
+
+    #[test]
+    fn a_divisor_of_zero_does_not_divide_by_zero() {
+        // Reachable: every source starved at once is every source silent, so
+        // the answer is silence either way -- but a zero divisor would make
+        // it NaN, which is not silence and travels a long way downstream.
+        assert_eq!(mix_frames(&[vec![0.0], vec![0.0]], 0), vec![0.0]);
     }
 
     #[test]
     fn three_sources_average_correctly() {
-        let out = mix_frames(&[vec![0.9], vec![0.3], vec![0.3]]);
+        let out = mix_frames(&[vec![0.9], vec![0.3], vec![0.3]], 3);
         assert!((out[0] - 0.5).abs() < 1e-6, "got {}", out[0]);
     }
 
@@ -381,11 +508,24 @@ mod tests {
         let (b_tx, b_rx) = mpsc::channel::<Vec<f32>>(32);
         let (out_tx, out_rx) = mpsc::channel::<Vec<f32>>(64);
         let health = spawn_mix(
-            &["A".to_string(), "B".to_string()],
-            vec![a_rx, b_rx],
+            vec![
+                ("A".to_string(), Feed::Live(a_rx)),
+                ("B".to_string(), Feed::Live(b_rx)),
+            ],
             out_tx,
         );
         (a_tx, b_tx, out_rx, health)
+    }
+
+    /// Push a queue's clock back far enough that the mix reads it as starved.
+    ///
+    /// Reached into rather than waited out: [`STARVE_AFTER`] is five seconds
+    /// by design, and a test that slept through it would be five seconds of
+    /// nothing on every run.
+    fn starve(health: &Health, which: usize) {
+        health.0[which].lock().unwrap().last_data = Instant::now()
+            .checked_sub(STARVE_AFTER + Duration::from_secs(1))
+            .expect("the clock must reach back a few seconds");
     }
 
     /// Read frames until one carries something, or give up.
@@ -418,9 +558,28 @@ mod tests {
 
         let heard = first_audible(&mut out).await;
         assert_eq!(heard.len(), FRAME);
-        // Halved by the silent source's contribution: the gain stays at 1/N so
-        // the level cannot jump 6 dB mid-utterance when a source wakes up.
+        // Still halved, because the idle source has not yet been idle long
+        // enough to be called starved: it is given STARVE_AFTER to say
+        // something, exactly as the meter rows give it. The hysteresis is the
+        // point -- a divisor that followed each frame would move 6 dB every
+        // time a speaker paused. See the test below for the other side.
         assert!((heard[0] - 0.5).abs() < 1e-6, "got {}", heard[0]);
+    }
+
+    #[tokio::test]
+    async fn a_starved_source_stops_costing_the_others_their_level() {
+        // Mic plus a Windows loopback with nothing playing is the reported
+        // configuration, and the loopback in it is silent for the whole
+        // session. Dividing by it anyway put the microphone on the wire 6 dB
+        // down for as long as the user cared to talk.
+        let (live, _idle, mut out, health) = two_sources();
+        starve(&health, 1);
+        for _ in 0..4 {
+            live.send(vec![1.0; FRAME]).await.unwrap();
+        }
+
+        let heard = first_audible(&mut out).await;
+        assert!((heard[0] - 1.0).abs() < 1e-6, "got {}", heard[0]);
     }
 
     #[tokio::test]
@@ -483,22 +642,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_mix_ends_when_every_source_has_ended() {
-        // Otherwise a session whose devices all died would listen to a stream
-        // of manufactured silence for ever instead of noticing.
+    async fn the_mix_ends_only_after_emitting_what_its_sources_left_behind() {
+        // Two things at once, because they are the same tick. A session whose
+        // devices all died must stop rather than listen to manufactured
+        // silence for ever -- and the tick that drains the last queue still
+        // has to send what it drained. `take_frame` is what empties a queue,
+        // so a `spent` test taken after it is true on the very tick that
+        // produced the final audio: this exact case, one frame pushed and
+        // both sources gone, emitted nothing at all.
         let (a, b, mut out, _health) = two_sources();
         a.send(vec![0.5; FRAME]).await.unwrap();
         drop(a);
         drop(b);
 
-        let ended = tokio::time::timeout(Duration::from_secs(5), async {
-            while out.recv().await.is_some() {}
+        let heard = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut frames = 0usize;
+            let mut audible = 0usize;
+            while let Some(f) = out.recv().await {
+                frames += 1;
+                if f.iter().any(|s| *s != 0.0) {
+                    audible += 1;
+                }
+            }
+            (frames, audible)
         })
-        .await;
-        assert!(
-            ended.is_ok(),
-            "the mix kept emitting after every source ended"
-        );
+        .await
+        .expect("the mix kept emitting after every source ended");
+        assert!(heard.0 > 0, "the mix ended without emitting anything");
+        assert_eq!(heard.1, 1, "the last frame of audio never left the mix");
     }
 
     #[tokio::test]
@@ -516,6 +687,53 @@ mod tests {
         assert_eq!(rows[0].label, "A");
         assert!(rows[0].rms > 0.5, "the live source reads {}", rows[0].rms);
         assert_eq!(rows[1].rms, 0.0, "the idle source invented a level");
+    }
+
+    #[tokio::test]
+    async fn a_mix_that_ran_late_catches_up_rather_than_forfeiting_the_backlog() {
+        // tokio applies its missed-tick behaviour whenever a tick runs more
+        // than 5 ms late, which on a loaded machine is routine. `Delay`
+        // restarts the schedule from the moment it noticed, so the frames that
+        // fell due while it was late are never taken -- and they are not
+        // skipped either, because they are sitting in the source's queue.
+        // They are held there and trimmed away later as overflow. Measured
+        // under a consumer stalling 60 ms once a second: 180 ms of audio
+        // discarded per source per ten seconds, both queues pinned at their
+        // bound, and 200 ms of latency added for good.
+        const PUSHED: usize = 9;
+        let (a_tx, a_rx) = mpsc::channel::<Vec<f32>>(64);
+        // One deep, so a consumer that stops reading stalls the mix at once
+        // rather than after sixty-four frames of slack.
+        let (out_tx, mut out) = mpsc::channel::<Vec<f32>>(1);
+        let health = spawn_mix(vec![("A".to_string(), Feed::Live(a_rx))], out_tx);
+        for _ in 0..PUSHED {
+            a_tx.send(vec![0.5; FRAME]).await.unwrap();
+        }
+
+        // Nobody reads for fifteen ticks' worth. The mix gets two frames into
+        // the channel and then blocks on the third.
+        tokio::time::sleep(TICK * 15).await;
+
+        // Everything owed has to come back at once now, not one frame per
+        // 20 ms from a schedule that restarted.
+        let (mut frames, mut audible) = (0usize, 0usize);
+        let _ = tokio::time::timeout(TICK * 5, async {
+            loop {
+                let Some(f) = out.recv().await else { break };
+                frames += 1;
+                if f.iter().any(|s| *s != 0.0) {
+                    audible += 1;
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            audible, PUSHED,
+            "only {audible} of {PUSHED} pushed frames came back; the mix is \
+             emitting on a restarted schedule rather than the one it owes"
+        );
+        assert_eq!(health.read()[0].dropped, 0, "audio was trimmed away unheard");
     }
 
     #[test]
@@ -599,5 +817,71 @@ mod tests {
         assert_eq!(frame.len(), FRAME);
         assert!(frame.iter().all(|s| *s == 0.0));
         assert_eq!(q.rms, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_source_that_would_not_open_neither_silences_nor_hides_itself() {
+        // The whole thesis of selecting two sources. A loopback that refuses
+        // to open must cost its own row and nothing more -- not the working
+        // microphone beside it, and not its own place in the meter, or the
+        // window shows one row where two were ticked and the user is back to
+        // guessing which one went missing.
+        let (a_tx, a_rx) = mpsc::channel::<Vec<f32>>(32);
+        let (out_tx, mut out) = mpsc::channel::<Vec<f32>>(64);
+        let health = spawn_mix(
+            vec![
+                ("Yeti".to_string(), Feed::Live(a_rx)),
+                (
+                    "System audio".to_string(),
+                    Feed::Failed("Device does not support input".to_string()),
+                ),
+            ],
+            out_tx,
+        );
+        a_tx.send(vec![1.0; FRAME]).await.unwrap();
+
+        // Full scale, not half: a source that never opened is not a live one,
+        // so it takes no share of the gain.
+        let heard = first_audible(&mut out).await;
+        assert!((heard[0] - 1.0).abs() < 1e-6, "got {}", heard[0]);
+
+        let rows = health.read();
+        assert_eq!(rows.len(), 2, "the source that failed lost its row");
+        assert_eq!(rows[1].label, "System audio");
+        assert_eq!(
+            rows[1].error.as_deref(),
+            Some("Device does not support input"),
+            "the reason has to reach the window, not only the log"
+        );
+        assert!(rows[1].silent);
+    }
+
+    #[tokio::test]
+    async fn a_mix_whose_every_source_failed_is_an_error_not_an_empty_stream() {
+        // The other half: skipping is only right while something is left. A
+        // mix with nothing behind it would report Listening for ever and
+        // record silence.
+        let missing = |n: &str| Source {
+            target: crate::source::SourceTarget::CpalDevice {
+                name: n.to_string(),
+                loopback: false,
+            },
+            name: n.to_string(),
+            kind: crate::source::SourceKind::Microphone,
+            detail: None,
+            stable_name: None,
+            sink_description: None,
+        };
+        let (out_tx, _out) = mpsc::channel::<Vec<f32>>(8);
+        let started = MixedCapture::start(
+            &[missing("no such device one"), missing("no such device two")],
+            out_tx,
+        );
+        let text = match started {
+            Ok(_) => panic!("a mix with nothing behind it must not report success"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(text.contains("no such device one"), "{text}");
+        assert!(text.contains("no such device two"), "{text}");
     }
 }

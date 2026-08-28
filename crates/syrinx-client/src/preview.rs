@@ -172,6 +172,12 @@ impl Preview {
             label: self.label.clone(),
             rms: self.rms(),
             silent: self.silent(),
+            // A preview holds one capture with no queue behind it, so there
+            // is nothing to trim; and a source whose device would not open
+            // has no `Preview` to ask, so its row comes from the daemon,
+            // which is what knows the source was selected at all.
+            dropped: 0,
+            error: None,
         }
     }
 }
