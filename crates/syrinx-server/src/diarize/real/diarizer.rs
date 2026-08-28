@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use super::{Embedder, Norm, Vad};
-use crate::diarize::cluster::{OnlineClusterer, cosine};
-use crate::diarize::window::{Cut, FRAME, Framer, WINDOW_SAMPLES, WindowAssembler};
+use crate::diarize::cluster::{Heard, OnlineClusterer, cosine};
+use crate::diarize::window::{Cut, FRAME, Framer, HOP_SAMPLES, WINDOW_SAMPLES, WindowAssembler};
 use crate::diarize::{Attribution, DiarizeTuning, Diarizer, DiarizerFactory, Relabel};
 
 /// The VAD, by name, in `diarize_model_dir`. Fixed rather than sniffed:
@@ -148,7 +148,8 @@ impl Models {
     /// speech probability for *everything* -- the vowel probe fails and
     /// nothing else would have noticed; an embedding model whose output is not
     /// a 2-D embedding, produces non-finite values, or produces an all-zero
-    /// vector.
+    /// vector; and an embedder that accepts one of the two input lengths a
+    /// session hands it and not the other.
     ///
     /// **What it cannot catch:** the wrong weights. A model trained on another
     /// language, at another sample rate, or read with the wrong `Norm` loads,
@@ -190,29 +191,34 @@ impl Models {
         );
 
         let mut embedder = Embedder::new(&path(&self.embed), EMBED_THREADS, self.norm)?;
-        // Exactly the window a session will hand it, so the shape checked here
-        // is the shape that runs -- an embedder that rejects the production
-        // frame count should fail at startup, not on someone's first meeting.
-        let window = speech_like(WINDOW_SAMPLES);
-        let embedding = embedder
-            .embed(&window)
-            .context("embedding a window of synthesised speech")?;
-        ensure!(
-            embedding.len() == embedder.dim(),
-            "{}: embedding is {} wide, but the model declares {}",
-            path(&self.embed),
-            embedding.len(),
-            embedder.dim()
-        );
-        // `Embedder::embed` normalises, so anything but a unit vector means it
-        // was handed zeros -- which l2_normalize's zero guard turns into a
-        // finite vector that the NaN check would let through.
-        let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        ensure!(
-            (norm - 1.0).abs() < 1e-3,
-            "{}: embedding of a voiced window has length {norm:.3}, not 1",
-            path(&self.embed)
-        );
+        // Both shapes a session hands it, because it hands over both: a 1.5 s
+        // window when one completes, and a 0.75 s hop on *every* hop of voiced
+        // audio. A fixed-input-length graph that only accepts the window would
+        // pass a window-only check at startup and then fail every hop for the
+        // length of the meeting.
+        for samples in [WINDOW_SAMPLES, HOP_SAMPLES] {
+            let embedding = embedder
+                .embed(&speech_like(samples))
+                .with_context(|| format!("embedding {samples} samples of synthesised speech"))?;
+            ensure!(
+                embedding.len() == embedder.dim(),
+                "{}: embedding of {samples} samples is {} wide, but the model \
+                 declares {}",
+                path(&self.embed),
+                embedding.len(),
+                embedder.dim()
+            );
+            // `Embedder::embed` normalises, so anything but a unit vector
+            // means it was handed zeros -- which l2_normalize's zero guard
+            // turns into a finite vector that the NaN check would let through.
+            let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+            ensure!(
+                (norm - 1.0).abs() < 1e-3,
+                "{}: embedding of {samples} samples of voiced audio has length \
+                 {norm:.3}, not 1",
+                path(&self.embed)
+            );
+        }
         Ok(embedder.dim())
     }
 }
@@ -332,22 +338,21 @@ fn speech_like(n: usize) -> Vec<f32> {
 /// Consecutive embeddings the embedder may fail before `RealDiarizer` calls
 /// itself broken.
 ///
-/// Six, and not five to match the session's strikes, because the two count
+/// Three, and not five to match the session's strikes, because the two count
 /// different things and stack: each of these failures is also a chunk the
-/// session warns about, so the whole episode is at most six plus five lines.
-/// Six consecutive embeddings is a little over two seconds of *voiced* audio,
-/// which is enough that a failure with a cause outside the model -- a failed
-/// allocation under memory pressure is the plausible one -- does not cost a
-/// session its labels. Nothing else transient can reach here: audio arrives as
-/// `pcm_s16le_to_f32` output, so a non-finite embedding is the model's doing
-/// and will not stop being the model's doing.
+/// session warns about, so the whole episode is at most three plus five lines.
+/// Three consecutive embeddings is a little over two seconds of *voiced*
+/// audio, which is enough that a failure with a cause outside the model -- a
+/// failed allocation under memory pressure is the plausible one -- does not
+/// cost a session its labels. Nothing else transient can reach here: audio
+/// arrives as `pcm_s16le_to_f32` output, so a non-finite embedding is the
+/// model's doing and will not stop being the model's doing.
 ///
-/// It was three while a window was the only thing embedded. There are now two
-/// embeddings per hop -- the hop itself and, on most hops, the window it
-/// completes -- so three would have halved the tolerance measured in seconds
-/// of speech, which is the quantity the paragraph above is reasoning about.
-/// The number moved so the reasoning would not have to.
-const MAX_EMBED_FAILURES: u32 = 6;
+/// Adding the hop embedding did not change that arithmetic, because `push`
+/// returns on the *first* embedding that fails: whatever a chunk was going to
+/// embed, at most one of them can mark the fuse, so a mark is still a chunk
+/// and three marks are still about two seconds of speech.
+const MAX_EMBED_FAILURES: u32 = 3;
 
 /// Whether the embedder is still worth asking, counted in embeddings.
 ///
@@ -429,9 +434,24 @@ impl Fuse {
 /// reported as [`Relabel`]s for the session to turn into
 /// `transcript.relabel`: a speaker being minted, whose first seconds were
 /// committed with no name because four windows had not yet agreed, and a full
-/// window contradicting the provisional label a hop had been offering. Neither
-/// crosses a detected turn change, so a correction can never put one person's
-/// name on another's sentence.
+/// window contradicting the provisional label a hop had been offering.
+///
+/// How far back one may reach is `correctable_since`, and what bounds it is
+/// worth stating exactly rather than as "it never crosses a turn change".
+/// Three things move it forward, and they are the three points at which the
+/// audio before it has provenance this diarizer cannot vouch for: a *detected*
+/// turn change; the first completed hop of the session, which had nothing
+/// before it to be compared against, so no change could have been detected
+/// there even in principle; and a silence long enough to have cleared the
+/// accumulator, across which the same is true. A run is also ended by any
+/// window that settles a label, since a confident label is not correctable.
+///
+/// **What that does not guarantee.** A turn change entirely inside one hop is
+/// invisible to a detector that compares whole hops, so a correction can in
+/// principle reach over an interjection shorter than 0.736 s of voiced audio
+/// that carried no label of its own. The exposure is bounded to one hop and
+/// to the opening of a run -- anywhere else the incumbent's carried-forward
+/// label is on those chunks, and `session.rs` will not overwrite one.
 ///
 /// **On failure:** `session.rs` warns per failed chunk and retires the
 /// diarizer after five *consecutive* ones, so every error path here has to be
@@ -476,18 +496,25 @@ pub struct RealDiarizer {
     last_label: Option<u32>,
     /// The previous hop's embedding, for the change-point comparison. `None`
     /// before the first hop and after a gap long enough to have cleared the
-    /// accumulator, where there is nothing to compare against.
+    /// accumulator, where there is nothing to compare against -- the second is
+    /// enforced from `WindowAssembler::restarted`, since a hop from before
+    /// half a second of silence is not the hop before this one.
     previous_hop: Option<Vec<f32>>,
-    /// The chunk at which the run of chunks answered with no speaker began,
-    /// and `None` while a speaker is being named. What a mint relabels: those
-    /// chunks were committed unattributed and now have somebody to attribute
-    /// them to.
+    /// The earliest chunk a correction may still reach back to, or `None`
+    /// while the current chunk carries a settled label.
     ///
-    /// Reset at a detected turn change, which is what keeps a correction
-    /// inside one turn.
-    unlabelled_since: Option<u64>,
-    /// The provisional label a hop is currently asserting and the chunk it
-    /// started at. What a contradicting window relabels.
+    /// Not simply "where the unlabelled run began": it is bounded by the last
+    /// point this diarizer can vouch for the audio's provenance, which is a
+    /// detected turn change, the first hop of the session, or a silence that
+    /// cleared the accumulator. See the type's own notes -- the safety of
+    /// every relabel emitted here rests on this field and on nothing else.
+    correctable_since: Option<u64>,
+    /// The provisional label currently being asserted and the chunk it started
+    /// at. What a contradicting window relabels.
+    ///
+    /// Either a hop's guess or a full window the clusterer would not stand
+    /// behind; the two are the same promise to the reader and the same promise
+    /// to `session.rs`, which is that a later window may take it back.
     provisional: Option<(u32, u64)>,
     /// Chunks pushed so far. `Relabel` names chunks by this count, which is
     /// the same one `Session` keeps: the session pushes exactly one chunk per
@@ -525,7 +552,7 @@ impl RealDiarizer {
             change_threshold: tuning.change_threshold,
             last_label: None,
             previous_hop: None,
-            unlabelled_since: None,
+            correctable_since: None,
             provisional: None,
             chunks_seen: 0,
             fuse: Fuse::default(),
@@ -545,28 +572,56 @@ impl RealDiarizer {
         ))
     }
 
+    /// Mark a point the audio's provenance cannot be carried across.
+    ///
+    /// A correction may reach back to here and no further, because whatever
+    /// was said before it might have been somebody else and this diarizer has
+    /// no way to know. Three callers, and they are the three such points: a
+    /// detected turn change, the first hop of a session, and a silence that
+    /// cleared the accumulator.
+    fn seam(&mut self, chunk: u64) {
+        self.correctable_since = Some(chunk);
+    }
+
     /// A hop: the turn-change test, then a provisional label if there is
     /// nothing better on offer.
     ///
-    /// Returns whether this hop was a change point, which the caller needs in
-    /// order to throw away the windows behind it.
+    /// Returns whether this hop was an accepted change point, which the caller
+    /// needs in order to throw away the windows behind it.
     fn hop(&mut self, embedding: Vec<f32>, chunk: u64, out: &mut Attribution) -> bool {
-        let changed = self
-            .previous_hop
-            .as_ref()
-            .is_some_and(|previous| cosine(previous, &embedding) < self.change_threshold);
+        // A threshold of 0 is the documented way to switch detection off, and
+        // it has to be checked for rather than reached by arithmetic:
+        // different-speaker cosines are routinely negative, so `cosine < 0`
+        // fires often and no value of a bare threshold would ever mean "never".
+        let first = self.previous_hop.is_none();
+        let differs = self.change_threshold > 0.0
+            && self
+                .previous_hop
+                .as_ref()
+                .is_some_and(|previous| cosine(previous, &embedding) < self.change_threshold);
         self.previous_hop = Some(embedding.clone());
+
+        // Everything accumulated before this hop is the outgoing speaker, so a
+        // window built from it would be a mixture of two voices -- but the
+        // assembler refuses a cut that would leave no room for a window to
+        // complete, and a refused cut is not a boundary at all. Acting on one
+        // anyway would blank the label and stop the vote for a turn change
+        // nothing downstream can ever confirm.
+        let changed = differs && self.assembler.cut_at_boundary();
 
         if changed {
             out.boundary = true;
-            // Everything accumulated before this hop is the outgoing speaker,
-            // so a window built from it would be a mixture of two voices.
-            self.assembler.cut_at_boundary();
-            // And nothing known about the outgoing speaker is true of the
-            // incoming one. Saying nothing beats saying the wrong name.
+            // Nothing known about the outgoing speaker is true of the incoming
+            // one. Saying nothing beats saying the wrong name.
             self.last_label = None;
             self.provisional = None;
-            self.unlabelled_since = Some(chunk);
+            self.seam(chunk);
+        } else if first {
+            // The first hop of the session had nothing before it to be
+            // compared against, so no change could have been detected inside
+            // it however short the opening turn was. Whatever was said before
+            // this point is of unknown provenance and stays uncorrected.
+            self.seam(chunk);
         }
 
         // Only where there is nothing better. A hop's guess never overwrites
@@ -585,48 +640,57 @@ impl RealDiarizer {
     /// speaker, or corrects one.
     fn window(&mut self, embedding: &[f32], chunk: u64, out: &mut Attribution) {
         let before = self.clusterer.minted();
-        let settled = self.clusterer.observe(embedding);
+        let heard = self.clusterer.observe(embedding);
         let minted = self.clusterer.minted() > before;
 
-        match (settled, minted) {
-            // A speaker exists who did not before. The chunks since this turn
-            // began were committed with nobody's name on them, and now there
-            // is one -- which is the whole of complaint 1, fixed without
-            // touching the four-window reluctance that made it.
-            (Some(speaker), true) => {
-                let from = self.unlabelled_since.unwrap_or(chunk);
+        match (heard, minted) {
+            // A speaker exists who did not before. The chunks since the last
+            // provenance seam were committed with nobody's name on them, or
+            // with a guess, and now there is a name -- which is the whole of
+            // complaint 1, fixed without touching the four-window reluctance
+            // that made it.
+            (Heard::Settled(speaker), true) => {
                 out.relabels.push(Relabel {
-                    from_chunk: from,
+                    from_chunk: self.correctable_since.unwrap_or(chunk),
                     to_chunk: chunk,
                     speaker,
                 });
             }
-            // A window disagreeing with the guess a hop had been offering.
-            // Correcting it is better than leaving it wrong, and the hop is
+            // A window disagreeing with the guess that was being offered.
+            // Correcting it is better than leaving it wrong, and a guess is
             // allowed to be wrong precisely because this exists.
-            (Some(speaker), false) => {
+            (Heard::Settled(speaker), false) => {
                 if let Some((provisional, since)) = self.provisional
                     && provisional != speaker
                 {
                     out.relabels.push(Relabel {
-                        from_chunk: since,
+                        from_chunk: since.max(self.correctable_since.unwrap_or(since)),
                         to_chunk: chunk,
                         speaker,
                     });
                 }
             }
-            (None, _) => {}
+            (Heard::Guessed(_) | Heard::Unknown, _) => {}
         }
 
         // An undecided clusterer overwrites a known label with None on
         // purpose: it has just seen 1.5 s of speech it cannot place, so the
-        // previous answer is stale rather than still true.
-        self.last_label = settled;
-        self.provisional = None;
-        match settled {
-            Some(_) => self.unlabelled_since = None,
-            None => {
-                self.unlabelled_since.get_or_insert(chunk);
+        // previous answer is stale rather than still true. A guess replaces it
+        // too, and stays correctable.
+        self.last_label = heard.label();
+        self.provisional = match heard {
+            Heard::Guessed(label) => Some(match self.provisional {
+                Some((held, since)) if held == label => (label, since),
+                _ => (label, chunk),
+            }),
+            Heard::Settled(_) | Heard::Unknown => None,
+        };
+        match heard {
+            // Only a settled label ends a correctable run. A guess is text a
+            // later mint is still entitled to take back.
+            Heard::Settled(_) => self.correctable_since = None,
+            Heard::Guessed(_) | Heard::Unknown => {
+                self.correctable_since.get_or_insert(chunk);
             }
         }
     }
@@ -690,7 +754,23 @@ impl Diarizer for RealDiarizer {
         // geometry rather than a property worth relying on, and the flag costs
         // nothing either way.
         let mut cut = false;
-        for piece in self.assembler.push(&framed, &voiced) {
+        let pieces = self.assembler.push(&framed, &voiced);
+        if self.assembler.restarted() {
+            // Half a second of silence cleared the accumulator, so the hop
+            // being held for the change-point test is from before it. Two
+            // stretches of a meeting either side of a pause are not "the voice
+            // just now and the voice before that", and comparing them answers
+            // a question nobody asked.
+            self.previous_hop = None;
+            // Nor can anything before the silence be vouched for: the gap is
+            // where a turn change goes undetected most often, which is the
+            // measurement `window::MAX_GAP_FRAMES` records. The label carries
+            // across -- 48 of 51 decidable breaks had the same speaker either
+            // side -- but a *correction* may not, because carrying a label is
+            // reversible and rewriting somebody's sentence is not.
+            self.seam(chunk);
+        }
+        for piece in pieces {
             let (Cut::Hop(audio) | Cut::Window(audio)) = &piece;
             if matches!(piece, Cut::Window(_)) && cut {
                 continue;
@@ -719,8 +799,8 @@ impl Diarizer for RealDiarizer {
             out.speaker = self.last_label;
             out.provisional = self.provisional.is_some();
         }
-        if out.speaker.is_none() {
-            self.unlabelled_since.get_or_insert(chunk);
+        if out.speaker.is_none() || out.provisional {
+            self.correctable_since.get_or_insert(chunk);
         }
         Ok(out)
     }
@@ -884,6 +964,208 @@ mod tests {
                 "chunk {chunk} failed for the wrong reason: {message}"
             );
         }
+    }
+
+    // ------------------------------------------------- provenance and seams
+    //
+    // `hop` and `window` decide everything a correction is allowed to reach,
+    // and neither touches `state` -- so they can be driven directly, with the
+    // models left on the other side of the boundary the fuse test already
+    // crosses. What cannot be driven this way is `push` itself, which is why
+    // the assembler's own half of the refractory floor and of the gap seam is
+    // tested in `window.rs`.
+
+    /// A diarizer with no models behind it.
+    fn headless(tuning: DiarizeTuning) -> RealDiarizer {
+        RealDiarizer::new(
+            Models {
+                vad: PathBuf::from("/nonexistent/silero_vad.onnx"),
+                embed: PathBuf::from("/nonexistent/embed.onnx"),
+                norm: Norm::Mean,
+            },
+            tuning,
+        )
+    }
+
+    /// Embeddings live in four dimensions here: enough for two orthogonal
+    /// voices and the vector exactly between them.
+    fn axis(i: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; 4];
+        v[i] = 1.0;
+        v
+    }
+
+    /// Give the assembler enough voiced audio that a boundary cut is inside
+    /// the refractory floor. The samples themselves never matter -- these
+    /// tests hand `hop` and `window` their embeddings directly.
+    fn fill_the_accumulator(d: &mut RealDiarizer) {
+        let framed = crate::diarize::window::Framed {
+            first_frame: 0,
+            samples: vec![0.1f32; WINDOW_SAMPLES],
+        };
+        d.assembler.push(&framed, &[true; WINDOW_SAMPLES / FRAME]);
+    }
+
+    /// Mint a speaker on `voice` by handing the clusterer windows directly,
+    /// leaving the diarizer's own bookkeeping untouched.
+    fn mint(d: &mut RealDiarizer, voice: &[f32]) {
+        for _ in 0..crate::diarize::cluster::MIN_POOL {
+            d.clusterer.observe(voice);
+        }
+    }
+
+    #[test]
+    fn the_first_hop_of_a_session_is_a_seam_a_correction_cannot_cross() {
+        // A meeting opens with somebody saying "Right." -- under 0.736 s, so
+        // no hop ever completes on it and it is committed with no name. The
+        // next speaker's first hop has nothing before it to be compared
+        // against, so no turn change is detected there and none could be. If
+        // "no boundary detected" were read as "same speaker", the correction
+        // that names the second speaker would put their name on the first
+        // speaker's line.
+        let mut d = headless(DiarizeTuning::default());
+        // Chunks 0 and 1 answered with nobody, exactly as `push` records it.
+        d.correctable_since.get_or_insert(0);
+        d.correctable_since.get_or_insert(1);
+
+        let mut out = Attribution::default();
+        assert!(
+            !d.hop(axis(1), 2, &mut out),
+            "there is nothing for a first hop to have changed from"
+        );
+        assert_eq!(
+            d.correctable_since,
+            Some(2),
+            "the first hop has to end the run it cannot vouch for"
+        );
+
+        // Four windows of the new voice, and the mint that names them.
+        let mut relabels = Vec::new();
+        for chunk in 3..7 {
+            let mut out = Attribution::default();
+            d.window(&axis(1), chunk, &mut out);
+            relabels.extend(out.relabels);
+        }
+        assert_eq!(
+            relabels,
+            vec![Relabel {
+                from_chunk: 2,
+                to_chunk: 6,
+                speaker: 1
+            }],
+            "the correction reached back over somebody else's words"
+        );
+    }
+
+    #[test]
+    fn a_correction_never_reaches_back_over_a_settled_label() {
+        // The other half: a window that settles a label ends the correctable
+        // run, so text a full window placed is never up for reassignment
+        // however far the next mint would like to reach.
+        let mut d = headless(DiarizeTuning::default());
+        mint(&mut d, &axis(0));
+
+        let mut out = Attribution::default();
+        d.window(&axis(0), 5, &mut out);
+        assert_eq!(out.speaker, None, "`window` reports through `push`");
+        assert_eq!(d.last_label, Some(1));
+        assert_eq!(d.correctable_since, None, "a settled label ends the run");
+
+        // Two chunks with nothing in them, then a second voice arriving.
+        d.correctable_since.get_or_insert(6);
+        let mut relabels = Vec::new();
+        for chunk in 8..12 {
+            let mut out = Attribution::default();
+            d.window(&axis(1), chunk, &mut out);
+            relabels.extend(out.relabels);
+        }
+        assert_eq!(
+            relabels,
+            vec![Relabel {
+                from_chunk: 6,
+                to_chunk: 11,
+                speaker: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_window_offers_a_provisional_label_rather_than_a_gap() {
+        // What the clusterer withholding an assignment costs, and what it does
+        // not. The window names nobody confidently -- so it moves no centroid,
+        // which is the drift protection -- but the argmax still reaches the
+        // reader, marked as correctable, and the chunk stays inside the run a
+        // later mint may rewrite.
+        let mut d = headless(DiarizeTuning::default());
+        mint(&mut d, &axis(0));
+        mint(&mut d, &axis(1));
+
+        let between: Vec<f32> = vec![0.5f32.sqrt(), 0.5f32.sqrt(), 0.0, 0.0];
+        let mut out = Attribution::default();
+        d.window(&between, 4, &mut out);
+        assert!(
+            out.relabels.is_empty(),
+            "a guess corrects nothing by itself"
+        );
+        assert!(
+            matches!(d.provisional, Some((1 | 2, 4))),
+            "an ambiguous window should offer its best guess: {:?}",
+            d.provisional
+        );
+        assert_eq!(d.last_label, d.provisional.map(|(l, _)| l));
+        assert_eq!(
+            d.correctable_since,
+            Some(4),
+            "a guess is text a mint may still take back"
+        );
+    }
+
+    #[test]
+    fn a_change_threshold_of_zero_detects_no_turn_change() {
+        // Documented as the way to switch detection off, and it has to be
+        // checked for rather than reached by arithmetic: different-speaker
+        // cosines are routinely negative, so `cosine < 0` fires constantly and
+        // no value of a bare threshold would ever mean "never".
+        let off = DiarizeTuning {
+            change_threshold: 0.0,
+            ..Default::default()
+        };
+        let mut d = headless(off);
+        fill_the_accumulator(&mut d);
+        let mut out = Attribution::default();
+        d.hop(axis(0), 0, &mut out);
+        let opposite: Vec<f32> = axis(0).iter().map(|x| -x).collect();
+        assert!(!d.hop(opposite.clone(), 1, &mut out));
+        assert!(!out.boundary, "a cosine of -1 was called a turn change");
+
+        // The same pair at the shipped threshold, so the difference is the
+        // configuration and not the fixture.
+        let mut d = headless(DiarizeTuning::default());
+        fill_the_accumulator(&mut d);
+        let mut out = Attribution::default();
+        d.hop(axis(0), 0, &mut out);
+        assert!(d.hop(opposite, 1, &mut out));
+        assert!(out.boundary);
+    }
+
+    #[test]
+    fn a_boundary_the_accumulator_refuses_is_not_a_boundary_at_all() {
+        // The refractory floor lives in `window.rs`, but acting on a boundary
+        // it declined would be worse than not detecting one: the label would
+        // be blanked and the session's vote clipped for a turn change no
+        // window can ever confirm, since no window would complete.
+        let mut d = headless(DiarizeTuning::default());
+        mint(&mut d, &axis(0));
+        let mut out = Attribution::default();
+        d.hop(axis(0), 0, &mut out);
+        d.last_label = Some(1);
+
+        // Nothing in the accumulator, so a cut has no room to leave a window
+        // behind it.
+        let opposite: Vec<f32> = axis(0).iter().map(|x| -x).collect();
+        assert!(!d.hop(opposite, 1, &mut out));
+        assert!(!out.boundary);
+        assert_eq!(d.last_label, Some(1), "a refused cut blanked the label");
     }
 
     #[test]

@@ -35,7 +35,30 @@ const HOP_FRAMES: usize = 23;
 /// probes the embedder with exactly this length: the shape it proves should be
 /// the shape a session runs.
 pub const WINDOW_SAMPLES: usize = WINDOW_FRAMES * FRAME;
-const HOP_SAMPLES: usize = HOP_FRAMES * FRAME;
+/// Samples in one hop. Public for the same reason: a session hands the
+/// embedder a hop on *every* hop of voiced audio, so a model that only accepts
+/// the window length has to fail at startup rather than mid-meeting.
+pub const HOP_SAMPLES: usize = HOP_FRAMES * FRAME;
+
+/// Voiced frames that must arrive between one accepted turn boundary and the
+/// next.
+///
+/// Not a guess and not a taste in turn lengths: it is exactly what window
+/// formation needs to make progress. A cut keeps a hop, so the next window
+/// wants `WINDOW_FRAMES - HOP_FRAMES` further voiced frames; if boundaries
+/// were accepted more often than that, no window would ever complete and the
+/// clusterer would be starved -- no centroid updated, nobody minted, nothing
+/// for a hop's provisional label to name. Simulated over 112 s of continuous
+/// speech, a boundary every hop embedded **zero** windows.
+///
+/// It is a real cost, stated rather than hidden: a turn shorter than 0.768 s
+/// of voiced audio cannot be detected as one, so a backchannel inside somebody
+/// else's turn stays that speaker's. That is the same trade the design already
+/// makes elsewhere -- short interjections arrive unlabelled -- and it is the
+/// cheaper side of it, because the alternative is a room of eight taking short
+/// turns producing no windows at all.
+const REFRACTORY_FRAMES: usize = WINDOW_FRAMES - HOP_FRAMES;
+const REFRACTORY_SAMPLES: usize = REFRACTORY_FRAMES * FRAME;
 
 /// Voiced frames further apart than this start the window over instead of
 /// splicing across the silence between them. Silence of half a second ends a
@@ -159,6 +182,18 @@ pub struct WindowAssembler {
     hop: Vec<f32>,
     /// Index of the most recent voiced frame, for the gap rule.
     last: Option<usize>,
+    /// Voiced samples accumulated since the accumulator last started over --
+    /// an accepted boundary cut, or a gap that cleared it. What
+    /// [`REFRACTORY_FRAMES`] is measured against.
+    since_restart: usize,
+    /// Whether the gap rule cleared the accumulator during the most recent
+    /// [`WindowAssembler::push`].
+    ///
+    /// The diarizer needs to know: the hop it holds for the change-point
+    /// comparison came from before the silence, and comparing across a gap
+    /// that long asks whether two different stretches of the meeting sound
+    /// alike rather than whether the voice just changed.
+    restarted: bool,
 }
 
 impl WindowAssembler {
@@ -178,6 +213,7 @@ impl WindowAssembler {
     /// flags come from a model and the audio does not.
     pub fn push(&mut self, framed: &Framed, voiced: &[bool]) -> Vec<Cut> {
         let mut cuts = Vec::new();
+        self.restarted = false;
 
         // as_chunks, not chunks_exact: both truncate to whole frames, and this
         // one keeps the frame size a constant the compiler can see.
@@ -201,10 +237,15 @@ impl WindowAssembler {
                 // two voices in one vector, and the whole use of a hop is
                 // being compared against its neighbour as if it were one.
                 self.hop.clear();
+                // A window has to be built from scratch again, so the
+                // refractory count starts again with it.
+                self.since_restart = 0;
+                self.restarted = true;
             }
             self.last = Some(index);
             self.voiced.extend(frame);
             self.hop.extend_from_slice(frame);
+            self.since_restart += FRAME;
 
             // Before the window, because the hop is what decides whether the
             // window about to complete is worth anything -- see the note above
@@ -223,7 +264,8 @@ impl WindowAssembler {
     }
 
     /// Throw away everything accumulated before the most recent hop, because
-    /// the voice changed at the start of it.
+    /// the voice changed at the start of it. Reports whether the boundary was
+    /// accepted.
     ///
     /// The two mechanisms this fixes are stacked and were both measured. The
     /// only thing that used to reset the accumulator was `MAX_GAP_FRAMES`, and
@@ -239,9 +281,29 @@ impl WindowAssembler {
     /// is the incoming speaker's, so keeping it starts the next window 0.75 s
     /// ahead. Less than a hop in hand means the accumulator holds nothing
     /// older than the boundary anyway, and all of it stays.
-    pub fn cut_at_boundary(&mut self) {
+    ///
+    /// **A boundary inside the refractory floor is refused**, and the caller
+    /// must treat a refusal as no boundary at all. Cutting keeps a hop and a
+    /// window needs `WINDOW_FRAMES`, so cuts arriving faster than
+    /// [`REFRACTORY_FRAMES`] apart leave the window forever incomplete -- and
+    /// a room of eight taking short turns is exactly where a correctly working
+    /// detector fires that often. The detector has no hysteresis and no
+    /// minimum turn length of its own; this is the floor, and it lives here
+    /// because the arithmetic it protects is this module's.
+    pub fn cut_at_boundary(&mut self) -> bool {
+        if self.since_restart < REFRACTORY_SAMPLES {
+            return false;
+        }
         let keep = self.voiced.len().min(HOP_SAMPLES);
         self.voiced.drain(..self.voiced.len() - keep);
+        self.since_restart = 0;
+        true
+    }
+
+    /// Whether the gap rule cleared the accumulator during the last
+    /// [`WindowAssembler::push`].
+    pub fn restarted(&self) -> bool {
+        self.restarted
     }
 }
 
@@ -491,11 +553,114 @@ mod tests {
         // found on the very first pair of hops, when the accumulator holds
         // less than a hop's worth of anything.
         let mut a = WindowAssembler::default();
-        a.cut_at_boundary();
+        assert!(!a.cut_at_boundary());
         assert_eq!(a.voiced.len(), 0);
         a.push(&frames(0, 3, 1.0), &[true; 3]);
-        a.cut_at_boundary();
+        assert!(!a.cut_at_boundary());
         assert_eq!(a.voiced.len(), 3 * FRAME, "less than a hop is all of it");
+    }
+
+    #[test]
+    fn boundaries_closer_together_than_a_window_needs_are_refused() {
+        // The starvation this floor exists to prevent, in the arithmetic that
+        // produces it: a cut keeps a hop, a window is 47 frames, so cuts
+        // arriving every hop leave the accumulator forever 24 frames short.
+        // Nothing else in the pipeline stops that -- the detector has no
+        // hysteresis and no minimum turn length -- and a room of eight taking
+        // short turns is where a *correctly working* detector fires that fast.
+        assert_eq!(REFRACTORY_FRAMES, WINDOW_FRAMES - HOP_FRAMES);
+
+        let mut starved = WindowAssembler::default();
+        let mut embedded = 0;
+        for i in 0..HOP_FRAMES * 8 {
+            embedded += windows(starved.push(&frames(i, 1, 1.0), &[true])).len();
+            // A boundary at every hop, which is what the detector reports
+            // when everyone is taking short turns.
+            if (i + 1).is_multiple_of(HOP_FRAMES) {
+                starved.cut_at_boundary();
+            }
+        }
+        assert!(
+            embedded > 0,
+            "eight hops of continuous speech embedded no window at all"
+        );
+
+        // And the floor is where the arithmetic puts it, from both sides.
+        for (frames_between, cut) in [(REFRACTORY_FRAMES - 1, false), (REFRACTORY_FRAMES, true)] {
+            let mut a = WindowAssembler::default();
+            for i in 0..frames_between {
+                a.push(&frames(i, 1, 1.0), &[true]);
+            }
+            assert_eq!(
+                a.cut_at_boundary(),
+                cut,
+                "a boundary {frames_between} voiced frames after the last \
+                 restart should{} have been accepted",
+                if cut { "" } else { " not" }
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_always_completes_between_two_accepted_boundaries() {
+        // The property the floor is chosen to give, rather than the number it
+        // is chosen as: however often the detector fires, the clusterer keeps
+        // being fed.
+        let mut a = WindowAssembler::default();
+        let mut since_cut = 0;
+        let mut cuts = 0;
+        for i in 0..WINDOW_FRAMES * 8 {
+            since_cut += windows(a.push(&frames(i, 1, 1.0), &[true])).len();
+            // Ask for a boundary on every single frame, which is as
+            // pathological as the detector could ever be.
+            if a.cut_at_boundary() {
+                if cuts > 0 {
+                    assert!(since_cut > 0, "no window completed between two cuts");
+                }
+                cuts += 1;
+                since_cut = 0;
+            }
+        }
+        assert!(cuts > 2, "only {cuts} boundaries were accepted");
+    }
+
+    #[test]
+    fn a_long_silence_makes_the_next_boundary_wait_again() {
+        // The gap rule empties the accumulator, so the window that has to
+        // complete before the next cut has to be built from nothing -- which
+        // means the refractory count starts again with it, or the first cut
+        // after a pause would land on a quarter-built window.
+        let mut a = WindowAssembler::default();
+        for i in 0..REFRACTORY_FRAMES * 2 {
+            a.push(&frames(i, 1, 1.0), &[true]);
+        }
+        let resumes_at = REFRACTORY_FRAMES * 2 + MAX_GAP_FRAMES + 1;
+        a.push(&frames(resumes_at, 1, 2.0), &[true]);
+        assert!(a.restarted(), "the gap should have cleared the accumulator");
+        assert!(!a.cut_at_boundary(), "and reset what a cut may follow");
+
+        for i in 1..REFRACTORY_FRAMES {
+            a.push(&frames(resumes_at + i, 1, 2.0), &[true]);
+        }
+        assert!(a.cut_at_boundary());
+    }
+
+    #[test]
+    fn a_push_that_splices_reports_no_restart() {
+        // `restarted` drives the diarizer's decision to throw away the hop it
+        // was going to compare against, so a false positive costs a
+        // turn-change detection on every chunk.
+        let mut a = WindowAssembler::default();
+        a.push(&frames(0, 4, 1.0), &[true; 4]);
+        assert!(!a.restarted());
+        let spliced = 3 + MAX_GAP_FRAMES;
+        a.push(&frames(spliced, 1, 1.0), &[true]);
+        assert!(!a.restarted(), "a gap inside the budget is not a restart");
+        let broken = spliced + MAX_GAP_FRAMES + 1;
+        a.push(&frames(broken, 1, 1.0), &[true]);
+        assert!(a.restarted());
+        a.push(&frames(broken + 1, 1, 1.0), &[true]);
+        assert!(!a.restarted(), "the flag describes the last push only");
     }
 
     #[test]

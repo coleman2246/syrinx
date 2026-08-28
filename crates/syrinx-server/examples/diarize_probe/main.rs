@@ -563,7 +563,11 @@ fn label_frames(
     let mut clusterer = params.clusterer();
 
     for i in 0..emb.len() {
-        let Some(label) = clusterer.observe(emb.get(i)) else {
+        // `label`, not `settled`: a window the clusterer will not stand behind
+        // still reaches a reader, as a provisional label a later mint may
+        // correct, so scoring only the settled ones would measure a transcript
+        // nobody is shown.
+        let Some(label) = clusterer.observe(emb.get(i)).label() else {
             continue;
         };
         let (t0, t1) = emb.times[i];
