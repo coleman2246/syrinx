@@ -294,6 +294,25 @@ pub fn start(
     }
 }
 
+/// Record what became of one append to the transcript stream.
+///
+/// A failure used to reach `error!` and nothing further, so a stream that died
+/// an hour into a meeting was indistinguishable from one still being written:
+/// the daemon log is not somewhere anyone has open while dictating, and the
+/// file itself only says so once it is read.
+///
+/// The first failure is the one kept, and a later success does not clear it.
+/// The fragment that could not be written is not written by the fragment after
+/// it, so a message that cleared itself would report a complete file that is
+/// missing a sentence.
+fn record_append(state: &mut SessionState, result: Result<()>) {
+    let Err(e) = result else { return };
+    error!("failed to append to the transcript stream: {e:#}");
+    state
+        .error
+        .get_or_insert_with(|| format!("the transcript stream stopped: {e:#}"));
+}
+
 fn fail(state: &Arc<Mutex<SessionState>>, msg: String) {
     let mut s = state.lock().expect("state lock poisoned");
     s.error = Some(msg);
@@ -457,12 +476,12 @@ async fn run(
                     // Written whatever the mode: the point of streaming is a
                     // copy on disk, and typing at the cursor is exactly when
                     // no transcript is kept in memory to save later.
-                    if let Some(w) = stream.as_mut()
-                        && let Err(e) = w.append(&seg)
-                    {
-                        error!("failed to append to the transcript stream: {e:#}");
-                    }
+                    let appended = match stream.as_mut() {
+                        Some(w) => w.append(&seg),
+                        None => Ok(()),
+                    };
                     let mut s = st.lock().expect("state lock poisoned");
+                    record_append(&mut s, appended);
                     if mode.keeps_transcript() {
                         s.transcript.push_str(&text);
                         s.segments.push(seg);
@@ -631,6 +650,37 @@ mod tests {
             merged.error.as_deref(),
             Some("connecting to the server: refused")
         );
+    }
+
+    #[test]
+    fn a_stream_that_stops_being_written_reaches_the_window() {
+        // The failure only ever reached `error!` in the daemon log, which is
+        // not a place anyone has open while dictating -- so a stream that died
+        // an hour into a meeting looked exactly like one still being written,
+        // right up until the file was read.
+        let mut s = SessionState::default();
+        record_append(&mut s, Err(anyhow::anyhow!("No space left on device")));
+        let msg = s.error.expect("a failed append is worth showing");
+        assert!(msg.contains("No space left on device"), "{msg}");
+        assert!(msg.contains("transcript"), "say what stopped: {msg}");
+    }
+
+    #[test]
+    fn an_append_that_worked_says_nothing() {
+        let mut s = SessionState::default();
+        record_append(&mut s, Ok(()));
+        assert_eq!(s.error, None);
+    }
+
+    #[test]
+    fn a_later_success_does_not_erase_a_lost_fragment() {
+        // The fragment that could not be written is not written by the one
+        // after it, so a message that cleared itself would report a complete
+        // file that is missing a sentence.
+        let mut s = SessionState::default();
+        record_append(&mut s, Err(anyhow::anyhow!("No space left on device")));
+        record_append(&mut s, Ok(()));
+        assert!(s.error.is_some());
     }
 
     #[test]
