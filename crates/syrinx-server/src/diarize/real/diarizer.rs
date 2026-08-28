@@ -443,6 +443,42 @@ enum Gap {
     Assumed,
 }
 
+/// Silences one pending seam may bridge before it stops waiting for evidence.
+///
+/// Two, because two is the shape [`RealDiarizer`]'s own notes describe: an
+/// interjection too short to complete a hop, sitting *between* two silences.
+/// One silence into it and one out of it, and the comparison that resolves the
+/// seam is then made across it, between the voices either side.
+///
+/// A third silence is a second such interjection, and nothing in the
+/// arithmetic stops there: `previous_hop` is written only by a completed hop,
+/// so speech that never completes one never becomes the next comparison's
+/// reference, however many pauses break it up. Measured on AMI, one comparison
+/// was asked to vouch for five silences.
+///
+/// **Silences and not chunks**, though chunks are what the audit reports and
+/// one discarded seam did bridge 30 of them -- 16.8 s. What a correction
+/// misattributes is words, and each bridged silence admits at most one stretch
+/// of speech too short to complete a hop, which is under 0.75 s of voiced
+/// audio however long the quiet either side of it runs. That 30-chunk seam
+/// bridged a single silence and was almost all quiet. Counting silences bounds
+/// the words; counting chunks would bound the clock, which is not what is at
+/// risk, and it is the one of the two that keeps its meaning when a backend
+/// changes its chunk length.
+///
+/// Costs 3 correct discards across the three AMI meetings at the shipped
+/// threshold -- 227 unbounded against 224 -- and removes no crossings. The
+/// exposure it closes is the one the guard cannot see, where both hops agree
+/// because the voice in between never reached either of them: the largest one
+/// it removes is a seam four silences and 25 chunks wide whose pre-gap hop the
+/// annotation cannot attribute to anybody.
+///
+/// `pub` for the same reason `cluster`'s constants are: `examples/diarize_probe`
+/// scores this rule as well as the threshold, and a second copy of the number
+/// there would attribute a measurement to a bound the server does not ship.
+#[doc(hidden)]
+pub const MAX_BRIDGED_SILENCES: u32 = 2;
+
 /// One session's speaker attribution.
 ///
 /// Per [`Diarizer::push`]: one ASR chunk in, one [`Attribution`] out. The
@@ -516,14 +552,35 @@ enum Gap {
 /// **What that does not guarantee.** A turn change entirely inside one hop is
 /// invisible to a detector that compares whole hops, so a correction can in
 /// principle reach over an interjection shorter than 0.736 s of voiced audio
-/// that carried no label of its own. The exposure is bounded to one hop and
-/// to the opening of a run -- anywhere else the incumbent's carried-forward
-/// label is on those chunks, and `session.rs` will not overwrite one. Deferring
-/// the gap seam adds one shape to that bound and no others: an interjection too
-/// short to complete a hop, sitting *between* two silences, is never embedded
-/// on its own -- so the comparison that resolves the seam is made across it,
-/// between the voices either side, and a correction may reach over it when
-/// those two agree.
+/// that carried no label of its own. Deferring the gap seam adds one shape to
+/// that: an interjection too short to complete a hop, sitting *between* two
+/// silences, is never embedded on its own -- so the comparison that resolves
+/// the seam is made across it, between the voices either side, and a
+/// correction may reach over it when those two agree.
+///
+/// What bounds the total is [`MAX_BRIDGED_SILENCES`]: one pending seam may
+/// bridge two silences and no more, so at most two such interjections are ever
+/// inside one comparison. Without it there is no bound at all --
+/// `previous_hop` is written only by a completed hop, and a silence merely
+/// records a seam, so speech that never completes a hop never becomes the next
+/// comparison's reference however many pauses break it up.
+///
+/// The two shapes compose, and the worst case is worth naming: a hop that
+/// *starts* on one voice and runs into another is itself a mixture, so it can
+/// match the voice before the pause while carrying somebody else's opening
+/// words. Observed on IS1000a -- A, a silence, a third of a second of D,
+/// another silence, half a second of A, then C in the same hop -- where the
+/// post-gap hop is A and C together and matches A's. Both halves of that are
+/// above; neither is fixed by a threshold.
+///
+/// **What does not bound it is `session.rs`.** Its rule is that a *settled*
+/// label is never overwritten (`apply_relabels`: a commit is correctable when
+/// it has no speaker, or carries a provisional one naming somebody else), and
+/// a carried-forward label is provisional whenever `provisional` is set here
+/// -- which is most of a run that has not settled. So a correction reaching
+/// over an interjection is not stopped downstream by the incumbent's label
+/// being on those chunks. The bound is the one this type draws and nothing
+/// else.
 ///
 /// **On failure:** `session.rs` warns per failed chunk and retires the
 /// diarizer after five *consecutive* ones, so every error path here has to be
@@ -582,6 +639,10 @@ pub struct RealDiarizer {
     /// What a silence that cleared the accumulator is still owed an answer
     /// about.
     gap: Gap,
+    /// Silences since the last hop completed, which is how many one pending
+    /// seam is being asked to answer for at once. See
+    /// [`MAX_BRIDGED_SILENCES`], which is where it stops waiting.
+    bridged_silences: u32,
     /// The earliest chunk a correction may still reach back to, or `None`
     /// while the current chunk carries a settled label.
     ///
@@ -637,6 +698,7 @@ impl RealDiarizer {
             last_label: None,
             previous_hop: None,
             gap: Gap::Closed,
+            bridged_silences: 0,
             correctable_since: None,
             provisional: None,
             chunks_seen: 0,
@@ -702,6 +764,10 @@ impl RealDiarizer {
     /// unaccounted for. Making the guard a rule rather than a consequence of
     /// that arithmetic is the point: the promise being kept here is the one
     /// the protocol makes about never renaming somebody's sentence.
+    ///
+    /// The other caller is [`MAX_BRIDGED_SILENCES`], where nothing is waiting
+    /// on a correction and the seam has simply been outstanding across more
+    /// speech than one comparison can vouch for.
     fn assume_gap_hid_a_change(&mut self) {
         if let Gap::Pending(chunk) = self.gap {
             self.commit_gap_seam(chunk);
@@ -753,6 +819,7 @@ impl RealDiarizer {
         // turn-change detector, which is what the 51 decidable breaks behind
         // `window::MAX_GAP_FRAMES` measured, and none of this reopens that.
         let gap = std::mem::replace(&mut self.gap, Gap::Closed);
+        self.bridged_silences = 0;
         if gap != Gap::Closed {
             if self.voice_changed_across_the_gap(&embedding) {
                 // At this hop rather than at the pause, which is the tighter
@@ -907,6 +974,10 @@ impl RealDiarizer {
             // second silence before that happens moves the seam forward to the
             // later one, which is the tighter bound.
             self.gap = Gap::Pending(chunk);
+            self.bridged_silences += 1;
+            if self.bridged_silences > MAX_BRIDGED_SILENCES {
+                self.assume_gap_hid_a_change();
+            }
         }
         match failed {
             Some(e) => Err(e),
@@ -1746,6 +1817,53 @@ mod tests {
         let mut out = Attribution::default();
         d.hop(axis(0), 13, &mut out);
         assert_eq!(d.correctable_since, Some(10));
+    }
+
+    #[test]
+    fn a_pending_seam_stops_waiting_once_it_has_bridged_enough_silences() {
+        // `previous_hop` is written only by a completed hop, so without a
+        // bound one comparison can be asked to vouch for any amount of speech
+        // that never completed one -- however many pauses break it up. Five
+        // pauses and fifty chunks later, the hop before the first of them was
+        // still the reference the seam turned on.
+        let mut d = headless(DiarizeTuning::default());
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        for pause in [10, 20, 30, 40, 50] {
+            d.batch(Vec::new(), true, pause, &mut out, |_| {
+                unreachable!("a silence carries no pieces")
+            })
+            .expect("nothing to fail");
+        }
+
+        let mut out = Attribution::default();
+        d.hop(axis(0), 53, &mut out);
+        assert_eq!(
+            d.correctable_since,
+            Some(50),
+            "a correction reached back over fifty chunks and five pauses on the \
+             word of two hops either side of all of them"
+        );
+    }
+
+    #[test]
+    fn the_shape_the_deferral_documents_still_reaches_through() {
+        // The bound above is drawn where the notes draw it and not tighter:
+        // an interjection too short to complete a hop, sitting between two
+        // silences, is the shape the design describes and it still resolves on
+        // the evidence rather than conservatively.
+        let mut d = headless(DiarizeTuning::default());
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        for pause in [10, 14] {
+            d.batch(Vec::new(), true, pause, &mut out, |_| unreachable!())
+                .expect("nothing to fail");
+        }
+        assert_eq!(d.gap, Gap::Pending(14), "two silences is still evidence");
+
+        let mut out = Attribution::default();
+        d.hop(axis(0), 17, &mut out);
+        assert_eq!(d.correctable_since, Some(3));
     }
 
     #[test]
