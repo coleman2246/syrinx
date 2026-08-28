@@ -49,10 +49,10 @@ pub struct DiarizeTuning {
     /// is allowed to reach across it. See [`cluster::T_GAP_CHANGE`].
     ///
     /// The one field here with no config key behind it. It decides how far
-    /// back a correction reaches and nothing else, its value was chosen by a
-    /// sweep of `diarize_probe live` rather than estimated, and a deployment
-    /// has no measurement of its own to beat that with; `--gap-change` is
-    /// where it is varied until one does.
+    /// back a correction reaches and nothing else, its value was chosen by
+    /// scoring every decision it makes against the AMI annotation rather than
+    /// estimated, and a deployment has no measurement of its own to beat that
+    /// with; `diarize_probe gaps` is where it is varied until one does.
     pub gap_change_threshold: f32,
 }
 
@@ -243,10 +243,10 @@ mod tests {
     #[test]
     fn crossing_a_silence_is_judged_more_strictly_than_crossing_a_hop() {
         // The two thresholds are not interchangeable and the ordering between
-        // them is the whole argument: a 0.75 s embedding either side of a
-        // pause is the noisiest comparison the pipeline makes, and the error
-        // it must not make -- reaching a correction across a real speaker
-        // change -- is the expensive one.
+        // them is the whole argument. The comparison is the same cosine
+        // between two hops either way; what differs is the cost, and the error
+        // a silence must not make -- reaching a correction across a real
+        // speaker change -- is the expensive one.
         let t = DiarizeTuning::default();
         assert!(
             t.gap_change_threshold > t.change_threshold,

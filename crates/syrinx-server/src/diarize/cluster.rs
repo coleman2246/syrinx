@@ -33,7 +33,8 @@
 //! [`T_MINT_CEILING`], [`MAX_POOLS`], [`POOL_AGE`] -- are **engineering
 //! estimates and have not been measured**; the probe's live-emulation mode
 //! exists to replace them. [`T_GAP_CHANGE`] is the first one it has: its value
-//! was swept there rather than reasoned about, and its doc records the table.
+//! comes from `diarize_probe gaps`, which scores every decision it is applied
+//! to against the AMI annotation, and its doc records the table.
 //!
 //! Pure arithmetic. No models, no `ort`, no feature gate -- which is what lets
 //! the whole of the labelling policy be tested in CI on synthetic embeddings.
@@ -203,40 +204,73 @@ pub const T_CHANGE: f32 = 0.30;
 /// turn boundary, because `window::MAX_GAP_FRAMES` measured that it is bad at
 /// it (48 of 51 decidable breaks had the same speaker either side).
 ///
-/// **Stricter than `T_CHANGE`, and the sweep agreed.** Two 0.75 s embeddings
-/// with half a second of silence between them are the noisiest comparison this
-/// pipeline makes, and the two errors are not symmetric: answering "same"
-/// wrongly lets a correction cross a real speaker change and write one
-/// person's name over another's sentence, which the protocol promises cannot
-/// happen, while answering "changed" wrongly costs a few words of backfill
-/// nobody was promised. The measurement put the safe floor at 0.34, above
-/// `T_CHANGE` -- which was the argument's prediction and is now its result.
+/// **Stricter than `T_CHANGE`**, because the two errors are not symmetric:
+/// answering "same" wrongly lets a correction cross a real speaker change and
+/// write one person's name over another's sentence, which the protocol
+/// promises cannot happen, while answering "changed" wrongly costs a few words
+/// of backfill nobody was promised. It is the same cosine between two hops of
+/// the same length from the same model, so nothing about the comparison itself
+/// is worse across a silence than along one -- only what it is asked to decide
+/// and what a wrong answer costs.
 ///
-/// **Unmeasured as a separability threshold**, and chosen by sweep instead.
-/// Nothing has measured where same-speaker and different-speaker hop pairs sit
-/// *across a silence*, which is the population a number like this would have
-/// to be placed inside; what was measured is the end of the argument rather
-/// than the middle of it. Every candidate ran through `diarize_probe live` on
-/// three AMI meetings, scored on the confusion a correction crossing a real
-/// change would produce -- the design doc carries the table.
+/// **Placed on the decisions, not on the outcome.** `diarize_probe gaps`
+/// records every comparison this constant is applied to on three AMI meetings
+/// -- 940 of them, 733 with an annotation clear enough to say whether it was
+/// one voice or two -- and scores each candidate on them directly, under the
+/// shipped `real::MAX_BRIDGED_SILENCES`:
 ///
-/// 0.35 is the middle of the band the sweep left standing. From 0.34 to 0.37
-/// ES2002a's backfill covers 31 commits instead of 3 and its corrected
-/// confusion *falls*, while EN2001a and IS1000a do not move at all. At 0.33
-/// one more correction lands on EN2001a and its corrected confusion rises from
-/// 5.3% to 5.4%, which is a correction crossing a real speaker change and is
-/// the one thing this threshold exists to prevent -- so the floor is where the
-/// guard rail moved and not where the gain stopped. Above 0.38 the gain is
-/// gone. The middle of the band rather than either edge, because the two
-/// cliffs cost different things: one costs a few words of backfill, the other
-/// costs a sentence its author.
+/// | value | same-speaker seams correctly discarded | seams discarded across a real change |
+/// |---|---|---|
+/// | 0.34 | 281 / 548 | **1** |
+/// | 0.35 | 253 / 548 | **1** |
+/// | 0.36 | 243 / 548 | 0 |
+/// | **0.37** | **224 / 548** | **0** |
+/// | 0.38 | 212 / 548 | 0 |
+///
+/// The one crossing is EN2001a at cosine 0.3551: speaker C stops, half a
+/// second of quiet, speaker B starts, and neither hop is a mixture. The
+/// outcome sweep in the design doc could not see it -- at that decision
+/// nothing was correctable, so no relabel was emitted and no aggregate moved.
+/// A meeting makes a few hundred of these decisions and a dozen corrections,
+/// so "zero crossings" in a table of corrected confusion is a statement about
+/// how rare corrections are.
+///
+/// **0.37 rather than 0.36**, which also has no crossings: 0.36 sits 0.0049
+/// above the demonstrated error, and on the same meeting the *same pair of
+/// speakers* straddles the bar in both directions 0.0152 apart -- B to C at
+/// 0.3399 correctly rejected, C to B at 0.3551 wrongly accepted. A margin
+/// smaller than one observed step of the distribution it is cutting is not a
+/// margin; 0.37 leaves 0.0149, which is that step.
+///
+/// **And 0.37 rather than higher**, which is where the second measurement
+/// binds: 0.37 is the largest value whose outcome on all three meetings is
+/// still identical to the 0.35 it replaces, so nothing that was ever measured
+/// is given up for the margin. 0.38 costs 12 of 224 correct discards and one
+/// commit of ES2002a's backfill, and 0.40 costs 39; neither buys a crossing
+/// back, because there are none to buy above 0.36. Raise the guard as far as
+/// it goes for free and stop.
+///
+/// **Where the two populations sit**, which nothing had measured until now:
+/// `diarize_probe separability --window 0.75 --hop 0.75` puts same-speaker
+/// pairs at a median of 0.344 (ES2002a) and 0.286 (IS1000a) against 0.042 and
+/// 0.040 for different speakers. This threshold therefore sits at or above the
+/// *same-speaker median*: 58% and 74% of genuine same-speaker pairs read as
+/// "changed" at it, which is why the discard column above is a minority of the
+/// decidable decisions. That is the cheap error, and taking it is the point.
+///
+/// All pairs is not the population this is applied to, and the difference is
+/// the reason it had to be scored on the decisions. At 0.37 only 0.07% and
+/// 0.09% of *all* different-speaker pairs read as one voice, against 1 in 185
+/// -- 0.5% -- of the real cross-gap changes at 0.35: turn changes cluster at
+/// pauses, so the pairs either side of a silence are drawn from a harder
+/// distribution than the pairs at large.
 ///
 /// **1 makes every silence a seam**, which is the rule that shipped before
 /// this constant existed: two 0.75 s embeddings of real audio are never the
 /// same vector, so the seam is always committed. That is what makes it the
 /// sweep's own control, and it reproduced the shipped numbers to the digit.
 #[doc(hidden)]
-pub const T_GAP_CHANGE: f32 = 0.35;
+pub const T_GAP_CHANGE: f32 = 0.37;
 
 /// How much more like itself than like any incumbent a pool of orphans must be
 /// before it becomes a speaker of its own.

@@ -1681,10 +1681,10 @@ mod tests {
     fn the_silence_and_the_hop_boundary_are_judged_at_different_thresholds() {
         // A pair halfway between the two thresholds: alike enough to be one
         // person talking on from one hop to the next, not alike enough to
-        // carry somebody's name across half a second of silence. Two 0.75 s
-        // embeddings with a pause between them are the noisiest comparison
-        // this pipeline makes, and the error that costs a sentence its author
-        // is not the error that costs a few words of backfill.
+        // carry somebody's name across half a second of silence. The same
+        // cosine either way, and a different bar, because the error that costs
+        // a sentence its author is not the error that costs a few words of
+        // backfill.
         //
         // Read from the shipped values rather than written down, so that
         // retuning either one re-aims this test instead of rotting it.
