@@ -1,8 +1,8 @@
 # Faster labels, cleaner turns, and a room with eight people in it
 
 **Date:** 2026-08-27
-**Status:** Implemented, with five of its own rules corrected — four during
-implementation and one after measuring the shipped result — see "Where this
+**Status:** Implemented, with six of its own rules corrected — four during
+implementation and two after measuring the shipped result — see "Where this
 document was wrong" at the end. Read that section alongside the design below;
 where the two disagree, it wins.
 **Supersedes constants in:** `docs/specs/2026-08-24-speaker-diarization-design.md`
@@ -262,9 +262,13 @@ points: a detected turn change, the first completed hop, and a silence long
 enough to have cleared the window accumulator — that last one **only when the
 voice on the far side of the silence is a different one**, which is measured
 rather than assumed; see "A silence is measured, not assumed" below. A turn
-change entirely inside one hop remains undetectable — the residual exposure is
-one hop of audio at the opening of a run, and is documented in the code rather
-than argued away.
+change entirely inside one hop remains undetectable, and that is the residual
+exposure: a correction may reach over an interjection too short to complete a
+hop, because nothing ever embedded it on its own. It is bounded by the
+diarizer's own rules and by nothing downstream — `session.rs` protects a
+*settled* label and a carried-forward one is provisional — so the bound is two
+such interjections per deferred seam, which is `MAX_BRIDGED_SILENCES`, plus one
+per detected boundary. Documented in the code rather than argued away.
 
 **Client handling, per surface:**
 
@@ -309,27 +313,50 @@ complete is compared against the kept one:
 - **voices match** — the seam is discarded, and a correction reaches through
   the pause.
 
-Three rules keep that safe.
+Four rules keep that safe.
 
 - **The comparison across a gap has its own threshold**, `T_GAP_CHANGE`,
-  separate from `T_CHANGE` and stricter. Two 0.75 s embeddings with half a
-  second of silence between them are the noisiest comparison the pipeline
-  makes, and the two errors are not symmetric: answering "same" wrongly lets a
-  correction rename one person's sentence to another, which the protocol
-  promises cannot happen, while answering "changed" wrongly costs a few words
-  of backfill nobody was promised. It has no config key — its value came from
-  the sweep below rather than from an estimate, and a deployment has nothing
-  better to replace it with yet — but it is `--gap-change` in the probe, which
-  is where it was chosen and where it would be re-chosen.
+  separate from `T_CHANGE` and stricter. It is the same cosine between two hops
+  of the same length from the same model, so nothing about the comparison
+  itself is worse across a silence — what differs is the cost of each error.
+  Answering "same" wrongly lets a correction rename one person's sentence to
+  another, which the protocol promises cannot happen; answering "changed"
+  wrongly costs a few words of backfill nobody was promised. It has no config
+  key — its value came from the audit below rather than from an estimate, and a
+  deployment has nothing better to replace it with yet — but it is
+  `--gap-change` in the probe, which is where it was chosen and where it would
+  be re-chosen.
 - **No correction ever crosses an unresolved seam.** Anything that would emit
   one while the answer is outstanding commits the pending seam first, because
   the case a seam exists for is precisely the one where the missing evidence
-  would have said "somebody else".
+  would have said "somebody else". Evidence arriving afterwards may still
+  *tighten* that bound — onto the hop that measured the change, which is later
+  than the pause — and may never loosen it, because a correction has already
+  gone out against it.
+- **A pending seam may bridge two silences and no more.** `previous_hop` is
+  written only by a completed hop, so speech that never completes one never
+  becomes the next comparison's reference — and without a bound there is
+  nothing at all stopping one comparison from being asked to vouch for every
+  interjection between two hops half a minute apart. Two is the shape this
+  section describes: an interjection too short to complete a hop, sitting
+  between two silences. A third silence is a second such interjection, and the
+  seam resolves conservatively instead. Measured cost across the three
+  meetings: 3 of 227 correct discards.
 - **A silence still claims no boundary**, whichever way the comparison goes.
   That is a separate decision, `MAX_GAP_FRAMES` was measured to be bad at it —
   48 of 51 decidable breaks had the same speaker either side — and none of this
   reopens it. What a silence decides on its own is only what it was measured
   for: whether the audio either side of it may go into one embedding.
+
+**This needs the ASR chunk to be shorter than a hop**, and `RealDiarizer::push`
+refuses one that is not rather than deferring wrongly in silence. The gap is
+recorded after the batch's pieces are consumed, because every piece in a batch
+that restarted was assembled *before* the silence; a chunk that can complete a
+hop on both sides of one silence breaks that, and the post-gap hop would then
+be put to the ordinary adjoining-hop test at the looser `T_CHANGE`, where it
+could claim a turn boundary `MAX_GAP_FRAMES` declines to claim. `chunk_samples`
+is the ASR backend's, not a constant here — `asr::parakeet` merely happens to
+fix it at 0.56 s against a hop's 0.736 s.
 
 The adversarial case this must keep impossible is unchanged and is a red test:
 A talks but is never minted, so their words are committed unlabelled; a pause;
@@ -337,7 +364,97 @@ B talks and *is* minted. If the correction reached back across the pause it
 would put B's name on A's sentence. When the voices differ, they do not match,
 and the seam stands.
 
-#### What the sweep measured
+#### How `T_GAP_CHANGE` was placed, and how to place it again
+
+**On the decisions, not on the outcome.** A meeting makes a few hundred gap
+decisions and a dozen corrections, so almost every decision the guard makes
+lands on audio no correction ever reaches: it moves no aggregate. A threshold
+chosen from corrected miss and confusion has therefore been chosen from the
+dozen decisions that happened to matter, and "no correction crossed a real
+speaker change" in such a table is a statement about how rare corrections are
+rather than about how good the guard is. The first version of this section made
+that mistake and shipped a value that crosses one.
+
+`diarize_probe gaps <wav>` is the instrument. The method, so it can be
+repeated:
+
+1. Replay the recording through the server's own VAD, `WindowAssembler` and
+   embedder, one 32 ms frame at a time rather than one ASR chunk at a time.
+   Same rule at a finer grain, and it makes `WindowAssembler::restarted` name
+   the exact frame the silence broke at, so each hop's audio is known frame by
+   frame.
+2. Keep the last completed hop and count the restarts since it — which is the
+   whole of what `RealDiarizer` does around this comparison. Every time a hop
+   completes with at least one restart behind it, record the cosine the guard
+   would be applying, both hops' frames, the chunks they completed in, and how
+   many silences the seam bridged.
+3. Attribute each hop to a reference speaker under `reference::span_speaker`:
+   the dominant speaker must hold 90% of the frames where somebody is speaking
+   alone, and those must be at least half the frames covered. A hop that fails
+   the gate is *not decidable* and is counted but never scored — which is the
+   right answer for a hop that is itself a mixture.
+4. Score every candidate threshold against that one recorded population. The
+   cosines do not depend on the threshold, so one pass answers for all of them
+   and every row is the same 940 decisions.
+
+Across ES2002a, EN2001a and IS1000a: **940 decisions, 733 decidable — 548 the
+same speaker either side, 185 a real change.**
+
+| `--gap-change` | same-speaker seams correctly discarded | seams discarded across a real change |
+|---|---|---|
+| 0.32 | 325 / 548 | **2** |
+| 0.33 | 304 / 548 | **2** |
+| 0.34 | 281 / 548 | **1** |
+| 0.35 | 253 / 548 | **1** |
+| 0.36 | 243 / 548 | 0 |
+| **0.37** | **224 / 548** | **0** |
+| 0.38 | 212 / 548 | 0 |
+| 0.40 | 185 / 548 | 0 |
+
+The crossing is EN2001a, the hop completing in chunk 7774 against the one
+completing in 7777, at cosine **0.3551**: `EN2001a.C` stops, half a second of
+quiet, `EN2001a.B` starts, and neither hop is a mixture. The outcome sweep
+below cannot see it — nothing was correctable at that point, so no relabel was
+emitted and no aggregate moved.
+
+**0.37, not 0.36.** Both have zero crossings, but 0.36 sits 0.0049 above the
+demonstrated error, and on the same meeting the same pair of speakers straddles
+the bar in both directions 0.0152 apart: B to C at 0.3399, correctly rejected,
+and C to B at 0.3551, wrongly accepted. A margin smaller than one observed step
+of the distribution it is cutting is not a margin. 0.37 leaves 0.0149, which is
+that step, and costs 19 of 243 correct discards.
+
+**And 0.37, not higher**, which the outcome sweep below is the right instrument
+for even though it could not place the value: 0.37 is the largest value at
+which all three meetings are still exactly what they are at the 0.35 it
+replaces, so the margin is bought without giving up anything that was ever
+measured. 0.38 costs 12 of 224 correct discards and one commit of ES2002a's
+backfill; 0.40 costs 39. Neither buys back a crossing, because above 0.36 there
+are none left to buy. Raise the guard as far as it goes for free, and stop
+there.
+
+Rows are scored under the shipped `MAX_BRIDGED_SILENCES`, which is what
+`diarize_probe gaps` applies by default; `--restarts 0` lifts it and adds three
+discards at every value without changing a crossing.
+
+**What the population looks like.** `separability --window 0.75 --hop 0.75`
+measures where hop-length embeddings of one voice and of two actually sit, on
+all pairs: same-speaker median 0.344 (ES2002a) and 0.286 (IS1000a) against
+0.042 and 0.040 for different speakers. So the threshold sits at or above the
+*same-speaker median*, and 58% (ES2002a) / 74% (IS1000a) of genuine
+same-speaker pairs read as "changed" at 0.37. That is the cheap error, taken
+deliberately, and it is why the discard column above is a minority of the
+decidable decisions and why IS1000a barely moves anywhere in the outcome sweep.
+
+**The gap population is more dangerous than all pairs**, which is why the
+all-pairs figure could not have placed this. At 0.37 only 0.07% (ES2002a) and
+0.09% (IS1000a) of all different-speaker pairs read as the same voice; the
+measured rate on real cross-gap changes at 0.35 is 1 in 185, 0.5%. Pairs either
+side of a silence are drawn from a different distribution — turn changes
+cluster at pauses — so the population a threshold is scored on has to be the
+one it is applied to.
+
+#### What the outcome sweep measured
 
 `diarize_probe live --gap-change <t>` on the shipped tuning. **`--gap-change 1`
 is the control**: no two hops of real audio are the same vector, so every
@@ -345,58 +462,83 @@ silence commits its seam and the rule is the one that shipped. It reproduced
 the shipped numbers to the digit on all three meetings, which is what makes the
 rest of the column a measurement of this change and of nothing else.
 
-Corrections and the commits they cover, then corrected miss and confusion:
+Corrections and the commits they cover, then corrected miss and confusion.
+Every cell was run on every meeting — the previous version of this table
+asserted over eight it had not. It reaches down to 0.33 to cover the band 0.35
+was chosen from and no further, because the audit above has already
+disqualified everything below 0.36:
 
 | `--gap-change` | ES2002a | EN2001a | IS1000a |
 |---|---|---|---|
 | 1 (control) | 2 / 3 — 12.2%, 7.1% | 5 / 14 — 4.8%, 5.3% | 2 / 6 — 23.3%, 5.6% |
-| 0.45 | 2 / 3 — 12.2%, 7.1% | 5 / 14 — 4.8%, 5.3% | — |
-| 0.40 | 3 / 6 — 12.2%, 6.9% | 5 / 14 — 4.8%, 5.3% | 2 / 6 — 23.3%, 5.6% |
-| 0.38 | 3 / 6 — 12.2%, 6.9% | 5 / 14 — 4.8%, 5.3% | — |
-| 0.37 | 3 / 31 — 12.0%, 6.9% | — | — |
-| **0.35** | **3 / 31 — 12.0%, 6.9%** | **5 / 14 — 4.8%, 5.3%** | **2 / 6 — 23.3%, 5.6%** |
-| 0.34 | 3 / 31 — 12.0%, 6.9% | 5 / 14 — 4.8%, 5.3% | — |
-| 0.33 | 3 / 31 — 12.0%, 6.9% | 6 / 18 — 4.8%, **5.4%** | — |
-| 0.32 | 4 / 48 — 10.7%, 6.9% | 6 / 18 — 4.8%, **5.4%** | 2 / 6 — 23.3%, 5.6% |
-| 0.30 | 4 / 48 — 10.7%, 6.9% | 6 / 18 — 4.8%, **5.4%** | 2 / 6 — 23.3%, 5.6% |
-| 0.25 | 4 / 48 — 10.7%, 6.9% | 7 / 22 — 4.8%, 5.3% | 2 / 6 — 23.3%, 5.6% |
-| 0.20 | 4 / 72 — 10.7%, 6.9% | 8 / 36 — 4.8%, 5.3% | — |
-| 0.10 | 5 / 85 — 10.7%, 6.8% | — | — |
+| 0.38 | 3 / 6 — 12.2%, 6.9% | 5 / 14 — 4.8%, 5.3% | 2 / 6 — 23.3%, 5.6% |
+| **0.37** | **3 / 7 — 12.1%, 6.9%** | **5 / 14 — 4.8%, 5.3%** | **2 / 6 — 23.3%, 5.6%** |
+| 0.36 | 3 / 7 — 12.1%, 6.9% | 5 / 14 — 4.8%, 5.3% | 2 / 6 — 23.3%, 5.6% |
+| 0.35 | 3 / 7 — 12.1%, 6.9% | 5 / 14 — 4.8%, 5.3% | 2 / 6 — 23.3%, 5.6% |
+| 0.34 | 3 / 7 — 12.1%, 6.9% | 5 / 14 — 4.8%, 5.3% | 2 / 6 — 23.3%, 5.6% |
+| 0.33 | 3 / 7 — 12.1%, 6.9% | 5 / 14 — 4.8%, 5.3% | 2 / 6 — 23.3%, 5.6% |
 
-`run --min-pool 4` is identical to the shipped numbers on ES2002a and EN2001a
-at every value, as it must be: this changes what a correction may reach, and
-clustering is on the other side of that. Splits and merges do not move
-anywhere in the table either.
+Outside it, also measured: ES2002a is the control's at 0.45 and takes its first
+extra correction at 0.40 (3 / 6 — 12.2%, 6.9%), then a fourth at 0.32 (4 / 24 —
+10.8%, 6.9%). IS1000a is the control's at every value from 1 down to 0.25 — its
+two corrections are limited by something other than reach.
 
-**0.35, and the floor is where the guard rail moved rather than where the gain
-stopped.** At 0.33 EN2001a takes one more correction and its corrected
-confusion rises from 5.3% to 5.4% — a correction crossing a real speaker
-change, which is the single thing this threshold exists to prevent. That it
-reads 5.3% again at 0.25 is not the fault clearing: the later corrections cover
-more frames correctly and the aggregate comes out level, which is exactly the
-kind of arithmetic a guard rail must not be read through. So the band is
-[0.34, 0.37], and 0.35 is its middle — the two cliffs cost different things,
-one a few words of backfill and the other a sentence its author.
+`run --min-pool 4 --quiet` is identical to the shipped numbers on ES2002a and
+EN2001a at every value, as it must be: this changes what a correction may
+reach, and clustering is on the other side of that. Splits and merges do not
+move anywhere in the table either.
+
+**This table cannot place the threshold, and that is the point of the one
+above it.** EN2001a and IS1000a do not move at all between 0.33 and 1, and
+ES2002a moves twice; a guard rail that is never run into leaves no mark here.
+The value comes from the audit, and this confirms what it costs.
 
 What that buys, and what it does not:
 
-- **ES2002a: the backfill covers 31 commits where it covered 3**, corrected
-  miss falls 12.2% → 12.0%, corrected confusion falls 7.1% → 6.9%, and
-  speaker B's first label arrives after 0.58 s of their own speech instead of
-  2.69 s. One turn change fewer is followed in the corrected transcript (71 →
-  70 of 109) while p90 turn-switch latency falls 2.85 s → 2.65 s.
-- **EN2001a and IS1000a: nothing moves at all.** Not a regression — every
-  figure is the control's — but not a gain either. EN2001a *does* respond to
-  the threshold, and going far enough to see it is what costs the confusion
-  above; IS1000a is flat across the whole sweep from 1 down to 0.25, so its two
-  corrections are limited by something other than reach.
+- **ES2002a: the backfill covers 7 commits where it covered 3**, corrected miss
+  falls 12.2% → 12.1%, corrected confusion falls 7.1% → 6.9%, and speaker B's
+  first label arrives after 2.13 s of their own speech instead of 2.69 s. One
+  turn change fewer is followed in the corrected transcript (71 → 70 of 109)
+  while p90 turn-switch latency falls 2.85 s → 2.65 s.
+- **EN2001a and IS1000a: nothing moves at all**, in any figure. Not a
+  regression — every one is the control's — but not a gain either.
 
-So this is a large win on one meeting of three and neutral on the other two,
-bounded by a fault the sweep found rather than by taste. The number is now
-`--gap-change` and the honest next step is the measurement nobody has made:
-where same-speaker and different-speaker hop pairs actually sit *across* a
-silence, which is the distribution this threshold is guessing at from its
-effects.
+**Commits, not words.** `MockBackend` writes one word per chunk whether or not
+anybody was speaking, so the commit count overstates the reach of a correction
+that crosses a quiet stretch: an earlier draft of this section reported 31
+commits for ES2002a, of which 14 chunks carried no annotated speech at all.
+`live` now reports how many covered commits carry annotated speech beside the
+raw count, and every commit in the table above does.
+
+**The rest of the drop from 31 to 7 is `MAX_BRIDGED_SILENCES`**, and the audit
+names the decision: the ES2002a hop completing in chunk 76 against the one
+completing in 101, cosine 0.3753 — 25 chunks and **four silences** apart, with
+a pre-gap hop the annotation cannot even attribute to one speaker. That is the
+seam the whole 31-commit reach rested on, and it is precisely what a
+comparison between two hops cannot vouch for. Speaker B's first label at 0.58 s
+came from it too, and 2.13 s is what survives.
+
+**One real turn boundary is eaten, at 0.37 as at 0.35.** ES2002a follows 71 of
+109 turn changes in the control and 70 here. The lost one is frame 69159, to
+`ES2002a.D`: the gap between the hops completing in chunks 1237 and 1240 is
+genuinely B to B and its cosine is 0.4007, so the seam is discarded and a
+correction naming B may then cover chunk 1236 — where D's turn ends and B's
+begins, and the only frame in that turn following D. Frame scoring calls this
+right and turn scoring calls it a boundary eaten. Only a threshold above 0.4007
+would keep it, which is above the whole useful band: at 0.45 nothing on ES2002a
+moves at all.
+
+So this is a modest win on one meeting of three and neutral on the other two,
+bounded by a fault the decision audit found rather than by taste. Smaller than
+this section first claimed, and for two reasons that were both errors in the
+claim rather than in the feature: the commit count was inflated by a harness
+that writes a word per chunk of silence, and the reach it counted rested on a
+seam that had bridged more speech than one comparison can vouch for.
+
+The honest next step is the one the audit makes cheap. `gaps` records what
+every decision was worth on three meetings; a fourth would cost minutes and
+would say whether the 0.3551 crossing is the tail of a distribution or the
+whole of it.
 
 ### Configuration
 
@@ -478,6 +620,19 @@ prediction in a document rather than a red test.
   reopens a run a settled label had ended; a hop across a silence claims no
   turn boundary either way; and the two thresholds are pinned apart by a pair
   of hops that falls between them.
+- **What the seam does when the evidence is late, wrong, or missing.** A seam
+  committed early is still *tightened* by a hop that later measures a change,
+  and is never loosened by one that does not. A pending seam that has bridged
+  three silences stops waiting, while the two-silence shape the design
+  describes still resolves on the evidence. A piece that fails to embed still
+  records the silence it arrived with — the assembler clears `restarted` on the
+  next push, so a gap lost there is lost for good, and the next hop would be
+  compared as though it adjoined the one before the pause. A comparison that
+  answers `NaN` commits the seam rather than reading as "the same person",
+  which a bare dot product against a `<` would otherwise do. An ASR chunk that
+  is not shorter than a hop is refused, before the models are even loaded.
+  `window.rs` carries the precondition all of that turns on: one push can both
+  cut a piece and report a restart.
 - **Both documented "off" switches are off**, checked against behaviour rather
   than against the config parser. `diarize_change_threshold = 0` covers the
   gap comparison as well, since it is also a cosine between two hops.
@@ -501,6 +656,15 @@ vote, the lag, and now change detection and relabelling — and reports:
 
 These are the acceptance measurements. The constants above are provisional
 until this mode has run.
+
+It also gains `gaps <wav>`, which is the other half of that and answers a
+question the aggregates cannot: not "what did this configuration cost" but "was
+each decision the right one". It records every comparison `T_GAP_CHANGE` is
+applied to with the annotation's answer beside it, and scores every candidate
+threshold against that one population. Where an outcome sweep can only see a
+guard rail that something happened to run into, this sees every time it was
+touched — which for a rule that fires hundreds of times per meeting and matters
+a dozen times is the difference between a measurement and a coincidence.
 
 Two things the harness must get right, because both understate what it is
 measuring. It replays the server's own `Session`, so the label for a chunk
@@ -542,10 +706,11 @@ the model that actually ran.
 
 ## Where this document was wrong
 
-Five of the rules above were found to be wrong — four during implementation and
-one in use — and are corrected in the code. They are recorded here rather than
-quietly edited out, because each was reasoned from the same evidence the rest
-of the design was and the reasoning is worth not repeating.
+Six of the rules above were found to be wrong — four during implementation and
+two after the result was measured — and are corrected in the code. They are
+recorded here rather than quietly edited out, because each was reasoned from
+the same evidence the rest of the design was and the reasoning is worth not
+repeating.
 
 **1. Relaxing the mint gate manufactures splits.** The rule as designed —
 refuse a mint when the pooled mean is *assignable*, or within `T_RETIRE` —
@@ -651,5 +816,31 @@ EN2001a. The evidence to answer the question directly was already being
 computed and thrown away: turn-change detection embeds every hop, so the hop
 from before the pause was in hand and was cleared on the restart. It is kept
 now, the seam waits for the next hop, and the comparison decides. See "A
-silence is measured, not assumed" for the rule and the sweep that placed its
+silence is measured, not assumed" for the rule and the audit that placed its
 threshold.
+
+**6. A guard that fires hundreds of times cannot be placed by a metric that
+moves a dozen times.** `T_GAP_CHANGE` was chosen from `live`'s corrected miss
+and confusion, and 0.35 was called safe because no correction crossed a real
+speaker change anywhere in the sweep. It does cross one. Scored on the
+comparisons themselves, 940 across three meetings, 0.35 discards the seam at
+EN2001a's chunk 7774 to 7777 — cosine 0.3551, C stopping and B starting across
+half a second of quiet, neither hop a mixture. Nothing was correctable at that
+decision, so no relabel was emitted and no aggregate moved: the sweep was
+reporting the base rate of corrections and being read as a property of the
+guard. `diarize_probe gaps` exists so the next such rule is scored where it
+acts, and 0.37 is what it chose.
+
+The same blindness hid three smaller faults in the seam, all of them costing
+nothing an aggregate could see. **A pending seam had no bound at all** — this
+document said the exposure was "one hop", and `previous_hop` is written only by
+a completed hop, so one comparison could be asked to vouch for every
+interjection between two hops half a minute apart; `MAX_BRIDGED_SILENCES` now
+bounds it to the shape described here, and the 31-commit backfill this document
+claimed for ES2002a rested on a seam four silences wide. **A seam committed
+early was never tightened** by the hop that finally arrived, leaving the bound
+on the one chunk that can carry both speakers' words. **A silence disappeared
+from provenance entirely** if any piece of the chunk it arrived on failed to
+embed, which is exactly the transient the cautious path exists for. And the
+claim that `session.rs` bounds any of this is wrong: it protects a *settled*
+label, and a carried-forward label is provisional.
