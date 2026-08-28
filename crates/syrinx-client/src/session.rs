@@ -555,17 +555,22 @@ async fn run(
         tokio::select! {
             _ = &mut stop_rx => break,
             _ = health_tick.tick() => {
-                let mut s = state.lock().expect("state lock poisoned");
+                // Built before the state lock is taken, so the mixer's queue
+                // locks and this one are never held at the same time and no
+                // ordering between them can arise to be got wrong later.
                 let rows = match (&mixed, &solo) {
                     (Some(h), _) => h.read(),
-                    (None, Some(label)) => vec![SourceHealth {
-                        label: label.clone(),
-                        rms: s.rms,
-                        silent: last_audio.elapsed() >= STARVE_AFTER,
-                    }],
+                    (None, Some(label)) => {
+                        let rms = state.lock().expect("state lock poisoned").rms;
+                        vec![SourceHealth {
+                            label: label.clone(),
+                            rms,
+                            silent: last_audio.elapsed() >= STARVE_AFTER,
+                        }]
+                    }
                     (None, None) => Vec::new(),
                 };
-                s.sources = rows;
+                state.lock().expect("state lock poisoned").sources = rows;
             }
             chunk = audio_rx.recv() => match chunk {
                 Some(samples) => {
