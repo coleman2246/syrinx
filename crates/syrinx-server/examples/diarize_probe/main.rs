@@ -17,6 +17,7 @@
 //! | `bench` | what does one session cost on one core? |
 //! | `lag` | how long must a chunk wait for a label to exist? |
 //! | `live` | what does a *session* do -- first-label and turn-switch latency? |
+//! | `gaps` | is each decision the gap guard makes the right one? |
 //!
 //! **Models and audio live outside the repository**, in `$DIARIZE_SPIKE_DIR`
 //! (default `~/models/diarize-spike`) -- the directory the spike left behind,
@@ -60,12 +61,13 @@ use syrinx_server::diarize::cluster::{
     T_MINT_CEILING, T_RETIRE, cosine,
 };
 use syrinx_server::diarize::fbank::SAMPLE_RATE;
-use syrinx_server::diarize::real::{Embedder, Vad, norm_for};
+use syrinx_server::diarize::real::{Embedder, MAX_BRIDGED_SILENCES, Vad, norm_for};
 use syrinx_server::diarize::window::{
     Cut, FRAME, Framed, HOP_SAMPLES, WINDOW_SAMPLES, WindowAssembler,
 };
 use syrinx_server::session::{LAG_CHUNKS, RELABEL_WINDOW};
 
+mod gaps;
 mod live;
 mod reference;
 use reference::Reference;
@@ -840,7 +842,7 @@ const LIVE: Spec = Spec {
             "--gap-change",
             true,
             "cosine across a silence below which the voices differ; 1 makes \
-             every silence a seam, which is the rule that shipped before it",
+             every silence a seam",
         ),
         (
             "--relabel-window",
@@ -852,6 +854,32 @@ const LIVE: Spec = Spec {
             true,
             "seconds of each recording per turn when splicing",
         ),
+    ],
+};
+const GAPS: Spec = Spec {
+    name: "gaps",
+    what: "audit every decision the gap guard makes against the annotation",
+    operand: "<wav>",
+    // No `--gap-change`: this subcommand scores every candidate at once, which
+    // is the whole point of it. A threshold is where a recorded cosine falls,
+    // not something the recording depends on, so a flag that varied it would
+    // invite a table whose rows came from different populations.
+    flags: &[
+        ("--model", true, "embedding model filename, or a path"),
+        ("--wav", true, "comma-separated recordings"),
+        ("--chunk", true, "ASR chunk length in seconds"),
+        (
+            "--thresholds",
+            true,
+            "comma-separated candidate values for T_GAP_CHANGE",
+        ),
+        (
+            "--restarts",
+            true,
+            "silences one pending seam may bridge, MAX_BRIDGED_SILENCES by \
+             default; 0 does not bound it at all",
+        ),
+        ("--list", false, "print every decision, one per line"),
     ],
 };
 const LAG: Spec = Spec {
@@ -987,6 +1015,7 @@ const SPECS: &[Subcommand] = &[
     (&BENCH, bench),
     (&LAG, lag),
     (&LIVE, live),
+    (&GAPS, gaps_audit),
 ];
 
 fn usage() -> String {
@@ -1252,6 +1281,19 @@ fn separability(args: &Args) -> Result<()> {
                 "  best split at {threshold:.2} -> {:.1}% of pairs wrong",
                 100.0 * wrong
             );
+            // What the shipped gap threshold does to *this* population, which
+            // is not the population it is applied to. `gaps` scores it on the
+            // decisions it actually makes; printing the all-pairs rate beside
+            // them is what makes the difference between the two visible rather
+            // than something a reader has to take on trust.
+            let above = (diff.len() - diff.partition_point(|&s| s < T_GAP_CHANGE)) as f32;
+            let below = same.partition_point(|&s| s < T_GAP_CHANGE) as f32;
+            println!(
+                "  at T_GAP_CHANGE {T_GAP_CHANGE}: {:.2}% of different-speaker pairs read \
+                 as the same voice, {:.0}% of same-speaker pairs read as changed",
+                100.0 * above / diff.len() as f32,
+                100.0 * below / same.len() as f32,
+            );
         }
     }
     Ok(())
@@ -1514,6 +1556,109 @@ fn lag(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Score `T_GAP_CHANGE` on the guard's decisions rather than on its
+/// consequences.
+///
+/// The sweep in `live` places the threshold by what it does to corrected miss
+/// and confusion, and those are the wrong instrument for it: a meeting makes a
+/// few hundred gap decisions and a dozen corrections, so nearly every decision
+/// falls on audio no correction reaches and moves no aggregate. A value with
+/// zero crossings in that table has been told something about how rare
+/// corrections are, not about how good the guard is. This scores each decision
+/// against the annotation, so the column that matters -- seams discarded
+/// across a real speaker change -- is counted where it happens.
+fn gaps_audit(args: &Args) -> Result<()> {
+    let names = match args.positional() {
+        Some(one) => vec![one.to_string()],
+        None => args.list("--wav", "ES2002a.Mix-Headset.wav"),
+    };
+    let model = model_path(&args.list("--model", CHOSEN).join(""));
+    let chunk_samples = (args.num("--chunk", 0.56)? * SAMPLE_RATE) as usize;
+    let thresholds: Vec<f32> =
+        args.nums("--thresholds", "0.30,0.32,0.34,0.35,0.36,0.37,0.38,0.40")?;
+    let max_restarts = args.num("--restarts", MAX_BRIDGED_SILENCES as f32)? as u32;
+
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let mut embedder = embedder(&model, threads)?;
+
+    for name in &names {
+        let wav = resolve("audio", name);
+        let reference = Reference::load_ami(&format!("{}/annot", probe_dir()), &meeting_of(&wav))?;
+        let samples = reference::read_wav(&wav)?;
+        let voiced = voiced_frames(&wav)?;
+        let decisions = gaps::audit(&samples, &voiced, &reference, &mut embedder, chunk_samples)?;
+
+        let decidable: Vec<&gaps::Decision> = decisions
+            .iter()
+            .filter(|d| d.decidable().is_some())
+            .collect();
+        let same = decidable
+            .iter()
+            .filter(|d| d.decidable() == Some(true))
+            .count();
+        println!(
+            "{} ({}) {} gap decisions, {} decidable: {} same speaker, {} a real change",
+            meeting_of(&wav),
+            stem(&model),
+            decisions.len(),
+            decidable.len(),
+            same,
+            decidable.len() - same
+        );
+
+        println!("  threshold  correct discards  crossings");
+        for &t in &thresholds {
+            let tally = gaps::tally(&decisions, t, max_restarts);
+            println!(
+                "  {t:<10.2} {:>3} / {same:<12} {:>3}",
+                tally.correct, tally.crossings
+            );
+        }
+
+        // Named individually, because a crossing is a specific pair of hops
+        // with a specific cosine and the margin between it and the threshold
+        // is the whole question. A count alone cannot say whether a value with
+        // no crossings has room or is sitting on one.
+        let mut worst: Vec<&&gaps::Decision> = decidable
+            .iter()
+            .filter(|d| d.decidable() == Some(false))
+            .collect();
+        worst.sort_by(|a, b| b.cos.total_cmp(&a.cos));
+        for d in worst.iter().take(5) {
+            println!(
+                "    real change at cos {:.4}: chunk {} -> {} ({} silences, {} chunks)",
+                d.cos,
+                d.before_chunk,
+                d.after_chunk,
+                d.restarts,
+                d.bridged()
+            );
+        }
+
+        let mut bridged: Vec<u64> = decisions.iter().map(gaps::Decision::bridged).collect();
+        bridged.sort_unstable();
+        let pct = |p: f32| bridged[((bridged.len() - 1) as f32 * p) as usize];
+        let multi = decisions.iter().filter(|d| d.restarts > 1).count();
+        println!(
+            "    chunks bridged: p50 {} p90 {} max {}; {multi} of {} bridge more than one silence",
+            pct(0.5),
+            pct(0.9),
+            bridged[bridged.len() - 1],
+            decisions.len()
+        );
+
+        if args.has("--list") {
+            for d in &decisions {
+                println!(
+                    "    {}\t{}\t{:.4}\t{:?}\t{:?}\t{}",
+                    d.before_chunk, d.after_chunk, d.cos, d.before, d.after, d.restarts
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Replay a real session over a recording and report the two latencies the
 /// 2026-08-27 design is judged on.
 ///
@@ -1619,8 +1764,10 @@ fn live(args: &Args) -> Result<()> {
     ];
 
     println!(
-        "  {} corrections covering {} commits",
-        replay.relabels, replay.relabelled_commits
+        "  {} corrections covering {} commits, {} of them carrying annotated speech",
+        replay.relabels,
+        replay.relabelled_commits,
+        live::annotated(&replay.relabelled_chunks, &reference, chunk_samples),
     );
 
     for (what, hyp) in &painted {

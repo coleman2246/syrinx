@@ -51,6 +51,14 @@ pub struct Replay {
     /// Corrections sent, and commits they covered.
     pub relabels: usize,
     pub relabelled_commits: usize,
+    /// Which chunks those commits carried.
+    ///
+    /// Kept because the commit count on its own overstates the reach:
+    /// `MockBackend` emits one word per chunk whether or not anybody was
+    /// speaking, so a correction stretching over a quiet minute covers a
+    /// commit per chunk of it and none of them is a word a person would see
+    /// change. [`annotated`] is what turns this into the honest figure.
+    pub relabelled_chunks: Vec<usize>,
 }
 
 /// Drive a real session over `samples` and record what it committed.
@@ -90,6 +98,7 @@ pub fn replay(
     let mut corrected = vec![None; chunks];
     let mut chunk_of_seq: Vec<(u64, usize)> = Vec::new();
     let (mut relabels, mut relabelled_commits) = (0usize, 0usize);
+    let mut relabelled_chunks = Vec::new();
 
     for m in &messages {
         match m {
@@ -115,6 +124,7 @@ pub fn replay(
                     if seq >= from_seq && seq <= to_seq {
                         corrected[*chunk] = Some(*speaker);
                         relabelled_commits += 1;
+                        relabelled_chunks.push(*chunk);
                     }
                 }
             }
@@ -127,7 +137,27 @@ pub fn replay(
         corrected,
         relabels,
         relabelled_commits,
+        relabelled_chunks,
     })
+}
+
+/// How many of `chunks` carry a word somebody actually said.
+///
+/// The denominator the commit count needs. A commit exists per chunk because
+/// `MockBackend` writes one word per chunk regardless, so a correction reaching
+/// back over a quiet stretch collects a commit for every chunk of the quiet.
+/// Scored against single-speaker reference frames, the same population every
+/// other number here is scored on.
+pub fn annotated(chunks: &[usize], reference: &Reference, chunk_samples: usize) -> usize {
+    let per_chunk = chunk_samples / SAMPLES_PER_FRAME;
+    chunks
+        .iter()
+        .filter(|&&c| {
+            let lo = (c * per_chunk).min(reference.frames.len());
+            let hi = (lo + per_chunk).min(reference.frames.len());
+            reference.frames[lo..hi].iter().any(|m| m.count_ones() == 1)
+        })
+        .count()
 }
 
 /// Per-chunk labels painted onto the 10 ms grid the reference is scored on.

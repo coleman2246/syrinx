@@ -4,12 +4,16 @@
 //! alignments rather than the transcriber's `segments`, because segments
 //! include the pauses inside a turn and would count silence as speech.
 //!
-//! Ported unchanged from the go/no-go spike -- `git log --follow` on this file
-//! reaches it -- because every number in the design doc's "Spike results" was
-//! produced by this scoring code, so it moves into the tree as it was rather
-//! than being rewritten around the tree's types. Nothing here is production
-//! code -- the server never scores itself against an annotation -- which is
-//! why it lives beside the probe instead of in `src/diarize`.
+//! Ported from the go/no-go spike -- `git log --follow` on this file reaches
+//! it -- because every number in the design doc's "Spike results" was produced
+//! by this scoring code, so it moved into the tree as it was rather than being
+//! rewritten around the tree's types. Nothing scored here has changed since:
+//! [`span_speaker`] generalises [`window_speaker`] to audio that is not one
+//! contiguous stretch and is the only rule the two share.
+//!
+//! Nothing here is production code -- the server never scores itself against
+//! an annotation -- which is why it lives beside the probe instead of in
+//! `src/diarize`.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -194,20 +198,42 @@ pub fn score(hyp: &[Option<u32>], reference: &Reference) -> Metrics {
 pub fn window_speaker(reference: &Reference, t0: f32, t1: f32) -> Option<usize> {
     let lo = (t0 / FRAME_MS) as usize;
     let hi = ((t1 / FRAME_MS) as usize).min(reference.frames.len());
-    if lo >= hi {
-        return None;
-    }
+    span_speaker(reference, &[(lo, hi)])
+}
+
+/// The same judgement over audio that is not one contiguous stretch.
+///
+/// A hop is 0.75 s of *voiced* audio spliced out of a longer wall-clock span,
+/// so the frames it was built from arrive as several ranges rather than one.
+/// Scoring the whole span instead would charge a hop for silence it never
+/// contained, and the purity gate below would then refuse most of them.
+///
+/// One rule for both, and this is the one: the dominant speaker must hold 90%
+/// of the frames where somebody is speaking alone, and those frames must be at
+/// least half of what was covered at all. The first clause refuses a handover,
+/// the second refuses a judgement made from a handful of words.
+pub fn span_speaker(reference: &Reference, spans: &[(usize, usize)]) -> Option<usize> {
     let mut counts = vec![0usize; reference.names.len()];
-    let mut clean = 0usize;
-    for &mask in &reference.frames[lo..hi] {
-        if mask.count_ones() == 1 {
-            counts[mask.trailing_zeros() as usize] += 1;
-            clean += 1;
+    let (mut clean, mut total) = (0usize, 0usize);
+    for &(lo, hi) in spans {
+        let hi = hi.min(reference.frames.len());
+        if lo >= hi {
+            continue;
+        }
+        total += hi - lo;
+        for &mask in &reference.frames[lo..hi] {
+            if mask.count_ones() == 1 {
+                counts[mask.trailing_zeros() as usize] += 1;
+                clean += 1;
+            }
         }
     }
+    if total == 0 {
+        return None;
+    }
     let (best, &n) = counts.iter().enumerate().max_by_key(|(_, c)| **c)?;
-    // Purity gate: the window must be one voice, not a handover.
-    (n as f32 >= 0.9 * clean as f32 && n as f32 >= 0.5 * (hi - lo) as f32).then_some(best)
+    // Purity gate: the audio must be one voice, not a handover.
+    (n as f32 >= 0.9 * clean as f32 && n as f32 >= 0.5 * total as f32).then_some(best)
 }
 
 /// Frames of each reference speaker carrying each hypothesis label, in
