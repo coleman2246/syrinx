@@ -276,10 +276,12 @@ fn ensure_daemon() -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // A daemon that came up but never listened is still a child of ours. The
-    // failure below is reported in a modal dialog, which waits for a person to
-    // dismiss it, so leaving the wait to this process exiting could hold a
-    // defunct daemon for as long as the message sits on screen.
+    // Fifty polls found this daemon alive and not listening, so it is a live
+    // child rather than a defunct one, and the narrower case is the one worth
+    // covering: it may give up while the failure below sits in a modal dialog
+    // waiting for a person to read it. That dialog is the rest of this
+    // process's life -- `main` reports and exits -- so the thread costs a
+    // stack for as long as the message is on screen, and nothing after.
     syrinx_client::process::reap_in_background(child);
     anyhow::bail!(
         "the daemon did not start listening within 5s.\n{}",

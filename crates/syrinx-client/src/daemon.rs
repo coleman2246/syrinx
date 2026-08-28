@@ -1012,10 +1012,13 @@ impl DaemonRuntime {
             .spawn()
         {
             Ok(c) => {
-                // Whatever is in the slot has to be waited for rather than
-                // dropped. A Stop and a Start can arrive in the same pass of
-                // the command queue, which puts a new overlay here before the
-                // loop has cleared the old one.
+                // The slot can still hold the last session's overlay, and
+                // assigning over a `Child` drops it, which never waits. What
+                // clears it is `reap_finished_session`, once a pass and only
+                // when nothing is running: a session that ends on its own just
+                // after that check leaves the handle here for a Start drained
+                // in the next pass, which sees nothing running and comes
+                // straight through. The window is the loop's 25 ms sleep.
                 self.stop_overlay();
                 self.overlay = Some(c);
             }
@@ -1033,11 +1036,21 @@ impl DaemonRuntime {
     /// thread, which is what covers the frequent path -- one overlay per
     /// dictation session, on a daemon that then runs for days.
     ///
-    /// On the shutdown path that thread may never be scheduled. Nothing is
-    /// left behind there either: a child whose parent has gone is reparented
-    /// to init, or to the nearest subreaper, and waited for by it. Windows has
-    /// no zombie state to reach at all -- the record lives with the handle,
+    /// On the shutdown path that thread may never be scheduled, and nothing is
+    /// left behind anyway: this daemon installs no subreaper and `detach` only
+    /// calls `setsid`, so a child it leaves behind is reparented to
+    /// `systemd --user` or to pid 1, both of which wait for what they adopt.
+    /// Reparenting alone would not be enough to say that --
+    /// `PR_SET_CHILD_SUBREAPER` on an ancestor that never waits keeps the
+    /// zombie indefinitely -- but there is no such ancestor here. Windows has
+    /// no zombie state to reach at all: the record lives with the handle,
     /// which the `Child` closes as it drops.
+    ///
+    /// A daemon that is SIGKILLed never reaches here, and what it leaves is an
+    /// overlay still *running* -- an always-on-top window with nothing behind
+    /// it. The overlay closes itself in that case: it polls this daemon thirty
+    /// times a second and treats a request it cannot get an answer to as the
+    /// end of the session it was reporting on.
     fn stop_overlay(&mut self) {
         if let Some(mut c) = self.overlay.take() {
             let _ = c.kill();
@@ -1244,9 +1257,12 @@ impl DaemonRuntime {
         match std::process::Command::new(cmd).spawn() {
             Ok(c) => {
                 info!("opened a viewer");
-                // Dropping the handle instead would leave the viewer defunct
-                // from the moment its window is closed until the daemon exits,
-                // one per window ever opened.
+                // A viewer exits when someone closes its window, which can be
+                // hours from now and has nothing to do with this loop. The
+                // handle goes somewhere that can afford to sit in the wait,
+                // because there is nowhere here to keep it until then -- and
+                // the daemon this is parented to outlives every window it
+                // opens.
                 crate::process::reap_in_background(c);
             }
             Err(e) => warn!("could not open {cmd}: {e}"),
@@ -1967,10 +1983,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn starting_an_overlay_reaps_the_one_it_replaces() {
-        // A Stop and a Start can be drained in the same pass of the command
-        // queue, which reaches `start_overlay` before the loop has cleared the
-        // previous session's overlay. Assigning over the handle would drop it,
-        // and a dropped handle is never waited for.
+        // The slot is cleared by `reap_finished_session`, once a pass and only
+        // when nothing is running. A session that ends on its own just after
+        // that check leaves the previous overlay here for the Start drained in
+        // the next pass, and assigning over the handle would drop it -- a
+        // dropped handle is never waited for.
         let mut d = daemon_holding(SessionState::default());
         d.opts.mode = OutputMode::Type;
         // Given `--overlay`, which it does not understand, so the stand-in
