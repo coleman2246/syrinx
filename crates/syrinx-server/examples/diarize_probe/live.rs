@@ -135,6 +135,12 @@ pub fn replay(
 /// Forwards, unlike [`super::label_frames`]: a chunk's label covers the audio
 /// that chunk carried and nothing earlier. That is the whole difference this
 /// module exists to expose.
+///
+/// This says *which audio a label describes*, not when it arrived. A commit is
+/// released `lag_chunks` after the chunk its words end on, so the two latency
+/// measurements below add that back; the accuracy figures scored off this grid
+/// are unaffected, since they ask who was speaking rather than when anybody
+/// found out.
 pub fn paint(labels: &[Option<u32>], chunk_samples: usize, frames: usize) -> Vec<Option<u32>> {
     let mut out = vec![None; frames];
     let per_chunk = chunk_samples / SAMPLES_PER_FRAME;
@@ -237,12 +243,20 @@ fn turn_changes(reference: &Reference) -> Vec<(usize, usize)> {
     out
 }
 
-/// Voiced seconds from each speaker's first word to their first label, or
-/// `None` for a speaker who never got one.
+/// Voiced seconds from each speaker's first word to their first label
+/// reaching a client, or `None` for a speaker who never got one.
+///
+/// Charged to the moment of *emission*, which is `lag_chunks` after the chunk
+/// the label describes: the session holds a commit back while its label
+/// settles, so a label painted onto chunk `c` is not on anybody's screen until
+/// the commit released during chunk `c + lag_chunks` goes out. At the shipped
+/// depth that is 1.12 s of the answer, and leaving it out understates every
+/// number this subcommand exists to produce.
 pub fn first_label_latency(
     hyp: &[Option<u32>],
     reference: &Reference,
     chunk_samples: usize,
+    lag_chunks: usize,
 ) -> Vec<Option<f32>> {
     let mapping = speaker_of_label(hyp, reference);
     let first = first_heard(reference);
@@ -253,26 +267,39 @@ pub fn first_label_latency(
             let start = first[who]?;
             let label = mapping.iter().find(|(_, s)| *s == who)?.0;
             // The first frame carrying that speaker's label at or after they
-            // started talking. Painted forwards, so this really is the moment
-            // a client could first have shown it.
+            // started talking.
             let at =
                 (start..reference.frames.len().min(hyp.len())).find(|&f| hyp[f] == Some(label))?;
-            // Charged to the chunk boundary, because a label reaches a client
-            // as a whole commit rather than as a frame.
-            let at = at.next_multiple_of(per_chunk.max(1));
+            // Charged to the end of the commit that carries it: a label
+            // reaches a client as a whole commit rather than as a frame, and
+            // that commit waits out the lag first.
+            let at = emitted_at(at, per_chunk, lag_chunks);
             Some(own_speech(reference, who, start, at))
         })
         .collect()
+}
+
+/// The frame at which a label painted onto frame `at` actually goes out.
+///
+/// Rounded up to the chunk that carries it, then forward by the lag the
+/// session holds every commit for.
+fn emitted_at(at: usize, per_chunk: usize, lag_chunks: usize) -> usize {
+    let per_chunk = per_chunk.max(1);
+    at.next_multiple_of(per_chunk) + lag_chunks * per_chunk
 }
 
 /// Voiced seconds from each real turn change to the emitted label changing to
 /// the incoming speaker's, sorted. A turn the diarizer never picked up
 /// contributes nothing, which is the miss rate's business rather than this
 /// number's.
+///
+/// Charged at emission, exactly as [`first_label_latency`] is and for the same
+/// reason: this is a latency a person waits, not a property of the labelling.
 pub fn turn_switch_latency(
     hyp: &[Option<u32>],
     reference: &Reference,
     chunk_samples: usize,
+    lag_chunks: usize,
 ) -> (Vec<f32>, usize) {
     let mapping = speaker_of_label(hyp, reference);
     let changes = turn_changes(reference);
@@ -291,7 +318,7 @@ pub fn turn_switch_latency(
             .find(|(f, _)| *f > at)
             .map_or(n, |(f, _)| (*f).min(n));
         if let Some(found) = (at..until).find(|&f| hyp[f] == Some(label)) {
-            let found = found.next_multiple_of(per_chunk.max(1));
+            let found = emitted_at(found, per_chunk, lag_chunks);
             out.push(own_speech(reference, who, at, found));
         }
     }

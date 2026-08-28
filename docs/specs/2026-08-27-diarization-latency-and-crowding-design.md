@@ -1,7 +1,9 @@
 # Faster labels, cleaner turns, and a room with eight people in it
 
 **Date:** 2026-08-27
-**Status:** Approved design, pre-implementation
+**Status:** Implemented, with four of its own rules corrected during
+implementation — see "Where this document was wrong" at the end. Read that
+section alongside the design below; where the two disagree, it wins.
 **Supersedes constants in:** `docs/specs/2026-08-24-speaker-diarization-design.md`
 (architecture and spike results there still stand; this changes how windows are
 cut, how assignment decides, and when a label may be corrected)
@@ -145,10 +147,12 @@ the highest cosine to any live centroid and `s2` the second highest.
 
 - Assign to the best centroid only when `s1 >= T_ASSIGN` **and**
   `s1 - s2 >= T_MARGIN`.
-- Otherwise return `None` — and critically, **do not update any centroid**.
-  Ambiguity today is resolved by the third decimal place and then written into
-  a centroid via EMA; that is the drift mechanism. An ambiguous window should
-  change nothing.
+- Otherwise **do not update any centroid**. Ambiguity today is resolved by the
+  third decimal place and then written into a centroid via EMA; that is the
+  drift mechanism. An ambiguous window changes nothing.
+- Otherwise **still report the argmax**, marked provisional, and **still pool
+  the window**. Withholding buys the drift protection; it must not also be
+  paid for out of the miss rate. See "Where this document was wrong", item 3.
 
 Above `COHORT_MIN = 4` live centroids, `s1` is additionally normalised against
 the cohort of scores to the other centroids — `z = (s1 - mean(others)) / std(others)`,
@@ -166,21 +170,30 @@ which `speaker: None` is designed to carry.
 
 ### The pool stops needing to be consecutive
 
-`pool.clear()` on assignment is removed. The pool becomes a bounded ring of the
-most recent `POOL_RING = 8` orphan embeddings, and minting fires when any
-`MIN_POOL = 4` of them are mutually in agreement — not necessarily consecutive,
-not necessarily uninterrupted by other speakers' windows.
+`pool.clear()` on assignment is removed. Orphans are held **per candidate
+speaker**: an orphan joins the pool every member of which it agrees with at
+`T_ASSIGN`, or starts a pool of its own, and a pool reaching `MIN_POOL = 4`
+members mints. Pools are bounded in number (`MAX_POOLS = 8`, one per person in
+the room this is for) and in age (`POOL_AGE = 64` windows without a new
+member).
 
 `MIN_POOL` stays 4, so the reluctance the spike proved is intact: four windows
 must still agree with each other before a speaker exists. What is dropped is
 the additional, undocumented, unmeasured requirement that no other speaker talk
-in between, which crowding turns into an impossibility. The mean-versus-nearest
-re-test before minting (`cluster.rs:183-194`) is retained unchanged.
+in between, which crowding turns into an impossibility.
 
-`pool_agrees()` currently requires **all** pairs to clear `T_ASSIGN` and evicts
-only the oldest on failure (`cluster.rs:225-231`, `:176-181`), recovering one
-window per attempt. With a ring, the search is for any agreeing subset of four,
-which recovers immediately from a single poisoned window.
+Per candidate rather than one shared ring, because a shared ring has to hold
+the mintable set *and* everything that arrives between its members: with `k`
+foreign orphans between each of a newcomer's windows it needs
+`MIN_POOL + (MIN_POOL - 1) * k` slots, which at `k = 7` is 25. See "Where this
+document was wrong", item 2.
+
+Because a pool is mutually agreeing by construction, there is no subset search
+and no question of a poisoned window: a window that agrees with nobody starts
+its own pool and waits there for agreement that never comes.
+
+The mean-versus-nearest re-test before minting is **not** retained unchanged;
+see item 1 below.
 
 ### The session stops arguing with the boundary
 
@@ -197,6 +210,9 @@ Two smoothers actively fight a turn change and both become boundary-aware:
   behaviour pinned by `tests/diarize.rs:89-113` changes deliberately, and that
   test is updated to assert the new intent rather than deleted.
 
+A third smoother is needed and was missing from this design: a **refractory
+floor** on how often a boundary may be accepted. See item 4 below.
+
 ### Labels may be corrected
 
 New additive server message:
@@ -210,9 +226,13 @@ revision, the two have different client handling, and overloading revise would
 require adding a speaker field to a message whose existing semantics say the
 text changed.
 
-The session keeps a bounded ring of recently emitted commits — their `seq` and
-the chunk range each covered — spanning `RELABEL_WINDOW = 30s`. Two events emit
-a relabel:
+The session keeps a bounded ring of recently emitted commits — their `seq`,
+the chunk range **their text came from**, and whether the speaker beside them
+is a guess — spanning `RELABEL_WINDOW = 30s`. The chunk range is the text's
+provenance and not the range its label was voted over: the vote runs from the
+text's last chunk forward through the lag window, so it starts where the words
+end and reaches `lag_chunks` into whoever spoke next. Matching a correction
+against that is wrong in both directions. Two events emit a relabel:
 
 - **A speaker is minted.** The pooled windows have known chunk ranges; the
   commits overlapping them were emitted with `speaker: None` and now have a
@@ -225,6 +245,22 @@ Older text is frozen. A relabel never renumbers an existing speaker and never
 reassigns a commit that already carries a different confident label from a
 different turn — it fills gaps and corrects provisionals, nothing else. The
 "never renumber" property from the 2026-08-24 design is preserved exactly.
+
+That promise is only keepable if the **client** can tell which of its commits
+carry a guess, so `transcript.commit` carries `speaker_provisional: bool`
+(additive, omitted when false) and the client applies a correction only to
+segments it holds as unlabelled or provisional. A rule enforced at one end of
+a protocol is a comment about that end.
+
+**How far back a correction may reach** is bounded by provenance, not by "no
+turn change was detected". A change is undetectable where there was nothing to
+compare against, and the first hop of a session is exactly that case, so a
+meeting opening with a short unlabelled utterance would otherwise have the
+*next* speaker's name written over it. The bound moves forward at three
+points: a detected turn change, the first completed hop, and a silence long
+enough to have cleared the window accumulator. A turn change entirely inside
+one hop remains undetectable — the residual exposure is one hop of audio at
+the opening of a run, and is documented in the code rather than argued away.
 
 **Client handling, per surface:**
 
@@ -254,9 +290,17 @@ diarize_relabel_window = 30     # seconds of transcript still eligible for corre
 ```
 
 Starting values are engineering estimates, not measurements, and the probe work
-below exists to replace them. `diarize_relabel_window = 0` disables relabelling
-entirely, which is the escape hatch if corrections prove more disruptive to
-read than gaps.
+below exists to replace them. So are `T_MINT_MARGIN = 0.20`, `MAX_POOLS = 8`
+and `POOL_AGE = 64`, which have no keys of their own.
+
+**Every documented "off" has to be off.** `diarize_relabel_window = 0` disables
+relabelling entirely. `diarize_margin = 0` disables the margin, the cohort
+test and the mint ceiling together — the cohort test has no key of its own, so
+leaving it running would give a deployment reaching for the hatch no relief in
+the only room the hatch is for. `diarize_change_threshold = 0` is *checked
+for* rather than compared against, because different-speaker cosines are
+routinely negative (median 0.046) and no value of a plain `cosine < threshold`
+could ever mean "never".
 
 ## Testing
 
@@ -271,9 +315,18 @@ prediction in a document rather than a red test.
   ambiguous vector.
 - **Ambiguity changes nothing.** A vector between two centroids returns `None`
   and leaves both centroids bit-identical — the drift regression.
-- **The ring pool mints through interruption.** Four agreeing orphans separated
-  by other speakers' assigned windows still mint, where the consecutive pool
-  would not.
+- **The pool mints through interruption.** Four agreeing orphans separated by
+  other speakers' assigned windows still mint, where the consecutive pool would
+  not — and, separately, still mint with up to `MAX_POOLS - 1` *foreign
+  orphans* between each, which is the case a shared ring cannot hold.
+- **An ambiguous pool mints nobody.** Four mutually agreeing windows sitting
+  equidistant from two incumbents are not a third speaker, at 0.60, 0.65, 0.705
+  or 0.79 — while the same four just inside the ceiling still are.
+- **A non-finite embedding is refused**, never assigned, and moves no centroid:
+  one such assignment is an absorbing state, since the EMA makes that centroid
+  non-finite and `total_cmp` then ranks it above every real one.
+- **A window completes between any two accepted boundaries**, however often
+  detection fires.
 - **Z-norm is inert below the cohort minimum**, so two- and three-speaker
   behaviour is provably unchanged.
 - **Change detection cuts the window**, and a window spanning a synthetic
@@ -281,7 +334,13 @@ prediction in a document rather than a red test.
 - **Carry-forward stops at a boundary**, and the vote does not cross one.
 - **Relabel** fills a `None` gap on mint, corrects a contradicted provisional,
   never renumbers, never crosses out of its window, and is omitted entirely at
-  `diarize_relabel_window = 0`.
+  `diarize_relabel_window = 0`. At the **shipped lag depth**, with commits
+  spanning several chunks each: at `lag_chunks = 0` and one word per chunk, a
+  commit's first chunk, its last chunk and the end of its vote window are all
+  the same number, and every question about which chunks a commit's words came
+  from collapses.
+- **Both documented "off" switches are off**, checked against behaviour rather
+  than against the config parser.
 - **Client:** the GUI's segment store applies relabels; `save::render` reflects
   them; `StreamWriter` provably does not.
 - **Proto:** round-trip, and an old client ignoring an unknown message type.
@@ -303,6 +362,14 @@ vote, the lag, and now change detection and relabelling — and reports:
 These are the acceptance measurements. The constants above are provisional
 until this mode has run.
 
+Two things the harness must get right, because both understate what it is
+measuring. It replays the server's own `Session`, so the label for a chunk
+reaches a client `lag_chunks` later than the audio it describes — 1.12 s at
+the shipped depth — and the latency figures charge that. And it drives
+`RealDiarizerFactory`, which resolves the embedding model by the server's own
+rules, so it does not accept a `--model` flag it would then ignore: it prints
+the model that actually ran.
+
 ## Risks
 
 - **Correction is visible.** Text on screen acquiring a speaker name a few
@@ -319,4 +386,71 @@ until this mode has run.
 - **Change detection on overlapped speech.** Cross-talk will produce embedding
   jumps that are not turn changes, cutting windows spuriously. The cost is a
   higher miss rate during overlap, which is already excluded from every measured
-  number and already documented as out of scope.
+  number and already documented as out of scope. The refractory floor bounds
+  how bad this can get: a spurious boundary costs at most the audio before the
+  next one, and they cannot arrive faster than one per 0.768 s of speech.
+- **A crowded room is improved, not solved.** The mint gate's ceiling of
+  `T_ASSIGN + margin` is 0.55 at the shipped margin, and the spike measured the
+  two closest live centroids at 0.519 with only five speakers in the room. A
+  genuinely new voice whose pooled mean lands above 0.55 from an incumbent
+  still cannot be minted; what it gets instead is that incumbent's number as a
+  *guess*, which reads as a wrong label rather than as a gap. Whether that
+  ceiling is in the right place is the single most important thing the live
+  probe has to answer.
+
+## Where this document was wrong
+
+Four of the rules above were found to be wrong during implementation and are
+corrected in the code. They are recorded here rather than quietly edited out,
+because each was reasoned from the same evidence the rest of the design was
+and the reasoning is worth not repeating.
+
+**1. Relaxing the mint gate manufactures splits.** The rule as designed —
+refuse a mint when the pooled mean is *assignable*, or within `T_RETIRE` —
+makes the whole band from `T_ASSIGN` to 0.80 mintable whenever the nearest
+incumbent is merely ambiguous. Measured end to end with two incumbents, it
+mints a fresh label at 0.500, 0.600, 0.650 and 0.705 where the old rule
+assigned; against a same-speaker median of 0.517, a mint at 0.705 is
+overwhelmingly the same person. A duplicate then retires into its neighbour
+tens of windows later, by which time commits carrying its number are frozen —
+so the transcript is left permanently naming a speaker the session no longer
+has. The flaw is conceptual: **ambiguity between two incumbents is evidence of
+a bad or mixed embedding, not evidence of a new person**, and the rule treats
+it as novelty. The gate now asks whether the pooled group is more like itself
+than like anybody known — minimum pairwise agreement against the cosine to the
+nearest live centroid, by `T_MINT_MARGIN` — inside a ceiling of
+`T_ASSIGN + margin`, which at margin 0 collapses onto the pre-2026-08-27 rule
+exactly.
+
+**2. `POOL_RING = 8` tolerates one interrupting speaker.** Holding `MIN_POOL`
+newcomer windows with `k` foreign orphans between each needs `4 + 3k <= 8`, so
+`k <= 1`; a room of eight has seven other people, and the margin and cohort
+gates *convert other speakers' assignments into orphans*, so `k` is large in
+exactly the room this design exists for. Measured at `k = 2` the newcomer was
+never minted across twelve windows. Complaint 3's "the new speaker may never be
+minted at all" was not fixed by this design as written — the mechanism merely
+changed from `pool.clear()` to ring eviction. Per-candidate pools replace it.
+
+**3. Withholding an assignment must not cost coverage.** At four live centroids
+with one neighbour at 0.519 — the crowding the spike measured at five speakers
+— the margin and cohort gates refuse a true match at the same-speaker median of
+0.517 and again at 0.60, accepting only from 0.65. That is the spike's
+documented failure mode verbatim: a configuration that says almost nothing
+scores perfectly on stability while its miss rate climbs from 26% to 37%. The
+two jobs a withheld window was doing are now separated. On ambiguity: no
+centroid is updated, which is the drift protection and the real win; the argmax
+*is* emitted, marked provisional; and the window *is* pooled, so a mint from
+those windows corrects the text through the relabel machinery this design
+already builds.
+
+**4. Change detection can starve the clusterer.** `cut_at_boundary` keeps a hop
+(23 frames) and a window needs 47, so between two accepted boundaries more than
+one hop of voiced audio must arrive or **no window ever completes**. Simulated
+over 112 s of continuous speech, a boundary every hop embedded zero windows —
+no centroid updated, nobody minted, and nothing for a hop's provisional label to
+name; a boundary every two hops doubles complaint 1's latency. In a room of
+eight taking short turns, a boundary every other hop is the detector working
+correctly. There is a refractory floor now, of `WINDOW_FRAMES - HOP_FRAMES` =
+24 voiced frames (0.768 s), which is not a taste in turn lengths but exactly
+what window formation needs to make progress. Its cost is stated rather than
+hidden: a turn shorter than that cannot be detected as one.

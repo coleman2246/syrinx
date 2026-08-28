@@ -212,12 +212,15 @@ pub const T_MINT_MARGIN: f32 = 0.20;
 /// How many candidate speakers may be waiting for their fourth agreeing
 /// window at once.
 ///
-/// Orphans are held per candidate rather than in one flat ring, and that is
-/// the whole of the crowding fix on this side. A single ring of eight held a
-/// mintable set only if at most one other speaker's orphan landed between
-/// each of a newcomer's windows: `4 + 3k <= 8` gives `k <= 1`, and a room of
-/// eight has seven other people in it. Foreign orphans now land in their own
-/// pool instead of evicting a newcomer's evidence.
+/// Orphans are held per candidate rather than in one shared ring, and that is
+/// the whole of the crowding fix on this side. A shared ring has to hold a
+/// mintable set *and* everything that arrives between its members, so with
+/// `k` other people's orphans between each of a newcomer's windows it needs
+/// `MIN_POOL + (MIN_POOL - 1) * k` slots -- a room of eight, where seven other
+/// people are talking, wants 25 of them. Sized for a room instead, a shared
+/// ring is mostly other people's evidence and evicts the newcomer's. Per
+/// candidate, `k` costs nothing at all: a foreign orphan lands in its own
+/// pool.
 ///
 /// **Unmeasured.** 8 is one candidate per person in the room this design
 /// exists for. When a ninth would open, the pool that has waited longest for
@@ -574,8 +577,9 @@ impl OnlineClusterer {
     /// folds the duplicate back -- leaves a transcript naming somebody the
     /// session no longer has.
     ///
-    /// The old `T_RETIRE` re-test is gone because it is subsumed: a mean
-    /// within 0.80 of a live centroid is far past `T_ASSIGN + margin`.
+    /// `T_RETIRE` has no say here: a mean within 0.80 of a live centroid is
+    /// far past `T_ASSIGN + margin` and refused by the ceiling long before a
+    /// duplicate could be minted for retirement to fold back.
     fn mint(&mut self, members: &[Vec<f32>]) -> Option<u32> {
         let mean = mean_of(members);
         let rival = self.nearest(&mean).map(|(_, similarity)| similarity);
@@ -1012,11 +1016,11 @@ mod tests {
     /// windows interleaved with whoever is already talking, and then everyone
     /// takes short turns.
     ///
-    /// The shape of a real room, and the shape the old pool could not mint
-    /// from: it was emptied by every assignment, so a newcomer needed
-    /// `MIN_POOL` windows with *nobody else speaking in between*, which is
-    /// exactly what a conversation never supplies. Returns `(voice, window)`
-    /// pairs so a test can say who each window really was.
+    /// The shape of a real room, and the shape a pool emptied by every
+    /// assignment cannot mint from: it demands `MIN_POOL` windows with
+    /// *nobody else speaking in between*, which is exactly what a conversation
+    /// never supplies. Returns `(voice, window)` pairs so a test can say who
+    /// each window really was.
     fn arrivals(voices: &[Vec<f32>]) -> Vec<(usize, Vec<f32>)> {
         let mut script = Vec::new();
         let mut seed = 1u32;
@@ -1221,10 +1225,10 @@ mod tests {
         }
         assert_eq!(c.live_labels(), vec![1, 2, 3, 4], "the founders are in");
 
-        // The newcomer's opening window. Under the old rule this was an
-        // assignment to whichever founder won a coin toss at the third
-        // decimal place -- and, being an assignment, it moved that founder's
-        // centroid and emptied the pool.
+        // The newcomer's opening window. A bare argmax against a fixed
+        // threshold assigns it to whichever founder wins a coin toss at the
+        // third decimal place -- and an assignment moves that founder's
+        // centroid, so the room gets worse as well as the label being wrong.
         let opening = window(4);
         let (best, similarity) = c.nearest(&opening).expect("four live centroids");
         assert!(
@@ -1305,10 +1309,9 @@ mod tests {
     #[test]
     fn the_number_of_candidate_pools_is_bounded() {
         // A meeting is hours long and most of what the diarizer hears is
-        // nobody in particular. Per-candidate pools are what stopped other
-        // people's orphans evicting a newcomer's evidence, so the bound that
-        // keeps them finite has to be on the number of candidates rather than
-        // on the evidence inside one.
+        // nobody in particular. Bounding the evidence inside one candidate is
+        // what makes a crowded newcomer unmintable, so the bound that keeps
+        // this finite is on the number of candidates instead.
         let wide = |i: usize| {
             let mut v = vec![0.0f32; MAX_POOLS * 2];
             v[i] = 1.0;
@@ -1432,13 +1435,12 @@ mod tests {
     }
 
     #[test]
-    fn an_assignment_no_longer_throws_the_pool_away() {
-        // This used to assert the opposite, and the opposite is the bug: an
-        // assignment cleared the pool, so minting needed MIN_POOL orphans with
-        // nobody else speaking in between. MIN_POOL is unchanged -- four
-        // windows still have to agree with each other -- but they no longer
-        // have to be consecutive, because in a room where people take turns
-        // they never are.
+    fn an_assignment_says_nothing_about_the_orphans_waiting() {
+        // Who was talking just now is no evidence about whether three earlier
+        // windows are somebody else, so an assignment must not discard them.
+        // Treating it as evidence adds an unmeasured requirement on top of
+        // MIN_POOL -- that nobody else speak in between -- which a room where
+        // people take turns never satisfies.
         let mut c = OnlineClusterer::new();
         for i in 0..MIN_POOL as u32 {
             c.observe(&noisy(0, i));
@@ -1460,9 +1462,9 @@ mod tests {
     fn orphans_survive_several_interruptions_and_a_poisoned_window() {
         // The shape a real meeting has: a new voice gets a window in, somebody
         // else answers, they get another in. Plus one stray window that
-        // belongs to nobody, which used to cost a whole pool and then one
-        // window per attempt to recover from -- now it is simply in a pool of
-        // its own.
+        // belongs to nobody, which agrees with neither of them and therefore
+        // holds up neither -- it waits in a pool of its own for agreement that
+        // never arrives.
         let mut c = OnlineClusterer::new();
         for i in 0..MIN_POOL as u32 {
             c.observe(&noisy(0, i));
@@ -1524,20 +1526,20 @@ mod tests {
     /// Two speakers minted at the **shipped** configuration, and the pair of
     /// windows that walks their centroids into each other.
     ///
-    /// The fixture this replaced switched the margin off, which meant every
-    /// retirement test ran at a configuration the server does not ship --
-    /// precisely when the mint path can now reach retirement at the shipped
-    /// one. So the drift here is caused by windows that are *not* ambiguous:
-    /// each leads the runner-up by well over `T_MARGIN` from the first
-    /// observation to the last, and each sits on the far side of its own
-    /// centroid, so assigning it walks that centroid towards the other. They
-    /// would meet 25 degrees apart; retirement fires first, at the 36.9
-    /// degrees that is `T_RETIRE`.
+    /// The shipped configuration is the point of the fixture rather than a
+    /// convenience: retirement is reachable at it, so testing it anywhere else
+    /// would leave the path the server actually takes uncovered. That means
+    /// the drift here has to come from windows that are *not* ambiguous. Each
+    /// leads the runner-up by well over `T_MARGIN` from the first observation
+    /// to the last, and each sits on the far side of its own centroid, so
+    /// assigning it walks that centroid towards the other. They would meet 25
+    /// degrees apart; retirement fires first, at the 36.9 degrees that is
+    /// `T_RETIRE`.
     ///
     /// Ambiguity is the other fixture's business --
     /// `an_ambiguous_window_moves_no_centroid_at_all` -- and the two are
-    /// deliberately separate now: one is about drift the margin refuses, this
-    /// one is about cleaning up drift the margin permits.
+    /// separate on purpose: one is about drift the margin refuses, this one is
+    /// about cleaning up drift the margin permits.
     fn converging_pair() -> (OnlineClusterer, Vec<f32>, [Vec<f32>; 2]) {
         let second = at(APART);
         let drags = [at(20.0), at(45.0)];
@@ -1859,8 +1861,8 @@ mod tests {
             "0.80 should have kept both speakers"
         );
         assert_eq!(swept_live, vec![1], "0.35 should have retired the newer");
-        // Retired, not refused: the second speaker was minted either way, and
-        // only the fold differs. `T_RETIRE` has no say in minting any more.
+        // Retired, not refused: the second speaker is minted either way, and
+        // only the fold differs. `T_RETIRE` decides duplicates, not mints.
         assert_eq!(swept[MIN_POOL * 2 - 1], Heard::Settled(2));
         // Both still answer the final window with speaker 1 -- the rest of
         // the difference is only visible in what survives, which is why this
@@ -2126,13 +2128,14 @@ mod tests {
 
     #[test]
     fn a_pool_ambiguous_between_two_incumbents_mints_nobody() {
-        // The measured failure: with two incumbents, the rule this replaced
-        // minted a fresh label at 0.600, 0.650 and 0.705 where the old one
-        // assigned -- and at 0.705, against a same-speaker median of 0.517,
-        // that is overwhelmingly one of the two people already in the room.
-        // Worse, such a mint retires back into its neighbour tens of windows
-        // later, by which time commits carrying its number are frozen and the
-        // transcript names somebody the session no longer has.
+        // Measured, at 0.600, 0.650 and 0.705. A rule that mints wherever the
+        // mean is merely unassignable takes all three, and against a
+        // same-speaker median of 0.517 a pool at 0.705 from an incumbent is
+        // overwhelmingly that incumbent. What such a mint costs is not one
+        // wrong window: the duplicate retires back into its neighbour tens of
+        // windows later, by which time commits carrying its number are frozen,
+        // and the transcript is left naming somebody the session no longer
+        // has.
         for similarity in [0.60, 0.65, 0.705, 0.79] {
             let mut c = two_speakers();
             let voice = crowded_by_both(similarity);

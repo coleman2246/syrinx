@@ -113,10 +113,10 @@ struct Emitted {
     /// Not the range the label was voted over, which is a different span and
     /// wrong in both directions. The vote runs from the text's last chunk
     /// forward into the lag window, so it starts where the words end and
-    /// reaches `lag_chunks` into whoever spoke next: a correction naming the
-    /// next speaker's chunks overlapped it and rewrote the outgoing speaker's
-    /// sentence, while one naming the chunks the words actually came from
-    /// missed it entirely.
+    /// reaches `lag_chunks` into whoever spoke next: matched against that, a
+    /// correction naming the next speaker's chunks overlaps a commit made
+    /// entirely of the previous speaker's words, while one naming the chunks
+    /// those words came from misses it.
     from_chunk: u64,
     to_chunk: u64,
     speaker: Option<u32>,

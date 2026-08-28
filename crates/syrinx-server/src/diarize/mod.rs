@@ -26,8 +26,8 @@ use anyhow::Result;
 /// because they are set together and every one of them is read exactly once,
 /// at session start.
 ///
-/// Held as a struct rather than passed as four arguments because three of them
-/// are floats in the same range and a caller that swapped two would compile.
+/// Held as a struct rather than passed as three arguments because two of them
+/// are floats in the same range and a caller that swapped them would compile.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DiarizeTuning {
     /// `diarize_min_pool`: agreeing windows before a speaker is minted.

@@ -164,8 +164,9 @@ const DIARIZE_MIN_POOL: RangeInclusive<usize> = 2..=16;
 const DIARIZE_MARGIN: RangeInclusive<f32> = 0.0..=0.5;
 
 /// What [`Config::diarize_change_threshold`] will accept: a cosine's range,
-/// both ends meaningful. 0 detects no turn change ever, 1 detects one at every
-/// hop.
+/// both ends meaningful. 0 detects no turn change ever; 1 would detect one at
+/// every hop, which the window assembler's refractory floor then holds down to
+/// one per 0.768 s of voiced audio so that windows keep completing.
 const DIARIZE_CHANGE_THRESHOLD: RangeInclusive<f32> = 0.0..=1.0;
 
 /// What [`Config::diarize_relabel_window`] will accept, in seconds. The top is
@@ -263,9 +264,9 @@ impl Config {
         ensure!(
             DIARIZE_MARGIN.contains(&self.diarize_margin),
             "diarize_margin = {} is out of range: it must be {} to {}, in cosine. \
-             0 assigns to the nearest centroid over the threshold and never mind \
-             the runner-up, which is what the server did before speaker crowding \
-             was addressed; the shipped value is {}.",
+             0 turns off the margin, the cohort test and the mint ceiling together, \
+             which is what the server did before speaker crowding was addressed; \
+             the shipped value is {}.",
             self.diarize_margin,
             DIARIZE_MARGIN.start(),
             DIARIZE_MARGIN.end(),
@@ -275,7 +276,8 @@ impl Config {
             DIARIZE_CHANGE_THRESHOLD.contains(&self.diarize_change_threshold),
             "diarize_change_threshold = {} is out of range: it must be {} to {}, \
              in cosine between consecutive 0.75 s hops. 0 detects no turn change \
-             ever; the shipped value is {}.",
+             ever, and is checked for rather than compared against, since \
+             different-speaker cosines are often negative; the shipped value is {}.",
             self.diarize_change_threshold,
             DIARIZE_CHANGE_THRESHOLD.start(),
             DIARIZE_CHANGE_THRESHOLD.end(),
@@ -573,6 +575,11 @@ mod tests {
         // exactly what the server did before 2026-08-27. It is the retreat if
         // withholding turns out to cost more than it saves, so it has to be
         // accepted rather than read as "unset".
+        //
+        // That the value *reaches* the clusterer and switches off all three of
+        // the 2026-08-27 rules is `cluster.rs`'s business, and two tests there
+        // say so exhaustively -- a switch nobody checks the far end of is how
+        // a documented hatch stops working.
         assert_eq!(with("diarize_margin = 0.0").unwrap().diarize_margin, 0.0);
     }
 
@@ -604,8 +611,11 @@ mod tests {
 
     #[test]
     fn an_out_of_range_change_threshold_is_refused_at_load_by_name() {
-        // A cosine, so the range is a cosine's. At 1 every hop is a turn
-        // change and the accumulator never fills; at 0 nothing is.
+        // A cosine, so the range is a cosine's. Both ends are settings rather
+        // than mistakes: 0 detects nothing, which `real::diarizer` checks for
+        // rather than reaching by arithmetic, and 1 detects a change at every
+        // hop, which the window assembler's refractory floor keeps from
+        // starving the clusterer of windows.
         let err = with("diarize_change_threshold = 1.5").expect_err("above the range");
         let message = format!("{err:#}");
         assert!(message.contains("diarize_change_threshold"), "{message}");

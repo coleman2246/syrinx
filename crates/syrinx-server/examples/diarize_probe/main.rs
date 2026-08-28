@@ -800,8 +800,13 @@ const LIVE: Spec = Spec {
     name: "live",
     what: "replay a real session and measure the two latencies it is judged on",
     operand: "<wav>",
+    // No `--model`: this subcommand drives `RealDiarizerFactory`, which
+    // resolves the embedding model from the directory by the server's own
+    // rules -- the calibrated one wins by name whenever it is present. A flag
+    // that was accepted and then ignored would print one model's name beside
+    // another model's numbers, which in the subcommand meant to replace five
+    // unmeasured constants is worse than not offering the choice.
     flags: &[
-        MODEL_FLAG,
         (
             "--wav",
             true,
@@ -1535,11 +1540,16 @@ fn live(args: &Args) -> Result<()> {
         session_tuning,
     );
 
-    let model = model_path(args.get("--model").unwrap_or(CHOSEN));
     // The factory checks the models at load, exactly as the server does at
-    // startup, so a broken directory fails here rather than mid-replay.
+    // startup, so a broken directory fails here rather than mid-replay. It
+    // also chooses the embedding model, and reports which -- the numbers below
+    // are that model's, so the name printed has to be the one that ran.
     let factory = live::factory(&probe_dir(), tuning)?;
-    eprintln!("  model directory {} ({})", probe_dir(), basename(&model));
+    eprintln!(
+        "  model directory {} ({})",
+        probe_dir(),
+        basename(&factory.embed_model().to_string_lossy())
+    );
 
     let started = std::time::Instant::now();
     let replay = live::replay(&samples, &factory, chunk_samples, session_tuning)?;
@@ -1577,7 +1587,8 @@ fn live(args: &Args) -> Result<()> {
             100.0 * m.confusion
         );
 
-        let first = live::first_label_latency(hyp, &reference, chunk_samples);
+        let first =
+            live::first_label_latency(hyp, &reference, chunk_samples, session_tuning.lag_chunks);
         let shown: Vec<String> = reference
             .names
             .iter()
@@ -1588,11 +1599,12 @@ fn live(args: &Args) -> Result<()> {
             })
             .collect();
         println!(
-            "    first label, in that speaker's own speech: {}",
+            "    first label reaching a client, in that speaker's own speech: {}",
             shown.join(", ")
         );
 
-        let (switches, real) = live::turn_switch_latency(hyp, &reference, chunk_samples);
+        let (switches, real) =
+            live::turn_switch_latency(hyp, &reference, chunk_samples, session_tuning.lag_chunks);
         if switches.is_empty() {
             println!("    turn switch: none of {real} real turn changes was followed");
             continue;

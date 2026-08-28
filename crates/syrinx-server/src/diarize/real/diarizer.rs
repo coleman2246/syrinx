@@ -86,6 +86,17 @@ impl RealDiarizerFactory {
         );
         Ok(Self { models, tuning })
     }
+
+    /// The embedding model this factory resolved, by path.
+    ///
+    /// For `examples/diarize_probe`, which reports the model beside the
+    /// numbers it measured. The probe cannot name one here -- the server's own
+    /// rules choose it from the directory -- so reading it back is the only
+    /// way for the name printed to be the model that ran.
+    #[doc(hidden)]
+    pub fn embed_model(&self) -> &Path {
+        &self.models.embed
+    }
 }
 
 impl DiarizerFactory for RealDiarizerFactory {
@@ -348,10 +359,10 @@ fn speech_like(n: usize) -> Vec<f32> {
 /// arrives as `pcm_s16le_to_f32` output, so a non-finite embedding is the
 /// model's doing and will not stop being the model's doing.
 ///
-/// Adding the hop embedding did not change that arithmetic, because `push`
-/// returns on the *first* embedding that fails: whatever a chunk was going to
-/// embed, at most one of them can mark the fuse, so a mark is still a chunk
-/// and three marks are still about two seconds of speech.
+/// A chunk embeds a hop and, on most hops, the window it completes -- but
+/// `push` returns on the *first* embedding that fails, so at most one of them
+/// can ever mark the fuse. A mark is a chunk, which is what lets the paragraph
+/// above reason in seconds of speech.
 const MAX_EMBED_FAILURES: u32 = 3;
 
 /// Whether the embedder is still worth asking, counted in embeddings.
