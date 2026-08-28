@@ -390,11 +390,18 @@ mod tests {
                     label: "Yeti".into(),
                     rms: 0.42,
                     silent: false,
+                    dropped: 4_800,
+                    error: None,
                 },
+                // The two things a row can say beyond a level: how much of
+                // this source has been trimmed away unheard, and why it is
+                // contributing nothing at all.
                 syrinx_audio::mixer::SourceHealth {
                     label: "System audio".into(),
                     rms: 0.0,
                     silent: true,
+                    dropped: 0,
+                    error: Some("Device does not support input".into()),
                 },
             ],
             ..Default::default()

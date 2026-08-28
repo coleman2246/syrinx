@@ -1377,6 +1377,8 @@ mod tests {
                 label: "Yeti".into(),
                 rms: 0.4,
                 silent: false,
+                dropped: 320,
+                error: None,
             }],
             changes: 7,
         };

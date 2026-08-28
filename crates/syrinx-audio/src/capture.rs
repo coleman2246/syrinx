@@ -63,13 +63,14 @@ const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Run a stream on a thread of its own, and report whether it started.
 ///
 /// `cpal::Stream` is not `Send` on every platform, which is the only reason
-/// the thread exists. The rendezvous is what is new: this used to spawn the
-/// thread and return `Ok` at once, so a stream that failed to build or play
-/// logged the failure -- without the error value -- and left a live handle
-/// behind that produced nothing. `MixedCapture::start` then returned `Ok`, the
-/// session completed its handshake, and the daemon reported `Listening` with
-/// no error set anywhere. The only two failures that ever reached a caller
-/// were `find_device` and the config query.
+/// the thread exists. `start` runs on it, and everything a caller learns about
+/// the attempt comes back over the rendezvous below -- so a stream that fails
+/// to build or play reaches the caller as an error rather than as a live
+/// handle producing nothing.
+///
+/// The whole of the cpal work runs here, device lookup and config query
+/// included, so that a panic anywhere in it can only cost this thread. The
+/// caller sees that as a failed open rather than as its own stack unwinding.
 ///
 /// The stream is dropped when the returned sender is, which is what stops the
 /// capture.
@@ -83,7 +84,7 @@ fn on_stream_thread<S: 'static>(
         // Formatted here rather than sent whole: an `anyhow::Error` is not
         // `Send` across this channel in every shape it can take, and what the
         // caller needs is the chain, which `{:#}` carries.
-        let stream = match start() {
+        let stream = match crate::caught("opening the audio device", start) {
             Ok(s) => {
                 let _ = ready_tx.send(Ok(()));
                 s
@@ -119,29 +120,40 @@ impl CpalCapture {
         use cpal::traits::{DeviceTrait, StreamTrait};
         use syrinx_proto::{downmix_to_mono, resample_to_16k};
 
-        let device = crate::cpal_backend::find_device(name, loopback)?;
-        // A loopback source is a *render* endpoint being read. cpal builds that
-        // stream correctly -- it sets AUDCLNT_STREAMFLAGS_LOOPBACK for an input
-        // stream on a render device -- but it refuses to describe one:
-        // `default_input_config` answers "Device does not support input" for
-        // anything that is not a capture endpoint. The format to ask for is the
-        // one the device renders in, so query the output side and open it for
-        // input.
-        let supported = if loopback {
-            device
-                .default_output_config()
-                .context("querying the output config of a loopback device")?
-        } else {
-            device
-                .default_input_config()
-                .context("querying input config")?
-        };
-        let channels = supported.channels();
-        let rate = supported.sample_rate();
-        let format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
-
+        let name = name.to_string();
         let stop = on_stream_thread(move || {
+            // Found here rather than by the caller because the lookup panics
+            // on Windows instead of returning: it goes through
+            // `CoCreateInstance(..).unwrap()` and `.Item(i).unwrap()`. On the
+            // caller's thread that panic is the daemon's session thread dying
+            // mid-start, which leaves the session reading Listening for ever
+            // with no error to show. Here it is only a failed open.
+            let device = crate::cpal_backend::find_device(&name, loopback)?;
+            // A loopback source is a *render* endpoint being read. cpal builds
+            // that stream correctly -- it sets AUDCLNT_STREAMFLAGS_LOOPBACK for
+            // an input stream on a render device -- but it refuses to describe
+            // one: `default_input_config` answers "Device does not support
+            // input" for anything that is not a capture endpoint. The format to
+            // ask for is the one the device renders in, so query the output
+            // side and open it for input.
+            //
+            // This query panics on Windows too, at `.expect("could not query
+            // IMMDevice interface for IMMEndpoint")`, for the same reason it
+            // is here and not up there.
+            let supported = if loopback {
+                device
+                    .default_output_config()
+                    .context("querying the output config of a loopback device")?
+            } else {
+                device
+                    .default_input_config()
+                    .context("querying input config")?
+            };
+            let channels = supported.channels();
+            let rate = supported.sample_rate();
+            let format = supported.sample_format();
+            let config: cpal::StreamConfig = supported.into();
+
             let err_fn = |e| tracing::warn!("audio stream error: {e}");
             let stream = match format {
                 cpal::SampleFormat::F32 => device.build_input_stream(
@@ -246,14 +258,18 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_thread_that_dies_before_reporting_is_an_error_not_a_hang() {
+    fn a_backend_that_panics_reaches_the_caller_as_an_error_with_its_message() {
         // cpal's Windows backend panics rather than erroring in several
-        // places, so the thread can end without answering. The panic message
-        // this prints is the test doing its job.
-        let e = on_stream_thread(|| -> Result<()> { panic!("the backend gave up") })
-            .expect_err("a thread that died must not report success");
+        // places -- device lookup and the config query among them, which is
+        // why both now run inside this closure. A caller that only learned
+        // "it panicked" would have nothing to show; the payload is the
+        // diagnosis. The panic message this prints is the test doing its job.
+        let e = on_stream_thread(|| -> Result<()> {
+            panic!("could not query IMMDevice interface for IMMEndpoint")
+        })
+        .expect_err("a backend that panicked must not report success");
         assert!(
-            format!("{e:#}").contains("stopped before the stream started"),
+            format!("{e:#}").contains("could not query IMMDevice interface"),
             "got: {e:#}"
         );
     }

@@ -292,19 +292,37 @@ pub fn start(
                 return;
             }
         };
-        match rt.block_on(run(opts, st.clone(), stop_rx, notify.clone())) {
-            Ok(()) => st.lock().expect("state lock poisoned").status = Status::Idle,
-            Err(e) => {
-                error!("session failed: {e:#}");
-                fail(&st, format!("{e:#}"));
-            }
-        }
+        finish(&st, || rt.block_on(run(opts, st.clone(), stop_rx, notify.clone())));
         notify();
     });
 
     SessionHandle {
         state,
         stop: Some(stop_tx),
+    }
+}
+
+/// Run a session to its end, and make sure the end is visible.
+///
+/// Split out from [`start`] so a test can drive every way of ending without a
+/// server or a device. The one that mattered is the panic: cpal's Windows
+/// backend panics rather than erroring, on the caller's thread, and this
+/// thread is that caller. An unguarded panic killed it before anything could
+/// be recorded, so the status stayed wherever it was last set -- `Listening`,
+/// which the handshake sets before any device is opened. `Status::is_active`
+/// then read the dead session as running for ever: the daemon never reaped it,
+/// Stop sent into a oneshot nobody held, metering stayed off, and only
+/// restarting the daemon got out of it.
+///
+/// So whatever happens in `body`, this leaves the session idle, and leaves the
+/// reason where a window can show it.
+fn finish(state: &Arc<Mutex<SessionState>>, body: impl FnOnce() -> Result<()>) {
+    match syrinx_audio::caught("the session", body) {
+        Ok(()) => state.lock().expect("state lock poisoned").status = Status::Idle,
+        Err(e) => {
+            error!("session failed: {e:#}");
+            fail(state, format!("{e:#}"));
+        }
     }
 }
 
@@ -380,8 +398,12 @@ async fn run(
                 diarize,
                 ..
             } => {
+                // Everything the handshake settled, but not yet `Listening`:
+                // no device has been opened at this point, and opening one is
+                // where the failures are. Saying Listening here meant the
+                // window read Listening for the whole of an open that was
+                // going to fail.
                 let mut s = state.lock().expect("state lock poisoned");
-                s.status = Status::Listening;
                 s.model = Some(model);
                 s.chunk_ms = Some(chunk_ms);
                 s.diarize = diarize;
@@ -448,6 +470,11 @@ async fn run(
         ),
         None => None,
     };
+
+    // Only now: a device is open and a place to write it exists, so this is
+    // the first moment at which "listening" is true rather than intended.
+    state.lock().expect("state lock poisoned").status = Status::Listening;
+    notify();
 
     let st = state.clone();
     let n = notify.clone();
@@ -696,6 +723,7 @@ mod tests {
             label: label.into(),
             rms: 0.3,
             silent,
+            ..Default::default()
         };
         let merged = merge_states(&[
             SessionState {
@@ -715,6 +743,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("Yeti", false), ("System audio", true)]
         );
+    }
+
+    /// A session that has got as far as reporting `Listening`.
+    fn listening() -> Arc<Mutex<SessionState>> {
+        Arc::new(Mutex::new(SessionState {
+            status: Status::Listening,
+            ..Default::default()
+        }))
+    }
+
+    #[test]
+    fn a_session_thread_that_panics_ends_failed_rather_than_listening_for_ever() {
+        // The wedge behind "I restart the daemon a few times". cpal's Windows
+        // backend panics on the calling thread, and that thread is the one
+        // running the session. Nothing recorded the ending, so the status
+        // stayed at whatever it had reached -- Listening -- and `is_active`
+        // read the dead session as running: never reaped, Stop into a oneshot
+        // nobody held, metering off, no error anywhere to explain it. The
+        // panic message this prints is the test doing its job.
+        let state = listening();
+        finish(&state, || panic!("could not get endpoint data_flow"));
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.status, Status::Idle, "a dead session still looked active");
+        assert!(
+            s.error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not get endpoint data_flow")),
+            "the window has nothing to show for it: {:?}",
+            s.error
+        );
+    }
+
+    #[test]
+    fn a_session_that_ends_cleanly_goes_idle_with_nothing_to_report() {
+        let state = listening();
+        finish(&state, || Ok(()));
+        let s = state.lock().unwrap();
+        assert_eq!(s.status, Status::Idle);
+        assert_eq!(s.error, None, "a clean stop invented a failure");
+    }
+
+    #[test]
+    fn a_session_that_returns_an_error_still_carries_it() {
+        // The guard must not swallow the ordinary failure it sits beside.
+        let state = listening();
+        finish(&state, || anyhow::bail!("connecting to the server: refused"));
+        let s = state.lock().unwrap();
+        assert_eq!(s.status, Status::Idle);
+        assert_eq!(s.error.as_deref(), Some("connecting to the server: refused"));
     }
 
     #[test]

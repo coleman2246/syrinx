@@ -17,35 +17,21 @@
 //! code at least type-checks and its tests run during Linux development. Only
 //! the loopback *behaviour* is Windows-specific; the calls are portable.
 
+use crate::caught;
 use crate::source::{Source, SourceKind, SourceTarget};
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 
 /// Run `f`, treating a panic inside it as "no answer".
 ///
-/// cpal's Windows backend does not confine itself to returning errors:
-/// `Device::description` calls `.OpenPropertyStore(STGM_READ).expect("could
-/// not open property store")`, so one endpoint that fails transiently panics
-/// the caller. That caller is the GUI's UI thread every two seconds and the
-/// daemon's main loop, for every endpoint on the machine -- a device being
-/// swapped or a driver reloading would take down whichever process happened to
-/// touch it first.
-///
-/// Losing one endpoint from a list is a far smaller thing than losing the
-/// process, so a panic costs the endpoint. This only works where panics unwind;
-/// under `panic = "abort"` there is nothing to catch, and nothing here can help.
+/// For the enumeration path, where one endpoint that will not answer should
+/// drop out of the list rather than fail the whole listing. See [`caught`].
 fn without_panicking<T>(what: &str, f: impl FnOnce() -> Option<T>) -> Option<T> {
-    // AssertUnwindSafe because the closure only reads a device and the result
-    // is discarded on the way out, so there is no half-updated state to
-    // observe afterwards.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(v) => v,
-        Err(_) => {
-            // No name to give it: the name is what panicked.
-            tracing::warn!("skipping an audio endpoint: {what} panicked");
-            None
-        }
-    }
+    caught(what, || Ok(f())).unwrap_or_else(|e| {
+        // No name to give it: the name is what panicked.
+        tracing::warn!("skipping an audio endpoint: {e:#}");
+        None
+    })
 }
 
 fn device_name(d: &cpal::Device) -> Option<String> {
@@ -54,12 +40,46 @@ fn device_name(d: &cpal::Device) -> Option<String> {
     })
 }
 
+/// Every device on one side of the input/output split.
+///
+/// Both halves are guarded, because both panic. Getting the enumerator is a
+/// `CoCreateInstance(..).unwrap()`, and reading an entry out of the collection
+/// is an `.Item(i).unwrap()` that fails when an endpoint disappears between
+/// the snapshot and the read.
+///
+/// A panic while reading an entry ends the enumeration rather than skipping
+/// past it: cpal increments its index only *after* the unwrap, so asking again
+/// would panic on the same entry for ever. A short list beats a spin.
+fn devices(loopback: bool) -> Result<Vec<cpal::Device>> {
+    let host = cpal::default_host();
+    let mut it = caught("listing the audio devices", || {
+        let side: Box<dyn Iterator<Item = cpal::Device>> = if loopback {
+            Box::new(host.output_devices().context("enumerating output devices")?)
+        } else {
+            Box::new(host.input_devices().context("enumerating input devices")?)
+        };
+        Ok(side)
+    })?;
+
+    let mut out = Vec::new();
+    loop {
+        match caught("reading an audio endpoint", || Ok(it.next())) {
+            Ok(Some(d)) => out.push(d),
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!("stopping the device listing early: {e:#}");
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Enumerate microphones, and outputs re-offered as system audio.
 pub fn list_sources() -> Result<Vec<Source>> {
-    let host = cpal::default_host();
     let mut out = Vec::new();
 
-    for d in host.input_devices().context("enumerating input devices")? {
+    for d in devices(false)? {
         let Some(name) = device_name(&d) else { continue };
         out.push(Source {
             target: SourceTarget::CpalDevice {
@@ -75,7 +95,7 @@ pub fn list_sources() -> Result<Vec<Source>> {
         });
     }
 
-    for d in host.output_devices().context("enumerating output devices")? {
+    for d in devices(true)? {
         let Some(name) = device_name(&d) else { continue };
         let name_for_sink = name.clone();
         out.push(Source {
@@ -108,13 +128,8 @@ pub fn list_sources() -> Result<Vec<Source>> {
 
 /// Find a cpal device by name, on the correct side of the input/output split.
 pub fn find_device(name: &str, loopback: bool) -> Result<cpal::Device> {
-    let host = cpal::default_host();
-    let mut devices: Box<dyn Iterator<Item = cpal::Device>> = if loopback {
-        Box::new(host.output_devices().context("enumerating output devices")?)
-    } else {
-        Box::new(host.input_devices().context("enumerating input devices")?)
-    };
-    devices
+    devices(loopback)?
+        .into_iter()
         .find(|d| device_name(d).as_deref() == Some(name))
         .with_context(|| format!("no such audio device: {name}"))
 }
@@ -170,6 +185,32 @@ mod tests {
             panic!("could not open property store")
         });
         assert_eq!(got, None, "a panicking endpoint must drop out of the list");
+    }
+
+    #[test]
+    fn a_panicking_query_becomes_an_error_carrying_what_it_said() {
+        // The message is the diagnosis. cpal panics with "could not query
+        // IMMDevice interface for IMMEndpoint" and the like, and that reaches
+        // a user rather than only a log, so dropping it for "it panicked"
+        // would throw away the only thing that says what went wrong. The
+        // panic message printed by this test is the test doing its job.
+        let e = caught("querying the device", || -> Result<()> {
+            panic!("could not get endpoint data_flow")
+        })
+        .expect_err("a panicking query must not report success");
+        let text = format!("{e:#}");
+        assert!(text.contains("querying the device"), "{text}");
+        assert!(text.contains("could not get endpoint data_flow"), "{text}");
+    }
+
+    #[test]
+    fn a_query_that_answers_keeps_both_its_value_and_its_error() {
+        // The guard must cost neither the ordinary answer nor an ordinary
+        // failure, which still has to arrive as the error it already was.
+        assert_eq!(caught("fine", || Ok(7)).unwrap(), 7);
+        let e = caught("failing", || -> Result<u8> { anyhow::bail!("no device") })
+            .expect_err("an ordinary error must survive the guard");
+        assert!(format!("{e:#}").contains("no device"));
     }
 
     #[test]
