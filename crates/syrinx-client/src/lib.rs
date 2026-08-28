@@ -28,6 +28,7 @@ pub mod hotkey;
 pub mod inject;
 pub mod mode;
 pub mod preview;
+pub mod process;
 pub mod save;
 pub mod session;
 pub mod state;

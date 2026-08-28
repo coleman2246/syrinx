@@ -150,27 +150,6 @@ pub fn refresh_waybar(signal: u8) {
         .status();
 }
 
-/// Wait for a child process on a thread of its own, so it cannot be left
-/// defunct.
-///
-/// Dropping a `std::process::Child` deliberately does not wait: the standard
-/// library will not hide a blocking call inside a drop. The consequence is
-/// that a child nobody waits for stays in the process table as a zombie from
-/// the moment it exits until its parent does -- which for a daemon is however
-/// many days it has been up.
-///
-/// Waiting on the caller's thread is not the answer either. The daemon's loop
-/// publishes state forty times a second and owes every IPC client a reply
-/// inside five, and a process in uninterruptible IO does not exit merely
-/// because it has been killed. So the wait gets a thread whose only job is to
-/// sit in it: one stack for as long as the child lives, which is the price of
-/// not blocking anything that matters.
-pub fn reap_in_background(mut child: std::process::Child) {
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

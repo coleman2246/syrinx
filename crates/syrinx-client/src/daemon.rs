@@ -1041,7 +1041,7 @@ impl DaemonRuntime {
     fn stop_overlay(&mut self) {
         if let Some(mut c) = self.overlay.take() {
             let _ = c.kill();
-            crate::state::reap_in_background(c);
+            crate::process::reap_in_background(c);
         }
     }
 
@@ -1247,7 +1247,7 @@ impl DaemonRuntime {
                 // Dropping the handle instead would leave the viewer defunct
                 // from the moment its window is closed until the daemon exits,
                 // one per window ever opened.
-                crate::state::reap_in_background(c);
+                crate::process::reap_in_background(c);
             }
             Err(e) => warn!("could not open {cmd}: {e}"),
         }
