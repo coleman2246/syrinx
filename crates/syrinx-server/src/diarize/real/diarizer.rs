@@ -431,9 +431,15 @@ enum Gap {
     /// puts it at itself instead, which is later and so tighter.
     Pending(u64),
     /// The same silence, after something had to assume it hid a change and
-    /// committed the seam. The evidence is no longer wanted -- it could only
-    /// loosen a bound already given out -- but the next hop still follows a
-    /// pause rather than adjoining anything.
+    /// committed the seam at the pause.
+    ///
+    /// The evidence is still wanted. A bound already given out cannot be
+    /// *loosened* -- a correction may already have been emitted against it --
+    /// but it can still be tightened, and when the hop finally arrives and the
+    /// voices differ it should be: the hop is later than the pause, and the
+    /// chunk a silence begins in is the one place a bound must not be drawn
+    /// (see [`RealDiarizer::hop`]). What this state stops is a second forced
+    /// commit of the same silence, not the comparison.
     Assumed,
 }
 
@@ -503,7 +509,9 @@ enum Gap {
 /// **Anything that would emit a correction while the answer is outstanding
 /// commits the seam first.** No correction ever crosses an unresolved seam,
 /// because the case a seam exists for is precisely the one where the missing
-/// evidence would have said "somebody else".
+/// evidence would have said "somebody else". Evidence arriving after that is
+/// still allowed to *tighten* the bound and never to loosen it, which is what
+/// [`Gap::Assumed`] carries.
 ///
 /// **What that does not guarantee.** A turn change entirely inside one hop is
 /// invisible to a detector that compares whole hops, so a correction can in
@@ -682,7 +690,9 @@ impl RealDiarizer {
     /// The hop that would have answered is still to come, so the only safe
     /// answer is the one the seam was recorded for: assume the silence hid a
     /// speaker change. `Gap::Assumed` rather than `Gap::Closed`, so the hop
-    /// when it does arrive still knows it follows a pause.
+    /// when it does arrive still knows it follows a pause -- and can still
+    /// tighten the bound this hands out, which is the only direction left open
+    /// once a correction may have been emitted against it.
     ///
     /// **Not an unreachable precaution**, though the shipped geometry hides
     /// how it is reached: a hop completes at 23 voiced frames and a window at
@@ -725,15 +735,14 @@ impl RealDiarizer {
     fn hop(&mut self, embedding: Vec<f32>, chunk: u64, out: &mut Attribution) -> bool {
         // The first hop after a silence is asked a different question from
         // every other one -- not "has the voice changed since the hop before"
-        // but "is this the voice that stopped" -- and only a pending seam turns
-        // on the answer. It claims no boundary whatever it finds: a silence is
-        // a poor turn-change detector, which is what the 151 breaks behind
+        // but "is this the voice that stopped" -- and the only thing that
+        // turns on the answer is how far back a correction may reach. It
+        // claims no boundary whatever it finds: a silence is a poor
+        // turn-change detector, which is what the 51 decidable breaks behind
         // `window::MAX_GAP_FRAMES` measured, and none of this reopens that.
         let gap = std::mem::replace(&mut self.gap, Gap::Closed);
         if gap != Gap::Closed {
-            if let Gap::Pending(_) = gap
-                && self.voice_changed_across_the_gap(&embedding)
-            {
+            if self.voice_changed_across_the_gap(&embedding) {
                 // At this hop rather than at the pause, which is the tighter
                 // of the two and exactly where the rule this replaces put it.
                 // Half a second is under half a chunk, so the chunk a silence
@@ -741,6 +750,14 @@ impl RealDiarizer {
                 // well as the incoming speaker's first, and a bound drawn
                 // there would let a correction reach into the sentence it is
                 // meant to stop at.
+                //
+                // `Gap::Assumed` takes this branch too. Something has already
+                // committed that seam at the pause, and a bound handed out
+                // cannot be loosened -- but this is a floor, so applying it
+                // can only move the bound forward, off the chunk the silence
+                // began in and onto the hop that measured the change. The rule
+                // this replaces did exactly that, by clearing the held hop and
+                // letting the next one seam as the first of a run.
                 self.commit_gap_seam(chunk);
             }
             self.previous_hop = Some(embedding.clone());
@@ -1412,7 +1429,7 @@ mod tests {
     // --------------------------------------------------- the deferred seam
     //
     // Half a second of quiet is constant in conversation, and treating every
-    // one of it as a provenance seam is what held the backfill to 2
+    // one of them as a provenance seam is what held the backfill to 2
     // corrections over 21 minutes of ES2002a. These drive the state machine
     // that measures the silence instead of assuming about it; `window.rs`
     // owns the half that decides when the accumulator restarted at all.
@@ -1673,6 +1690,50 @@ mod tests {
         d.gap = Gap::Pending(10);
         d.hop(axis(0), 13, &mut out);
         assert_eq!(d.correctable_since, Some(13));
+    }
+
+    #[test]
+    fn a_seam_committed_early_is_still_tightened_by_the_hop_that_arrives_late() {
+        // `Gap::Assumed` means a correction went out while the answer was
+        // outstanding, so the bound at the pause has been given out and cannot
+        // be loosened. It can still be *tightened*, and when the voices turn
+        // out to differ it must be: the rule this replaced cleared the held
+        // hop, so the post-gap hop seamed as the first of a run -- at itself,
+        // which is a chunk later than the pause. Leaving it at the pause
+        // exposes exactly the chunk `hop` refuses to draw a bound at, the one
+        // that can carry both speakers' words.
+        let mut d = headless(DiarizeTuning::default());
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        d.gap = Gap::Pending(10);
+        d.assume_gap_hid_a_change();
+        assert_eq!(d.gap, Gap::Assumed);
+        assert_eq!(d.correctable_since, Some(10), "the bound handed out");
+
+        let mut out = Attribution::default();
+        d.hop(axis(1), 13, &mut out);
+        assert_eq!(
+            d.correctable_since,
+            Some(13),
+            "the evidence said somebody else and the bound stayed on the chunk \
+             the silence began in"
+        );
+    }
+
+    #[test]
+    fn a_seam_committed_early_is_never_loosened_by_it() {
+        // The other direction, and the one that is not open: a correction was
+        // emitted against the bound at the pause, so evidence arriving
+        // afterwards to say the same voice resumed cannot buy the reach back.
+        let mut d = headless(DiarizeTuning::default());
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+        d.gap = Gap::Pending(10);
+        d.assume_gap_hid_a_change();
+
+        let mut out = Attribution::default();
+        d.hop(axis(0), 13, &mut out);
+        assert_eq!(d.correctable_since, Some(10));
     }
 
     #[test]
