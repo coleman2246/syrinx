@@ -387,6 +387,11 @@ fn run(
     state::refresh_waybar(cfg.waybar_signal);
 
     let source_count = chosen.len();
+    // Named as a set: `short_label` calls every monitor "System audio", and
+    // two sources under one name build one stream filename and put two
+    // writers on it, which tears the records. Unused in combined mode, where
+    // there is one session and no per-source file.
+    let source_names = syrinx_audio::source::short_labels(&chosen);
     // Separate mode is one session per source; combined is one session fed by
     // a mix. Only the first source may type, since several streams typing into
     // one cursor interleave into nonsense.
@@ -410,7 +415,7 @@ fn run(
             .into_iter()
             .enumerate()
             .map(|(i, s)| {
-                let name = s.short_label();
+                let name = source_names[i].clone();
                 let stream = stream_target.as_ref().map(|(base, format)| {
                     let p = stream_path_for(base, &name, source_count);
                     info!("appending {name}'s transcript to {}", p.display());

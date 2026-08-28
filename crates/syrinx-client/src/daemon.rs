@@ -743,6 +743,11 @@ impl DaemonRuntime {
                 ));
             }
             crate::mode::SourceMode::Separate => {
+                // Named as a set rather than one at a time: `short_label`
+                // calls every monitor "System audio", and two of those would
+                // build one filename and put two writers on it -- the tearing
+                // the paragraph above exists to prevent.
+                let names = syrinx_audio::source::short_labels(&resolved);
                 for (i, source) in resolved.into_iter().enumerate() {
                     // Only the first source may type: several streams typing
                     // into one cursor interleave into nonsense. The rest are
@@ -752,7 +757,7 @@ impl DaemonRuntime {
                     } else {
                         OutputMode::Transcribe
                     };
-                    let name = source.short_label();
+                    let name = names[i].clone();
                     let stream = stream.as_ref().map(|(base, format)| {
                         let p = if split_stream {
                             save::path_for_source(base, &name)
