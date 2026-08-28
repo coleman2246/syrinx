@@ -683,9 +683,12 @@ impl Diarizer for RealDiarizer {
         // A change point invalidates every window still to come out of this
         // batch: they were assembled before the cut, from audio either side of
         // the boundary, which is exactly the mixture the cut says they are.
-        // (A hop and a window never complete on the same frame -- 23 and 47
-        // frames are coprime in the relevant sense -- but they can complete on
-        // the same chunk, which is what this is for.)
+        //
+        // They can share a chunk, which is what this is for. They cannot share
+        // a frame -- windows complete at 47 + 23k voiced frames and hops at
+        // 23m, and 47 is 1 mod 23 -- but that is arithmetic about the shipped
+        // geometry rather than a property worth relying on, and the flag costs
+        // nothing either way.
         let mut cut = false;
         for piece in self.assembler.push(&framed, &voiced) {
             let (Cut::Hop(audio) | Cut::Window(audio)) = &piece;
