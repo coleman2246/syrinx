@@ -408,9 +408,17 @@ button picks a file, offering the current local time as the name —
 `2026-08-21_14-59-41.txt`, the same default **Save as…** uses. Ordered
 largest unit first, so sorting a folder by name sorts it by time.
 
+It asks every time, and it asks in the folder you chose last: the folder is
+worth remembering across runs and the name is not, or a file picked a
+fortnight ago quietly collects every session since under that day's date.
+Cancelling changes nothing, and **Stop streaming** beside it is what stops.
+The choice applies to the next session, because the file is opened when a
+session starts.
+
 Every session appends to the same file, so stopping and starting continues
 where you left off, and a crash costs the last sentence rather than the whole
-session — verified against `kill -9` mid-session.
+session — verified against `kill -9` mid-session. If a write fails partway
+through, the window says so rather than only the daemon log.
 
 Several sources transcribed separately get a file each, beside the one you
 asked for: `syrinx start --separate --stream notes.txt` on a microphone and
