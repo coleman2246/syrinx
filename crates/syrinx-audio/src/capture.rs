@@ -28,9 +28,7 @@ impl Capture {
                 // produced silence while the same card's capture device
                 // happened to work, which reads as the two being swapped.
                 let cap = match source.kind {
-                    crate::SourceKind::Microphone => {
-                        crate::pipewire::PwCapture::start(*id, tx)?
-                    }
+                    crate::SourceKind::Microphone => crate::pipewire::PwCapture::start(*id, tx)?,
                     crate::SourceKind::Monitor | crate::SourceKind::Application => {
                         crate::pipewire::PwCapture::start_linked(*id, tx)?
                     }
@@ -52,6 +50,68 @@ impl Capture {
 /// stopped by dropping the handle.
 pub struct CpalCapture {
     _stop: std::sync::mpsc::Sender<()>,
+}
+
+/// How long a device gets to open before it is called a failure.
+///
+/// Bounded because the whole point of this rendezvous is that the caller
+/// learns the truth, and a device that never finishes opening would otherwise
+/// substitute a hang for the silence it replaced. Ten seconds is far longer
+/// than any real open takes, on WASAPI or anywhere else.
+const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run a stream on a thread of its own, and report whether it started.
+///
+/// `cpal::Stream` is not `Send` on every platform, which is the only reason
+/// the thread exists. The rendezvous is what is new: this used to spawn the
+/// thread and return `Ok` at once, so a stream that failed to build or play
+/// logged the failure -- without the error value -- and left a live handle
+/// behind that produced nothing. `MixedCapture::start` then returned `Ok`, the
+/// session completed its handshake, and the daemon reported `Listening` with
+/// no error set anywhere. The only two failures that ever reached a caller
+/// were `find_device` and the config query.
+///
+/// The stream is dropped when the returned sender is, which is what stops the
+/// capture.
+fn on_stream_thread<S: 'static>(
+    start: impl FnOnce() -> Result<S> + Send + 'static,
+) -> Result<std::sync::mpsc::Sender<()>> {
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+    std::thread::spawn(move || {
+        // Formatted here rather than sent whole: an `anyhow::Error` is not
+        // `Send` across this channel in every shape it can take, and what the
+        // caller needs is the chain, which `{:#}` carries.
+        let stream = match start() {
+            Ok(s) => {
+                let _ = ready_tx.send(Ok(()));
+                s
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("{e:#}")));
+                return;
+            }
+        };
+        // Block until the handle is dropped; the stream stops with us.
+        let _ = stop_rx.recv();
+        drop(stream);
+    });
+
+    match ready_rx.recv_timeout(OPEN_TIMEOUT) {
+        Ok(Ok(())) => Ok(stop_tx),
+        Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+        // Disconnected: the thread unwound before it could answer, which cpal
+        // backends do -- the Windows one panics rather than erroring in
+        // several places. Either way the caller gets an error, not a handle to
+        // a stream that is not running.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("the audio thread stopped before the stream started")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!("the audio device did not open within {OPEN_TIMEOUT:?}")
+        }
+    }
 }
 
 impl CpalCapture {
@@ -81,11 +141,7 @@ impl CpalCapture {
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
 
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-
-        // cpal::Stream is !Send, so it cannot be moved into a tokio task; it
-        // gets a dedicated thread that holds it alive until asked to stop.
-        std::thread::spawn(move || {
+        let stop = on_stream_thread(move || {
             let err_fn = |e| tracing::warn!("audio stream error: {e}");
             let stream = match format {
                 cpal::SampleFormat::F32 => device.build_input_stream(
@@ -109,30 +165,96 @@ impl CpalCapture {
                     config,
                     move |d: &[u8], _| {
                         // U8 is unsigned with 128 as silence.
-                        let f: Vec<f32> =
-                            d.iter().map(|s| (*s as f32 - 128.0) / 128.0).collect();
+                        let f: Vec<f32> = d.iter().map(|s| (*s as f32 - 128.0) / 128.0).collect();
                         let _ = tx.try_send(resample_to_16k(&downmix_to_mono(&f, channels), rate));
                     },
                     err_fn,
                     None,
                 ),
                 other => {
-                    tracing::error!("unsupported sample format {other:?}");
-                    return;
+                    anyhow::bail!("this device captures in {other:?}, which syrinx cannot convert")
                 }
             };
-            let Ok(stream) = stream else {
-                tracing::error!("failed to build the input stream");
-                return;
-            };
-            if stream.play().is_err() {
-                tracing::error!("failed to start the input stream");
-                return;
-            }
-            // Block until the handle is dropped; the stream stops with us.
-            let _ = stop_rx.recv();
-        });
+            let stream = stream.context("building the input stream")?;
+            stream.play().context("starting the input stream")?;
+            Ok(stream)
+        })?;
 
-        Ok(Self { _stop: stop_tx })
+        Ok(Self { _stop: stop })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Wait for `f`, or give up.
+    ///
+    /// Deadline-bounded rather than left to spin: what these tests check is
+    /// that a thread reaches an end state, and one that never does would hang
+    /// the run instead of failing it.
+    fn within(deadline: Duration, f: impl Fn() -> bool) -> bool {
+        let until = Instant::now() + deadline;
+        while Instant::now() < until {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        f()
+    }
+
+    #[test]
+    fn a_stream_that_cannot_be_built_reports_the_error_rather_than_ok() {
+        // The fault this replaces: the failure was logged without its value
+        // and `Ok` was returned anyway, so a session went on to its handshake
+        // and reported Listening while capturing nothing.
+        let e =
+            on_stream_thread(|| -> Result<()> { anyhow::bail!("Device does not support input") })
+                .expect_err("a stream that never built must not report success");
+        assert!(
+            format!("{e:#}").contains("does not support input"),
+            "the real error has to survive: {e:#}"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_starts_returns_a_handle_that_stops_it() {
+        struct Stopper(Arc<AtomicBool>);
+        impl Drop for Stopper {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        let handle = on_stream_thread(move || Ok(Stopper(flag))).unwrap();
+        assert!(
+            !stopped.load(Ordering::SeqCst),
+            "it stopped before it was asked"
+        );
+
+        drop(handle);
+        assert!(
+            within(Duration::from_secs(5), || stopped.load(Ordering::SeqCst)),
+            "dropping the handle must stop the stream"
+        );
+    }
+
+    #[test]
+    fn a_stream_thread_that_dies_before_reporting_is_an_error_not_a_hang() {
+        // cpal's Windows backend panics rather than erroring in several
+        // places, so the thread can end without answering. The panic message
+        // this prints is the test doing its job.
+        let e = on_stream_thread(|| -> Result<()> { panic!("the backend gave up") })
+            .expect_err("a thread that died must not report success");
+        assert!(
+            format!("{e:#}").contains("stopped before the stream started"),
+            "got: {e:#}"
+        );
     }
 }
