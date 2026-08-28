@@ -1445,7 +1445,6 @@ impl App {
             .collect();
         resolved.map(|s| syrinx_audio::source::short_labels(&s))
     }
-
 }
 
 /// Accept a bare host, `host:port`, or a full URL, and produce a full one.

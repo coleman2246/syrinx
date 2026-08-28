@@ -658,9 +658,15 @@ mod tests {
     fn a_leading_tilde_becomes_the_home_directory() {
         // The value comes from a config file and a text box; no shell has
         // expanded it, and a literal `~` folder is never what was meant.
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap();
+        //
+        // Skipped rather than unwrapped where the environment names no home:
+        // a test that requires the machine running it to have `HOME` set
+        // fails under `env -u HOME cargo test`, which is not a bug in
+        // `expand_tilde`.
+        let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
+            assert_eq!(expand_tilde("~/notes.txt"), PathBuf::from("~/notes.txt"));
+            return;
+        };
         assert_eq!(expand_tilde("~/notes.txt"), PathBuf::from(&home).join("notes.txt"));
         assert_eq!(expand_tilde("~"), PathBuf::from(&home));
     }
