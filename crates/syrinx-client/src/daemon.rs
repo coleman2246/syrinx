@@ -1011,16 +1011,37 @@ impl DaemonRuntime {
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            Ok(c) => self.overlay = Some(c),
+            Ok(c) => {
+                // Whatever is in the slot has to be waited for rather than
+                // dropped. A Stop and a Start can arrive in the same pass of
+                // the command queue, which puts a new overlay here before the
+                // loop has cleared the old one.
+                self.stop_overlay();
+                self.overlay = Some(c);
+            }
             Err(e) => warn!("could not show the level overlay: {e}"),
         }
     }
 
     /// Close the overlay. It also closes itself when the session ends, but a
     /// daemon shutting down should not leave one behind.
+    ///
+    /// `kill` only asks: the process stays in the table as a zombie until
+    /// someone reads its exit status, and this runs on the loop, where a wait
+    /// on a process stuck in uninterruptible IO would stall both the meter and
+    /// the five seconds an IPC client is given. The wait therefore goes to a
+    /// thread, which is what covers the frequent path -- one overlay per
+    /// dictation session, on a daemon that then runs for days.
+    ///
+    /// On the shutdown path that thread may never be scheduled. Nothing is
+    /// left behind there either: a child whose parent has gone is reparented
+    /// to init, or to the nearest subreaper, and waited for by it. Windows has
+    /// no zombie state to reach at all -- the record lives with the handle,
+    /// which the `Child` closes as it drops.
     fn stop_overlay(&mut self) {
         if let Some(mut c) = self.overlay.take() {
             let _ = c.kill();
+            crate::state::reap_in_background(c);
         }
     }
 
@@ -1221,7 +1242,13 @@ impl DaemonRuntime {
             return;
         };
         match std::process::Command::new(cmd).spawn() {
-            Ok(_) => info!("opened a viewer"),
+            Ok(c) => {
+                info!("opened a viewer");
+                // Dropping the handle instead would leave the viewer defunct
+                // from the moment its window is closed until the daemon exits,
+                // one per window ever opened.
+                crate::state::reap_in_background(c);
+            }
             Err(e) => warn!("could not open {cmd}: {e}"),
         }
     }
@@ -1878,5 +1905,140 @@ mod tests {
         assert!(snap.diarize_configured);
         assert!(!snap.diarize);
         assert!(!snap.diarize_requested);
+    }
+
+    /// Whether the kernel still holds a record of this process.
+    ///
+    /// Signal 0 checks permission without sending anything, the same test
+    /// `state::running_pid` uses. A zombie answers yes -- it is still in the
+    /// table -- and only a reaped process is gone, which is exactly the
+    /// distinction these tests are about. It also leaves the exit status where
+    /// it is, which `waitpid` would not: a test that consumed the status would
+    /// be indistinguishable from the code under test doing its job.
+    #[cfg(unix)]
+    fn still_in_the_process_table(pid: u32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+    }
+
+    /// Poll until the process is gone. Two seconds is far longer than a thread
+    /// needs to be scheduled, so exhausting it means nobody is waiting at all.
+    #[cfg(unix)]
+    fn reaped_within_two_seconds(pid: u32) -> bool {
+        for _ in 0..200 {
+            if !still_in_the_process_table(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A child that outlives the test unless something stops it.
+    #[cfg(unix)]
+    fn long_lived_child() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawning a stand-in child")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stopping_the_overlay_reaps_it_rather_than_leaving_it_defunct() {
+        // The higher-frequency of the two leaks: the overlay is stopped once
+        // per dictation session, so a kill that never waits accrues a defunct
+        // process per session for the life of the daemon.
+        let mut d = daemon_holding(SessionState::default());
+        let child = long_lived_child();
+        let pid = child.id();
+        d.overlay = Some(child);
+
+        d.stop_overlay();
+
+        assert!(
+            reaped_within_two_seconds(pid),
+            "the overlay was killed but never waited for, so {pid} is still in the process table"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn starting_an_overlay_reaps_the_one_it_replaces() {
+        // A Stop and a Start can be drained in the same pass of the command
+        // queue, which reaches `start_overlay` before the loop has cleared the
+        // previous session's overlay. Assigning over the handle would drop it,
+        // and a dropped handle is never waited for.
+        let mut d = daemon_holding(SessionState::default());
+        d.opts.mode = OutputMode::Type;
+        // Given `--overlay`, which it does not understand, so the stand-in
+        // exits at once rather than sitting around for the rest of the run.
+        d.opts.gui_command = Some("sleep".into());
+        let previous = long_lived_child();
+        let pid = previous.id();
+        d.overlay = Some(previous);
+
+        d.start_overlay();
+
+        assert!(
+            reaped_within_two_seconds(pid),
+            "the replaced overlay {pid} was dropped rather than waited for"
+        );
+        d.stop_overlay();
+    }
+
+    /// A stand-in viewer that records its own pid and exits.
+    ///
+    /// `open_viewer` keeps no handle and passes no arguments, so the pid has
+    /// to come from the process itself.
+    #[cfg(unix)]
+    fn viewer_reporting_its_pid(pid_file: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = scratch("viewer-script");
+        std::fs::write(&p, format!("#!/bin/sh\necho $$ > {}\n", pid_file.display()))
+            .expect("writing the stand-in viewer");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+            .expect("making the stand-in viewer executable");
+        p
+    }
+
+    /// The pid the stand-in viewer wrote, once it has written it. An empty
+    /// file is a read that caught the redirect between open and write.
+    #[cfg(unix)]
+    fn pid_reported_within_two_seconds(path: &std::path::Path) -> Option<u32> {
+        for _ in 0..200 {
+            if let Ok(s) = std::fs::read_to_string(path)
+                && let Ok(pid) = s.trim().parse()
+            {
+                return Some(pid);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_viewer_that_is_closed_leaves_no_defunct_process_behind() {
+        // One per window ever opened, which is how fourteen of them were found
+        // parented to a single long-running daemon.
+        let pid_file = scratch("viewer-pid");
+        let _ = std::fs::remove_file(&pid_file);
+        let script = viewer_reporting_its_pid(&pid_file);
+        let mut d = daemon_holding(SessionState::default());
+        d.opts.gui_command = Some(script.display().to_string());
+
+        d.open_viewer();
+
+        let pid = pid_reported_within_two_seconds(&pid_file)
+            .expect("the stand-in viewer never reported its pid");
+        assert!(
+            reaped_within_two_seconds(pid),
+            "the viewer exited and was never waited for, leaving {pid} defunct"
+        );
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&pid_file);
     }
 }
