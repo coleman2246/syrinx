@@ -1231,8 +1231,8 @@ mod tests {
     fn crowded_room() -> Vec<Vec<f32>> {
         /// Cosine between a newcomer and each founder it crowds. Above
         /// `T_ASSIGN`, which is the whole point, and below the mint gate's
-        /// ceiling of `T_ASSIGN + T_MARGIN`, which is what still lets a
-        /// crowded newcomer become somebody.
+        /// ceiling, [`T_MINT_CEILING`], which is what still lets a crowded
+        /// newcomer become somebody.
         const CROWDED: f32 = 0.5;
         const DIM: usize = 12;
         let axis = |i: usize| {
@@ -1260,12 +1260,10 @@ mod tests {
         let room: Vec<Vec<f32>> = founders.into_iter().chain(newcomers).collect();
         // Stated rather than assumed, because the whole test rests on it.
         assert!(similarity(&room[0], &room[1]) < T_ASSIGN, "founders apart");
-        const {
-            assert!(
-                CROWDED < T_ASSIGN + T_MARGIN,
-                "a newcomer this crowded has to stay inside the mint gate's ceiling"
-            )
-        };
+        // Both bounds are read off the vectors that were built rather than off
+        // `CROWDED`, so that retuning either threshold fails this fixture with
+        // the measured number in the message instead of failing the crate's
+        // compilation, which is what a `const` assertion here would do.
         for j in 4..8 {
             for f in 0..2 {
                 let sim = similarity(&room[j], &room[f]);
@@ -1273,6 +1271,11 @@ mod tests {
                     sim > T_ASSIGN,
                     "newcomer {j} sits at {sim} from founder {f}, which has to \
                      be above the threshold to reproduce the failure"
+                );
+                assert!(
+                    sim < T_MINT_CEILING,
+                    "newcomer {j} sits at {sim} from founder {f}, which has to \
+                     stay inside the mint gate's ceiling to be minted at all"
                 );
             }
         }
@@ -2306,7 +2309,7 @@ mod tests {
         assert!((to_mean - floor).abs() < 1e-5, "{to_mean} against {floor}");
 
         assert!(
-            to_mean - T_MINT_MARGIN > T_ASSIGN + T_MARGIN,
+            to_mean - T_MINT_MARGIN > T_MINT_CEILING,
             "at the shipped pool the ceiling is what decides a mint, and this \
              is the arithmetic that leaves it room to"
         );
@@ -2328,8 +2331,11 @@ mod tests {
         // either incumbent, is still somebody.
         let mut c = two_speakers();
         let voice = crowded_by_both(0.50);
-        const CROWDED: f32 = 0.50;
-        const { assert!(CROWDED < T_MINT_CEILING, "inside the ceiling") };
+        let rival = similarity(&voice, &at(0.0));
+        assert!(
+            rival < T_MINT_CEILING,
+            "the newcomer sits at {rival}, which has to be inside the ceiling"
+        );
         let heard: Vec<Heard> = (0..MIN_POOL).map(|_| c.observe(&voice)).collect();
         assert!(heard[..MIN_POOL - 1].iter().all(|h| h.is_guess()));
         assert_eq!(heard.last(), Some(&Heard::Settled(3)));
@@ -2530,12 +2536,23 @@ mod tests {
     fn the_shipped_mint_ceiling_is_where_the_assignment_margin_used_to_put_it() {
         // The compatibility claim the decoupling rests on: a deployment at the
         // shipped settings sees nothing change, because the number is the same
-        // number. It is now a number rather than a sum, so this is the line
-        // that keeps the equality deliberate -- moving the ceiling is a
-        // decision somebody has to take on purpose, and the probe run that
-        // would justify it has not happened.
-        const { assert!(T_MINT_CEILING == T_ASSIGN + T_MARGIN) };
-        assert_eq!(OnlineClusterer::new().mint_ceiling, T_ASSIGN + T_MARGIN);
+        // number. It is now a number rather than a sum, so this is what keeps
+        // the equality deliberate -- moving the ceiling is a decision somebody
+        // has to take on purpose, and the probe run that would justify it has
+        // not happened.
+        //
+        // Run time, not a `const` block. A `const` here would weld the two
+        // apart numbers back together at compile time: retuning `T_MARGIN`,
+        // which its own doc calls an unmeasured estimate the probe exists to
+        // replace, would stop the crate building instead of failing one test
+        // that names the decision. A guard on a number somebody is expected to
+        // move has to be one they can read and delete.
+        assert_eq!(
+            OnlineClusterer::new().mint_ceiling,
+            T_ASSIGN + T_MARGIN,
+            "the shipped ceiling has left the sum it was derived from; if a \
+             sweep moved it on purpose, this assertion is what to delete"
+        );
         assert_eq!(OnlineClusterer::new().mint_ceiling, 0.55);
     }
 
