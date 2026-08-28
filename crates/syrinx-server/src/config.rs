@@ -98,15 +98,50 @@ pub struct Config {
     /// voice increasingly finds an incumbent over the bar to be handed to.
     /// Requiring a lead as well is the question that does not rot.
     ///
-    /// Raising it labels less and guesses less; 0 is the rule the server used
-    /// before 2026-08-27, and the retreat if corrections and gaps turn out to
-    /// read worse than the occasional wrong name. Accepted range 0 to 0.5.
+    /// Raising it labels less and guesses less, and does nothing else --
+    /// minting has its own key below, because it is a different question on a
+    /// different scale. 0 is the rule the server used before 2026-08-27, and
+    /// the retreat if corrections and gaps turn out to read worse than the
+    /// occasional wrong name; at 0, and only at 0, this key does govern the
+    /// mint ceiling as well, because the hatch is documented as switching off
+    /// everything that arrived with it. Accepted range 0 to 0.5.
     ///
     /// **The default is an engineering estimate, not a measurement.** See
     /// `docs/specs/2026-08-27-diarization-latency-and-crowding-design.md`; the
     /// probe's live-emulation mode exists to replace it.
     #[serde(default = "default_diarize_margin")]
     pub diarize_margin: f32,
+
+    /// How close to a speaker who already has a number a group of agreeing
+    /// windows may sit and still be given a number of its own.
+    ///
+    /// The split guard. Four windows that agree with each other but with
+    /// nobody known are either a new voice or one known voice recorded badly,
+    /// and the cosine between their average and the nearest existing speaker
+    /// is what separates the two: past this value they are that speaker, and
+    /// minting would split one person across two labels -- a label the
+    /// duplicate carries text away under and does not give back, since
+    /// retirement folds the centroid and cannot unfreeze a commit.
+    ///
+    /// Raising it mints more readily in a crowded room, at the risk of
+    /// splitting; lowering it mints less, and a genuinely new voice that is
+    /// refused gets an incumbent's number as a guess instead of a gap.
+    ///
+    /// **Not the same quantity as `diarize_margin`,** although it used to be
+    /// derived from it. That one is a lead between one 1.5 s window's cosines,
+    /// measured against the spike's same-speaker median of 0.517; this one is
+    /// a cosine between an *average* of `diarize_min_pool` windows and a
+    /// centroid, which for a single voice sits much higher. Accepted range 0
+    /// to 1, a cosine's own range: at or below `T_assign` this clause is inert
+    /// and the pre-2026-08-27 mint rule is all that is left, and from
+    /// `T_retire` upwards the retirement threshold caps it, so both ends
+    /// saturate into settings rather than into nonsense.
+    ///
+    /// **The default is an engineering estimate, not a measurement**, and the
+    /// design names it the single most important number the probe has to
+    /// answer.
+    #[serde(default = "default_diarize_mint_ceiling")]
+    pub diarize_mint_ceiling: f32,
 
     /// How far the cosine between two consecutive 0.75 s hop embeddings must
     /// fall before the diarizer calls it a turn change.
@@ -163,6 +198,16 @@ const DIARIZE_MIN_POOL: RangeInclusive<usize> = 2..=16;
 /// failure the spike documented when `T_assign` was raised instead.
 const DIARIZE_MARGIN: RangeInclusive<f32> = 0.0..=0.5;
 
+/// What [`Config::diarize_mint_ceiling`] will accept: a cosine's whole range,
+/// because unlike the margin this one has no interior value that stops meaning
+/// anything. Both ends saturate into settings instead -- at or below `T_assign`
+/// the ceiling clause is inert and minting is the pre-2026-08-27 rule alone,
+/// and from `T_retire` up the retirement threshold is the cap, so the far end
+/// says "let retirement decide" rather than "mint anything". Refusing the ends
+/// would make an operator work out where the useful band stops from constants
+/// no config file names.
+const DIARIZE_MINT_CEILING: RangeInclusive<f32> = 0.0..=1.0;
+
 /// What [`Config::diarize_change_threshold`] will accept: a cosine's range,
 /// both ends meaningful. 0 detects no turn change ever; 1 would detect one at
 /// every hop, which the window assembler's refractory floor then holds down to
@@ -213,6 +258,9 @@ fn default_diarize_min_pool() -> usize {
 }
 fn default_diarize_margin() -> f32 {
     crate::diarize::cluster::T_MARGIN
+}
+fn default_diarize_mint_ceiling() -> f32 {
+    crate::diarize::cluster::T_MINT_CEILING
 }
 fn default_diarize_change_threshold() -> f32 {
     crate::diarize::cluster::T_CHANGE
@@ -271,6 +319,17 @@ impl Config {
             DIARIZE_MARGIN.start(),
             DIARIZE_MARGIN.end(),
             default_diarize_margin(),
+        );
+        ensure!(
+            DIARIZE_MINT_CEILING.contains(&self.diarize_mint_ceiling),
+            "diarize_mint_ceiling = {} is out of range: it must be {} to {}, in \
+             cosine between a pool's mean and the nearest existing speaker. This \
+             is not the assignment margin and is not on its scale; the shipped \
+             value is {}.",
+            self.diarize_mint_ceiling,
+            DIARIZE_MINT_CEILING.start(),
+            DIARIZE_MINT_CEILING.end(),
+            default_diarize_mint_ceiling(),
         );
         ensure!(
             DIARIZE_CHANGE_THRESHOLD.contains(&self.diarize_change_threshold),
@@ -550,6 +609,10 @@ mod tests {
         let c = base();
         assert_eq!(c.diarize_margin, crate::diarize::cluster::T_MARGIN);
         assert_eq!(
+            c.diarize_mint_ceiling,
+            crate::diarize::cluster::T_MINT_CEILING
+        );
+        assert_eq!(
             c.diarize_change_threshold,
             crate::diarize::cluster::T_CHANGE
         );
@@ -559,11 +622,12 @@ mod tests {
     #[test]
     fn the_latency_tunables_parse() {
         let c = with(
-            "diarize_margin = 0.2\ndiarize_change_threshold = 0.5\n\
-             diarize_relabel_window = 10",
+            "diarize_margin = 0.2\ndiarize_mint_ceiling = 0.62\n\
+             diarize_change_threshold = 0.5\ndiarize_relabel_window = 10",
         )
         .unwrap();
         assert_eq!(c.diarize_margin, 0.2);
+        assert_eq!(c.diarize_mint_ceiling, 0.62);
         assert_eq!(c.diarize_change_threshold, 0.5);
         assert_eq!(c.diarize_relabel_window, 10);
     }
@@ -577,9 +641,11 @@ mod tests {
         // accepted rather than read as "unset".
         //
         // That the value *reaches* the clusterer and switches off all three of
-        // the 2026-08-27 rules is `cluster.rs`'s business, and two tests there
+        // the 2026-08-27 rules is `cluster.rs`'s business, and the tests there
         // say so exhaustively -- a switch nobody checks the far end of is how
-        // a documented hatch stops working.
+        // a documented hatch stops working. The mint ceiling is the one that
+        // needs saying out loud now that it has a key of its own: nothing
+        // about the arithmetic switches it off any more.
         assert_eq!(with("diarize_margin = 0.0").unwrap().diarize_margin, 0.0);
     }
 
@@ -607,6 +673,36 @@ mod tests {
         assert!(message.contains("diarize_margin"), "{message}");
         assert!(message.contains("0 to 0.5"), "{message}");
         assert!(with("diarize_margin = -0.1").is_err(), "a negative margin");
+    }
+
+    #[test]
+    fn a_mint_ceiling_outside_a_cosine_is_refused_at_load_by_name() {
+        // The whole of a cosine is accepted because both ends saturate into
+        // settings: at or below T_assign the ceiling clause is inert, and from
+        // T_retire up the retirement threshold is the cap. Outside that there
+        // is no number left to mean anything.
+        let err = with("diarize_mint_ceiling = 1.1").expect_err("above the range");
+        let message = format!("{err:#}");
+        assert!(message.contains("diarize_mint_ceiling"), "{message}");
+        assert!(message.contains("0 to 1"), "{message}");
+        assert!(with("diarize_mint_ceiling = -0.1").is_err(), "negative");
+        assert!(with("diarize_mint_ceiling = 0.0").is_ok());
+        assert!(with("diarize_mint_ceiling = 1.0").is_ok());
+    }
+
+    #[test]
+    fn a_non_finite_mint_ceiling_is_refused_rather_than_compared_against() {
+        // TOML spells all three of these, and every comparison in the mint
+        // gate is a `<` that a NaN loses. A ceiling of NaN would therefore
+        // read as "refuse every mint" and a session would simply stop finding
+        // speakers, with nothing in the log to say why. `contains` is false
+        // for all three, which is what makes the load the place it fails.
+        for value in ["nan", "inf", "-inf"] {
+            assert!(
+                with(&format!("diarize_mint_ceiling = {value}")).is_err(),
+                "{value} was accepted"
+            );
+        }
     }
 
     #[test]
@@ -642,6 +738,7 @@ mod tests {
         let mut c = base();
         let before = (
             c.diarize_margin,
+            c.diarize_mint_ceiling,
             c.diarize_change_threshold,
             c.diarize_relabel_window,
         );
@@ -649,6 +746,7 @@ mod tests {
         assert_eq!(
             (
                 c.diarize_margin,
+                c.diarize_mint_ceiling,
                 c.diarize_change_threshold,
                 c.diarize_relabel_window,
             ),
