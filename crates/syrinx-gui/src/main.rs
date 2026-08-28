@@ -264,9 +264,7 @@ fn ensure_daemon() -> Result<()> {
             // Reaped in the background. Without this the daemon becomes a
             // zombie the moment it exits and stays one for as long as this
             // window is open.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            syrinx_client::state::reap_in_background(child);
             return Ok(());
         }
         // Died before it ever listened: say why rather than time out.
@@ -278,6 +276,11 @@ fn ensure_daemon() -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // A daemon that came up but never listened is still a child of ours. The
+    // failure below is reported in a modal dialog, which waits for a person to
+    // dismiss it, so leaving the wait to this process exiting could hold a
+    // defunct daemon for as long as the message sits on screen.
+    syrinx_client::state::reap_in_background(child);
     anyhow::bail!(
         "the daemon did not start listening within 5s.\n{}",
         tail(&log_path)
