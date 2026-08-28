@@ -36,6 +36,22 @@ use syrinx_client::{
 /// worth that, and the alternative is a display that lies about how live it is.
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
 
+/// Least the transcript is ever given. Below this a card with a scrollbar in
+/// it says nothing at all, so the window is better off overflowing.
+const MIN_TRANSCRIPT: f32 = 80.0;
+
+/// Size the window opens at. Named because what it paints has to fit inside
+/// it -- there is no scroll area around any of it -- and a test says so.
+///
+/// It opened at 380 tall, which is less than the window's own minimum
+/// content: the rows above the transcript come to about 186, the transcript
+/// will not go below [`MIN_TRANSCRIPT`] and its card adds 22 more, and the
+/// controls and the lines of message under them are 130 again. The bottom row
+/// went under the edge of the window, and the bottom row is where the errors
+/// are.
+const WINDOW_WIDTH: f32 = 480.0;
+const WINDOW_HEIGHT: f32 = 460.0;
+
 /// How often the source list is re-scanned.
 ///
 /// Applications only exist in the graph while they are playing, so a list read
@@ -94,7 +110,7 @@ fn run() -> Result<()> {
     }
 
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([480.0, 380.0])
+        .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_min_inner_size([400.0, 280.0])
         .with_title("Syrinx");
     let options = eframe::NativeOptions {
@@ -560,11 +576,16 @@ impl App {
                 self.state = s;
                 self.disconnected = false;
             }
-            Ok(Response::Error { message }) => {
-                self.status_line = Some((Severity::Error, message))
-            }
-            Ok(_) => {}
             Err(_) => self.disconnected = true,
+            // Never a `State`, so it is whatever the daemon says went wrong,
+            // read the same way `send` reads it. Only ever set, never
+            // cleared: the line belongs to the button that was last pressed,
+            // not to a refresh happening thirty times a second behind it.
+            other => {
+                if let Some(s) = status_for(&other) {
+                    self.status_line = Some(s);
+                }
+            }
         }
     }
 
@@ -619,6 +640,18 @@ fn status_for(reply: &Result<Response>) -> Option<(Severity, String)> {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.window(ui);
+    }
+}
+
+impl App {
+    /// Everything the window paints, one frame of it.
+    ///
+    /// Separated from the `eframe::App` method it is the whole of, because an
+    /// `eframe::Frame` cannot be built outside eframe and this needs none: a
+    /// test can hand it a bare `Ui` of the window's size and measure what
+    /// comes out.
+    fn window(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if self.last_poll.elapsed() >= POLL_INTERVAL {
             self.poll();
@@ -651,8 +684,8 @@ impl eframe::App for App {
 
         // The card carries the visual weight now, so the rules above and below
         // it are redundant lines across the window.
-        let reserved = 104.0;
-        let height = ui.available_height() - reserved;
+        let room = ui.available_height() - self.reserved_below(ui);
+        let height = room.max(MIN_TRANSCRIPT);
         self.transcript_box(ui, height);
         ui.add_space(8.0);
         self.controls(ui, &ctx, running);
@@ -680,6 +713,46 @@ impl eframe::App for App {
         }
 
         ctx.request_repaint_after(POLL_INTERVAL);
+    }
+
+    /// Room to leave below the transcript for everything painted after it.
+    ///
+    /// This was the constant 104, sized when there were fewer rows than
+    /// there are now. Every row added since -- the stream target, a lost
+    /// fragment, the status line -- came out of the transcript's height
+    /// without being asked for, and the last one fell off the bottom of the
+    /// window: `eframe` hands `window` a bare root `Ui` with no scroll area,
+    /// so a row that does not fit is clipped rather than scrolled, and the
+    /// rows at the end are the errors.
+    ///
+    /// Deliberately generous. The control row is laid out `Align::Center`
+    /// across whatever height is left, so it stretches to absorb an
+    /// over-estimate and costs nothing but a slightly shorter transcript,
+    /// while an under-estimate is a row nobody can see.
+    fn reserved_below(&self, ui: &egui::Ui) -> f32 {
+        let gap = ui.spacing().item_spacing.y;
+        let line = ui.text_style_height(&egui::TextStyle::Body) + gap;
+        let button = ui.spacing().interact_size.y.max(
+            ui.text_style_height(&egui::TextStyle::Button)
+                + 2.0 * ui.spacing().button_padding.y,
+        ) + gap;
+        // The card's margin and border, which sit outside the height handed
+        // to the scroll area inside it.
+        const CARD: f32 = 22.0;
+        // Two button-height rows, which is what the controls wrap onto at
+        // the width this window opens at.
+        CARD + 8.0 + gap + 2.0 * button + self.footer_rows() as f32 * line
+    }
+
+    /// How many single-line messages sit under the controls right now.
+    fn footer_rows(&self) -> usize {
+        // The tray hint, which is always painted.
+        1 + usize::from(self.state.stream_to.is_some())
+            + usize::from(self.disconnected)
+            + usize::from(self.state.error.is_some())
+            + usize::from(self.state.stream_error.is_some())
+            + usize::from(self.list_error.is_some())
+            + usize::from(self.status_line.is_some())
     }
 }
 
@@ -978,7 +1051,9 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
-            .max_height(height.max(80.0))
+            // Clamped by the caller too, which needs to know the number it
+            // gets: the room left for everything else is measured against it.
+            .max_height(height.max(MIN_TRANSCRIPT))
             .show(ui, |ui| {
                 if self.state.transcript.is_empty() {
                     if self.state.mode == OutputMode::Type {
@@ -1147,7 +1222,16 @@ impl App {
 
     fn controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, running: bool) {
         let mut action: Option<Request> = None;
-        ui.horizontal(|ui| {
+        // What the press meant, for the presses whose meaning the daemon's
+        // reply does not carry. Applied after `send`, which writes the status
+        // line from that reply; see the end of this function.
+        let mut note: Option<(Severity, String)> = None;
+        // Wrapped, because this row holds a dozen controls and the window is
+        // 480 wide by default. A plain `horizontal` does not wrap, so
+        // everything past the edge was drawn outside the clip rectangle and
+        // simply never seen -- including the Clear button and the server
+        // address in the corner.
+        ui.horizontal_wrapped(|ui| {
             if running {
                 if ui.button("Stop").clicked() {
                     action = Some(Request::Stop);
@@ -1202,27 +1286,25 @@ impl App {
                     .save_file();
                 // Cancelling leaves the setting alone: closing a dialog is not
                 // a way of asking for anything.
-                //
-                // Nothing is put on the status line here. The daemon answers
-                // with a bare acknowledgement and `send` clears the line on
-                // one, so a message written now would be gone before the frame
-                // ended; the label under this row is what reports the target,
-                // and it stays.
                 if let Some(req) = stream_choice(chosen) {
+                    if let Request::SetStreamFile { path: Some(p) } = &req {
+                        note = Some((Severity::Ok, stream_chosen_note(p)));
+                    }
                     action = Some(req);
                 }
             }
-            // A bare verb, because it acts at once. Stopping is its own
+            // A bare verb, because it acts at once. Clearing is its own
             // control now that the button beside it always asks, and it is
-            // shown only while there is something to stop.
+            // shown only while there is a file set. "Clear" rather than
+            // "Stop": it cannot stop the session that is running, and while
+            // nothing is running there is no activity to stop either.
             if streaming
                 && ui
-                    .button("Stop streaming")
-                    .on_hover_text(
-                        "Stop appending to a file. Saving at the end still works.",
-                    )
+                    .button("Clear stream file")
+                    .on_hover_text(stream_clear_hover(running))
                     .clicked()
             {
+                note = Some((Severity::Ok, stream_cleared_note(running).to_string()));
                 action = Some(Request::SetStreamFile { path: None });
             }
 
@@ -1291,6 +1373,9 @@ impl App {
             {
                 action = Some(Request::Clear);
             }
+            // Right-aligned in whatever the row has left, which after
+            // wrapping is the end of its last line. It is not an action like
+            // its neighbours, and the corner is where an address belongs.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Shortened for the corner of a window; the full address is
                 // in the tooltip and in the edit field.
@@ -1315,37 +1400,52 @@ impl App {
         // written is worth reading without hovering, and in separate mode the
         // path that was chosen is not one of the files that gets written.
         if let Some(target) = self.state.stream_to.clone() {
+            let names = self.source_names();
             let targets =
-                stream_targets(&target, self.state.source_mode, &self.source_names());
-            if let Some(label) = stream_target_label(&targets) {
+                stream_targets(&target, self.state.source_mode, names.as_deref());
+            if let Some(label) = stream_target_label(&targets, running) {
                 ui.weak(label);
             }
         }
         ui.weak("Closing this window leaves dictation running in the tray.");
         if let Some(a) = action {
             self.send(a);
+            // After the dispatch, and only over a line the reply left empty.
+            // `send` fills the status line from what the daemon said, and for
+            // these presses that is a bare acknowledgement with nothing to
+            // report -- but a refusal must not be painted over with a
+            // confirmation of something that did not happen.
+            if self.status_line.is_none() {
+                self.status_line = note;
+            }
         }
     }
 
-    /// The selected sources under the names their files would take.
+    /// The selected sources under the names their files would take, or
+    /// `None` when this window cannot say.
     ///
-    /// `Source::short_label` is what `DaemonRuntime::start` hands to
-    /// `save::path_for_source`, so these are the names the split files
-    /// actually get. A key whose device has gone keeps the key, which is at
-    /// least something to recognise it by.
-    fn source_names(&self) -> Vec<String> {
-        self.state
+    /// `DaemonRuntime::start` resolves every remembered key against the
+    /// sources actually present, **skips the ones that have gone**, and only
+    /// then decides whether there is more than one to split the path between.
+    /// This window resolves against its own scan, which can be older, so it
+    /// may only speak when every selected key is accounted for. With a device
+    /// unplugged, two keys became two filenames here and one file there, so
+    /// neither of the names shown was ever written -- and an unresolved key
+    /// used to be turned into a filename of its own, which invented
+    /// `notes-alsa-input-usb-blue-microphones-yeti-st.txt` out of nothing.
+    ///
+    /// `short_labels` rather than `Source::short_label` one at a time, because
+    /// that is what the daemon uses and the two must name the same files.
+    fn source_names(&self) -> Option<Vec<String>> {
+        let resolved: Option<Vec<Source>> = self
+            .state
             .source_keys
             .iter()
-            .map(|k| {
-                self.sources
-                    .iter()
-                    .find(|s| &s.stable_key() == k)
-                    .map(|s| s.short_label())
-                    .unwrap_or_else(|| k.clone())
-            })
-            .collect()
+            .map(|k| self.sources.iter().find(|s| &s.stable_key() == k).cloned())
+            .collect();
+        resolved.map(|s| syrinx_audio::source::short_labels(&s))
     }
+
 }
 
 /// Accept a bare host, `host:port`, or a full URL, and produce a full one.
@@ -1412,7 +1512,19 @@ fn stream_choice(chosen: Option<PathBuf>) -> Option<Request> {
 /// per source and never writes the chosen path itself. The rule is
 /// `DaemonRuntime::start`'s, and has to stay the same one, or this names files
 /// that never appear.
-fn stream_targets(target: &str, mode: SourceMode, sources: &[String]) -> Vec<String> {
+///
+/// `None` for the sources means the window could not resolve every selected
+/// key, so it does not know how many files the daemon will open. The chosen
+/// path is then all there is to say honestly: it is at least the path the
+/// split is built from, where a guessed list of names is nothing at all.
+fn stream_targets(
+    target: &str,
+    mode: SourceMode,
+    sources: Option<&[String]>,
+) -> Vec<String> {
+    let Some(sources) = sources else {
+        return vec![target.to_string()];
+    };
     if mode != SourceMode::Separate || sources.len() < 2 {
         return vec![target.to_string()];
     }
@@ -1441,21 +1553,232 @@ fn stream_hover(running: bool) -> &'static str {
     }
 }
 
+/// Hover text for the control that clears the stream file.
+///
+/// It said "Stop appending to a file", which is a promise it cannot keep:
+/// `session::run` opens the writer once, at session start, from the options
+/// that session captured, so nothing sent now reaches a session already
+/// writing. The word is "clear" in both states, because that is what the
+/// button does in both -- while idle there is no activity to stop either, only
+/// a setting that says where the next session would write.
+fn stream_clear_hover(running: bool) -> &'static str {
+    if running {
+        "Clear the file the transcript is appended to.\n\
+         The file is opened when a session starts, so the session running\n\
+         now keeps writing to its own; this applies to the next one."
+    } else {
+        "Clear the file the transcript is appended to. Nothing is\n\
+         appended until a file is chosen again."
+    }
+}
+
+/// What the window says once a file has been chosen.
+///
+/// `rfd`'s `save_file()` raises the operating system's "replace this file?"
+/// prompt, and this code appends. Now that the dialog opens on every press
+/// that prompt is the ordinary path, so saying plainly that nothing is
+/// replaced is worth a line.
+fn stream_chosen_note(path: &str) -> String {
+    format!("Appending to {path}. Anything already in it is kept.")
+}
+
+/// What the window says once the file has been cleared.
+fn stream_cleared_note(running: bool) -> &'static str {
+    if running {
+        "The next session will not stream to a file. This one still is."
+    } else {
+        "No longer streaming to a file."
+    }
+}
+
 /// The target as it reads beneath the controls.
-fn stream_target_label(targets: &[String]) -> Option<String> {
+///
+/// Running or idle, because the two are different claims. The writer is opened
+/// at session start, so while a session runs this names the file the *next*
+/// one would open -- and a target changed mid-session would otherwise leave
+/// the window reading `Stream target: B.txt` while every fragment went to
+/// `A.txt`. The tooltip has always been careful about this; the label, which
+/// the design moved out of the tooltip precisely because it is the more
+/// visible surface, was not.
+fn stream_target_label(targets: &[String], running: bool) -> Option<String> {
+    let lead = if running { "Next session streams to" } else { "Stream target" };
     match targets {
         [] => None,
-        [one] => Some(format!("Stream target: {one}")),
-        many => Some(format!(
-            "Stream target, one file per source: {}",
-            many.join(", ")
-        )),
+        [one] => Some(format!("{lead}: {one}")),
+        many => Some(format!("{lead}, one file per source: {}", many.join(", "))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window with every control showing and nothing running.
+    ///
+    /// Built field by field rather than through `App::new`, which enumerates
+    /// audio devices and dials the daemon socket. Neither is anything to do
+    /// with how wide a row of buttons is.
+    fn app_showing_everything() -> App {
+        let config: Config = toml::from_str("token = ''").expect("a minimal config");
+        App {
+            config,
+            state: DaemonState {
+                // Separate mode with two sources is what shows Save split,
+                // and a stream target is what shows Clear stream file: the
+                // widest the row ever gets.
+                source_mode: SourceMode::Separate,
+                source_keys: vec!["a".into(), "b".into()],
+                stream_to: Some("/tmp/notes.txt".into()),
+                transcript: "something to save".into(),
+                ..DaemonState::default()
+            },
+            sources: Vec::new(),
+            save_format: save::Format::Plain,
+            last_poll: Instant::now(),
+            last_source_scan: Instant::now(),
+            disconnected: false,
+            status_line: None,
+            list_error: None,
+            url_edit: String::new(),
+            editing_url: false,
+            show_help: false,
+        }
+    }
+
+    #[test]
+    fn every_control_fits_inside_the_default_window() {
+        // The row holds a dozen controls and the default window is 480 wide.
+        // A plain `horizontal` does not wrap, so everything past the edge was
+        // laid out beyond the clip rectangle and never drawn -- the Clear
+        // button and the server address in the corner among them.
+        let ctx = egui::Context::default();
+        // The spacing is part of the answer: this theme sets its own button
+        // padding and item spacing.
+        theme::apply(&ctx);
+        let mut app = app_showing_everything();
+        let mut content = 0.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(WINDOW_WIDTH, 380.0),
+            )),
+            ..Default::default()
+        };
+        // A bare root `Ui`, which is what `eframe` hands `App::ui` -- no
+        // scroll area, so whatever is too wide is clipped away rather than
+        // reachable. Its width is set explicitly because a headless context
+        // with no window manager sizes its viewport to whatever it is given
+        // to lay out, which is the one thing this must not do.
+        let mut out = ctx.run_ui(input, |ui| {
+            ui.set_max_width(WINDOW_WIDTH);
+            let ctx = ui.ctx().clone();
+            app.controls(ui, &ctx, false);
+            content = ui.min_rect().width();
+        });
+        // A frame's font atlas has to be taken by whoever would upload it;
+        // dropping it unread is a panic in epaint, and nothing here draws --
+        // done before the assertions, because a panic while one is unwinding
+        // aborts the process and loses the message.
+        out.textures_delta.clear();
+
+        assert!(
+            content <= WINDOW_WIDTH,
+            "the controls are {content} wide in a window {WINDOW_WIDTH} across"
+        );
+
+        // And the server address is still in the right-hand corner. It is
+        // laid out right-to-left in whatever space the row has left, which is
+        // the part of this that wrapping could have spoiled.
+        let link = text_shape(&out.shapes, "127.0.0.1:8770")
+            .expect("the server address is not drawn at all");
+        assert!(
+            // A pixel of slack: a galley's box carries the last glyph's
+            // advance, which is not ink and is not what gets clipped.
+            link.right() <= WINDOW_WIDTH + 1.0,
+            "the server address runs off the window: {link:?}"
+        );
+        assert!(
+            link.left() > WINDOW_WIDTH / 2.0,
+            "the server address is no longer in the corner: {link:?}"
+        );
+    }
+
+    /// How deep into a window of `height` this app paints, once its layout
+    /// has settled.
+    fn painted_depth(app: &mut App, height: f32) -> f32 {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut bottom = 0.0;
+        // Twice: the first frame of any egui context lays out against sizes
+        // nothing has measured yet.
+        for _ in 0..2 {
+            // No poll and no rescan: this is about layout, and the daemon
+            // this window would talk to is whatever happens to be running on
+            // the machine running the test.
+            app.last_poll = Instant::now();
+            app.last_source_scan = Instant::now();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(WINDOW_WIDTH, height),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                ui.set_max_width(WINDOW_WIDTH);
+                ui.set_max_height(height);
+                app.window(ui);
+                bottom = ui.min_rect().bottom();
+            });
+            out.textures_delta.clear();
+        }
+        bottom
+    }
+
+    #[test]
+    fn nothing_the_window_paints_falls_off_the_bottom_of_it() {
+        // `eframe` hands `window` a bare root `Ui` with no scroll area, so a
+        // row that does not fit is clipped rather than scrolled -- and the
+        // room left below the transcript was a constant, settled before the
+        // stream target, the lost-fragment line and the status line existed.
+        // The rows at the end are the errors.
+        let mut app = app_showing_everything();
+        app.status_line = Some((Severity::Ok, "Saved to /tmp/a.txt".into()));
+        let depth = painted_depth(&mut app, WINDOW_HEIGHT);
+        assert!(
+            depth <= WINDOW_HEIGHT,
+            "{depth} painted into {WINDOW_HEIGHT} of window"
+        );
+
+        // And with every message showing at once. In a taller window,
+        // because at the size this one opens there is no room for six rows
+        // of message above a transcript that will not go below 80 pixels --
+        // which is not something a reserve can fix.
+        app.disconnected = true;
+        app.state.error = Some("the server closed the connection".into());
+        app.state.stream_error = Some("a fragment was not written".into());
+        app.list_error = Some("listing sources failed".into());
+        let tall = 620.0;
+        let depth = painted_depth(&mut app, tall);
+        assert!(depth <= tall, "{depth} painted into {tall} of window");
+    }
+
+    /// Where a piece of text was actually drawn, if it was drawn at all.
+    fn text_shape(
+        shapes: &[egui::epaint::ClippedShape],
+        want: &str,
+    ) -> Option<egui::Rect> {
+        fn walk(shape: &egui::Shape, want: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.job.text.contains(want) => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, want)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|c| walk(&c.shape, want))
+    }
 
     #[test]
     fn a_full_address_survives_untouched() {
@@ -1535,10 +1858,17 @@ mod tests {
     fn a_remembered_path_written_with_a_tilde_still_names_a_folder() {
         // The generated config documents `~/transcripts/notes.txt`, and no
         // shell has expanded it by the time it reaches a file dialog.
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap();
-        assert_eq!(stream_seed(Some("~/notes.txt"), "s").0, PathBuf::from(home));
+        //
+        // Asserted against the tilde rather than against `HOME`, which this
+        // used to read and unwrap: a test that requires the machine running it
+        // to have a variable set fails under `env -u HOME`, and what is
+        // actually being pinned is that no dialog is ever pointed at a folder
+        // literally called `~`.
+        let (folder, _) = stream_seed(Some("~/notes.txt"), "s");
+        assert!(
+            !folder.starts_with("~"),
+            "the tilde reached the dialog: {folder:?}"
+        );
     }
 
     #[test]
@@ -1563,7 +1893,7 @@ mod tests {
             stream_targets(
                 "/tmp/meeting.txt",
                 SourceMode::Separate,
-                &["Yeti".to_string(), "System audio".to_string()],
+                Some(&["Yeti".to_string(), "System audio".to_string()]),
             ),
             ["/tmp/meeting-yeti.txt", "/tmp/meeting-system-audio.txt"]
         );
@@ -1575,15 +1905,32 @@ mod tests {
         // source; the window has to say the same or it names files that never
         // appear.
         assert_eq!(
-            stream_targets("/tmp/meeting.txt", SourceMode::Separate, &["Yeti".into()]),
+            stream_targets(
+                "/tmp/meeting.txt",
+                SourceMode::Separate,
+                Some(&["Yeti".to_string()])
+            ),
             ["/tmp/meeting.txt"]
         );
         assert_eq!(
             stream_targets(
                 "/tmp/meeting.txt",
                 SourceMode::Combined,
-                &["Yeti".into(), "System audio".into()],
+                Some(&["Yeti".to_string(), "System audio".to_string()]),
             ),
+            ["/tmp/meeting.txt"]
+        );
+    }
+
+    #[test]
+    fn a_source_that_cannot_be_resolved_names_no_files_at_all() {
+        // The daemon skips a key whose device has gone and splits between
+        // what is left, so with one of two unplugged it opens a single file
+        // and this window named two -- neither of which was ever written. A
+        // label naming files nothing goes to is worse than no label, so when
+        // the count cannot be trusted only the chosen path is named.
+        assert_eq!(
+            stream_targets("/tmp/meeting.txt", SourceMode::Separate, None),
             ["/tmp/meeting.txt"]
         );
     }
@@ -1612,19 +1959,68 @@ mod tests {
 
     #[test]
     fn the_target_is_readable_without_hovering() {
-        let one = stream_target_label(&["/tmp/notes.txt".to_string()])
+        let one = stream_target_label(&["/tmp/notes.txt".to_string()], false)
             .expect("a chosen target has something to say");
         assert!(one.contains("/tmp/notes.txt"), "{one}");
 
-        let split = stream_target_label(&[
-            "/tmp/a-mic.txt".to_string(),
-            "/tmp/a-system-audio.txt".to_string(),
-        ])
+        let split = stream_target_label(
+            &[
+                "/tmp/a-mic.txt".to_string(),
+                "/tmp/a-system-audio.txt".to_string(),
+            ],
+            false,
+        )
         .unwrap();
         assert!(split.contains("/tmp/a-mic.txt"), "{split}");
         assert!(split.contains("/tmp/a-system-audio.txt"), "{split}");
 
-        assert_eq!(stream_target_label(&[]), None, "nothing set, nothing to say");
+        assert_eq!(
+            stream_target_label(&[], false),
+            None,
+            "nothing set, nothing to say"
+        );
+    }
+
+    #[test]
+    fn the_label_says_which_session_it_means() {
+        // The setting can be changed mid-session and the running session
+        // keeps the writer it opened, so a label that only stated the setting
+        // read "Stream target: B.txt" while every fragment went to A.txt.
+        let target = ["/tmp/b.txt".to_string()];
+        let running = stream_target_label(&target, true).unwrap();
+        let idle = stream_target_label(&target, false).unwrap();
+        assert!(running.contains("Next session"), "{running}");
+        assert_ne!(running, idle);
+        assert!(idle.contains("/tmp/b.txt") && running.contains("/tmp/b.txt"));
+    }
+
+    #[test]
+    fn clearing_the_file_promises_only_what_it_can_do() {
+        // It said "Stop appending to a file" while a session was running,
+        // which it cannot do: the writer is opened at session start and the
+        // running session keeps it.
+        let running = stream_clear_hover(true);
+        assert!(running.contains("next one"), "{running}");
+        assert!(
+            !running.contains("Stop"),
+            "it cannot stop the session running: {running}"
+        );
+        assert_ne!(running, stream_clear_hover(false));
+
+        let note = stream_cleared_note(true);
+        assert!(note.contains("next session"), "{note}");
+        assert_ne!(note, stream_cleared_note(false));
+    }
+
+    #[test]
+    fn a_chosen_file_is_confirmed_as_appended_to_and_not_replaced() {
+        // `rfd`'s save dialog raises the operating system's "replace this
+        // file?" prompt and this code appends. The dialog opens on every
+        // press now, so that prompt is the ordinary path.
+        let note = stream_chosen_note("/tmp/notes.txt");
+        assert!(note.contains("/tmp/notes.txt"), "{note}");
+        assert!(note.contains("Appending"), "{note}");
+        assert!(note.contains("kept"), "say the file survives: {note}");
     }
 
     #[test]
