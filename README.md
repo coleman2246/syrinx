@@ -225,6 +225,7 @@ recordings they were measured on:
 diarize_lag_chunks = 2          # chunks a commit waits for its label
 diarize_min_pool = 4            # agreeing windows before a new speaker is minted
 diarize_margin = 0.10           # how far the best voice must beat the second
+diarize_mint_ceiling = 0.55     # how close to a known voice a new one may sit
 diarize_change_threshold = 0.30 # how much the voice must change to end a turn
 diarize_relabel_window = 30     # seconds of transcript still open to correction
 ```
@@ -235,19 +236,33 @@ the wait off altogether. Dropping the pool to 3 gives a quiet participant a
 number three quarters of a second earlier, and risks the split this whole
 design is arranged to avoid — on the 87-minute meeting a pool of 3 found six
 speakers in a room of five, and a pool of 2 found twenty in a room of four.
-The three below them are newer and, unlike the two above, are **engineering
+The four below them are newer and, unlike the two above, are **engineering
 estimates rather than measurements** — they were chosen by reasoning from the
 numbers the AMI recordings gave and have not themselves been measured against
 a meeting.
 
 `diarize_margin` is how much clearer the best-matching voice has to be than
-the runner-up before the diarizer will commit to a name. Raising it does not
-make labels disappear: a voice it will not commit to is still named, as a
-guess a later correction may change. Setting it to **0** is the full retreat
-to the behaviour of every release before this one — it turns off the margin,
-the crowded-room test that goes with it, and the extra caution before a new
-speaker is minted, all three together, because it is no use as an escape hatch
-if any of them keeps running.
+the runner-up before the diarizer will commit to a name, and that is all it
+is. Raising it does not make labels disappear: a voice it will not commit to
+is still named, as a guess a later correction may change. Setting it to **0**
+is the full retreat to the behaviour of every release before this one — it
+turns off the margin, the crowded-room test that goes with it, and the extra
+caution before a new speaker is minted, all three together, because it is no
+use as an escape hatch if any of them keeps running. That is the one value at
+which it touches minting; at every other value minting is the next key's
+business alone.
+
+`diarize_mint_ceiling` is how close to somebody who already has a number a
+group of agreeing voices may sit and still be given a number of its own.
+Past it they are taken to be that person on bad audio, which is the split this
+whole design is arranged to avoid — a second label for one person carries text
+away and never gives it back. Raising it finds new speakers more readily in a
+crowded room and risks that split; lowering it finds fewer, and a new voice
+that is refused is offered an existing name as a guess rather than left blank.
+It is a cosine between an *average* of four windows and an existing voice,
+which is a different measurement on a different scale from `diarize_margin`,
+so the two do not move together and setting one says nothing about the other.
+Of all the numbers here it is the one most in need of being measured.
 
 `diarize_change_threshold` is how much the voice has to change between one
 three-quarter-second stretch and the next before the diarizer calls it a new
@@ -259,7 +274,7 @@ finishes one.
 `diarize_relabel_window` is how far back a correction may reach, and 0 sends
 none.
 
-All five keys are optional, all five are refused at startup if they are wildly
+All six keys are optional, all six are refused at startup if they are wildly
 out of range, and none is environment-overridable, for the same reason
 `diarize_model_dir` is not.
 

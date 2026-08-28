@@ -285,6 +285,7 @@ optional, range-validated at startup, not environment-overridable:
 
 ```toml
 diarize_margin = 0.10           # how far the best centroid must beat the second
+diarize_mint_ceiling = 0.55     # how close to an incumbent a pool's mean may mint
 diarize_change_threshold = 0.30 # cosine drop between hops that marks a turn
 diarize_relabel_window = 30     # seconds of transcript still eligible for correction
 ```
@@ -293,14 +294,20 @@ Starting values are engineering estimates, not measurements, and the probe work
 below exists to replace them. So are `T_MINT_MARGIN = 0.20`, `MAX_POOLS = 8`
 and `POOL_AGE = 64`, which have no keys of their own.
 
+`diarize_mint_ceiling` is a key rather than a derivation, and the correction
+below records why: this document specified the ceiling as `T_ASSIGN + margin`,
+which put one key in charge of two unrelated decisions and put the ceiling on
+the wrong scale to boot.
+
 **Every documented "off" has to be off.** `diarize_relabel_window = 0` disables
 relabelling entirely. `diarize_margin = 0` disables the margin, the cohort
 test and the mint ceiling together — the cohort test has no key of its own, so
 leaving it running would give a deployment reaching for the hatch no relief in
-the only room the hatch is for. `diarize_change_threshold = 0` is *checked
-for* rather than compared against, because different-speaker cosines are
-routinely negative (median 0.046) and no value of a plain `cosine < threshold`
-could ever mean "never".
+the only room the hatch is for, and the ceiling is switched off by a rule
+`may_mint` states rather than by the arithmetic that used to imply it.
+`diarize_change_threshold = 0` is *checked for* rather than compared against,
+because different-speaker cosines are routinely negative (median 0.046) and no
+value of a plain `cosine < threshold` could ever mean "never".
 
 ## Testing
 
@@ -393,14 +400,16 @@ the model that actually ran.
   number and already documented as out of scope. The refractory floor bounds
   how bad this can get: a spurious boundary costs at most the audio before the
   next one, and they cannot arrive faster than one per 0.768 s of speech.
-- **A crowded room is improved, not solved.** The mint gate's ceiling of
-  `T_ASSIGN + margin` is 0.55 at the shipped margin, and the spike measured the
-  two closest live centroids at 0.519 with only five speakers in the room. A
-  genuinely new voice whose pooled mean lands above 0.55 from an incumbent
-  still cannot be minted; what it gets instead is that incumbent's number as a
-  *guess*, which reads as a wrong label rather than as a gap. Whether that
+- **A crowded room is improved, not solved.** The mint gate's ceiling,
+  `T_MINT_CEILING`, is 0.55, and the spike measured the two closest live
+  centroids at 0.519 with only five speakers in the room. A genuinely new voice
+  whose pooled mean lands above 0.55 from an incumbent still cannot be minted;
+  what it gets instead is that incumbent's number as a *guess*, which reads as
+  a wrong label rather than as a gap. Whether that
   ceiling is in the right place is the single most important thing the live
-  probe has to answer.
+  probe has to answer — which is the other reason it is now a number of its
+  own, reachable from `diarize_mint_ceiling` and from `--mint-ceiling`, rather
+  than something only movable by changing what assignment does.
 
 ## Where this document was wrong
 
@@ -421,9 +430,23 @@ so the transcript is left permanently naming a speaker the session no longer
 has. The flaw is conceptual: **ambiguity between two incumbents is evidence of
 a bad or mixed embedding, not evidence of a new person**, and the rule treats
 it as novelty. The gate now asks whether the pooled group is more like itself
-than like anybody known, inside a ceiling of `T_ASSIGN + margin` which at
-margin 0 collapses onto the pre-2026-08-27 rule exactly. The mintable band
-narrows from `[0.45, 0.80)` to `[0.45, 0.55)`.
+than like anybody known, inside a ceiling which at margin 0 collapses onto the
+pre-2026-08-27 rule exactly. The mintable band narrows from `[0.45, 0.80)` to
+`[0.45, 0.55)`.
+
+**And that ceiling is `T_MINT_CEILING`, not `T_ASSIGN + margin`.** Deriving it
+from the assignment margin, as specified above, was wrong twice over. It gave
+`diarize_margin` two unrelated jobs pulling in opposite directions — the key is
+documented as assignment caution, so raising it to name people more carefully
+in a crowded room silently *widened* the band a pool could mint into, loosening
+the split protection measured at zero. And it put the ceiling on the wrong
+scale, which is the same error the paragraph below identifies on the cohesion
+side: `T_ASSIGN` and `T_MARGIN` were calibrated on one noisy window against a
+centroid, while what the ceiling compares is a mean of `MIN_POOL` windows
+against a centroid, and for one voice that sits far higher. The shipped ceiling
+is 0.55 either way, so nothing at the shipped settings changed; `margin = 0`
+still switches it off, now because `may_mint` says so rather than because
+`T_ASSIGN + 0` happened to make its clause unreachable.
 
 **"More like itself" has to be measured against the pool's own mean, on both
 sides.** The obvious reading — worst *pairwise* agreement among the members,
