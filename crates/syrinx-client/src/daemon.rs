@@ -2003,22 +2003,61 @@ mod tests {
             reaped_within_two_seconds(pid),
             "the replaced overlay {pid} was dropped rather than waited for"
         );
+        // Reaping the old one is only half of it: a `start_overlay` that
+        // cleared the slot and showed nothing would pass the assertion above
+        // and leave a typing session with no meter.
+        assert!(d.overlay.is_some(), "no overlay was shown to replace it");
         d.stop_overlay();
     }
 
-    /// A stand-in viewer that records its own pid and exits.
+    /// Removes what a test put in the temp directory, however the test ends.
+    ///
+    /// Cleanup written after the assertions runs only when they all pass,
+    /// which is the case where it matters least: it is the failing run that
+    /// leaves an executable script and a pid file behind for the next one.
+    #[cfg(unix)]
+    struct Removing(Vec<std::path::PathBuf>);
+
+    #[cfg(unix)]
+    impl Drop for Removing {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    /// Write a stand-in viewer that records its own pid and exits.
     ///
     /// `open_viewer` keeps no handle and passes no arguments, so the pid has
     /// to come from the process itself.
+    ///
+    /// Run once here before the test relies on it. `open_viewer` only warns
+    /// when a spawn fails, and the exec bit being set says nothing about
+    /// whether the exec is allowed -- a `/tmp` mounted `noexec` refuses it --
+    /// so without this the test would fail two seconds later with "never
+    /// reported its pid", which points at the daemon rather than at the mount.
     #[cfg(unix)]
-    fn viewer_reporting_its_pid(pid_file: &std::path::Path) -> std::path::PathBuf {
+    fn write_viewer_reporting_its_pid(script: &std::path::Path, pid_file: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
-        let p = scratch("viewer-script");
-        std::fs::write(&p, format!("#!/bin/sh\necho $$ > {}\n", pid_file.display()))
-            .expect("writing the stand-in viewer");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+        std::fs::write(
+            script,
+            format!("#!/bin/sh\necho $$ > {}\n", pid_file.display()),
+        )
+        .expect("writing the stand-in viewer");
+        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
             .expect("making the stand-in viewer executable");
-        p
+
+        let probe = std::process::Command::new(script).status();
+        assert!(
+            probe.as_ref().is_ok_and(|s| s.success()),
+            "the stand-in viewer {} could not be run ({probe:?}); a noexec {} does this",
+            script.display(),
+            std::env::temp_dir().display()
+        );
+        // The probe reported its own pid. Clear it, so what the test reads is
+        // the viewer the daemon starts rather than this run of the script.
+        let _ = std::fs::remove_file(pid_file);
     }
 
     /// The pid the stand-in viewer wrote, once it has written it. An empty
@@ -2042,8 +2081,10 @@ mod tests {
         // One per window ever opened, which is how fourteen of them were found
         // parented to a single long-running daemon.
         let pid_file = scratch("viewer-pid");
+        let script = scratch("viewer-script");
         let _ = std::fs::remove_file(&pid_file);
-        let script = viewer_reporting_its_pid(&pid_file);
+        let _cleanup = Removing(vec![script.clone(), pid_file.clone()]);
+        write_viewer_reporting_its_pid(&script, &pid_file);
         let mut d = daemon_holding(SessionState::default());
         d.opts.gui_command = Some(script.display().to_string());
 
@@ -2055,7 +2096,5 @@ mod tests {
             reaped_within_two_seconds(pid),
             "the viewer exited and was never waited for, leaving {pid} defunct"
         );
-        let _ = std::fs::remove_file(&script);
-        let _ = std::fs::remove_file(&pid_file);
     }
 }
