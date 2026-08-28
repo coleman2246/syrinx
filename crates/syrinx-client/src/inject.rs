@@ -203,20 +203,7 @@ fn paste(text: &str) -> Result<()> {
         .filter(|o| o.status.success())
         .map(|o| o.stdout);
 
-    let mut child = Command::new("wl-copy")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .context("running wl-copy")?;
-    {
-        use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .context("wl-copy stdin missing")?
-            .write_all(text.as_bytes())
-            .context("writing to wl-copy")?;
-    }
-    child.wait().context("waiting for wl-copy")?;
+    copy_to_clipboard(Command::new("wl-copy"), text.as_bytes())?;
 
     run(
         Command::new("wtype").args(["-M", "ctrl", "-k", "v", "-m", "ctrl"]),
@@ -228,18 +215,47 @@ fn paste(text: &str) -> Result<()> {
     // old clipboard instead.
     if let Some(prev) = previous {
         std::thread::sleep(std::time::Duration::from_millis(120));
-        if let Ok(mut c) = Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            use std::io::Write;
-            if let Some(stdin) = c.stdin.as_mut() {
-                let _ = stdin.write_all(&prev);
-            }
-            let _ = c.wait();
-        }
+        let _ = copy_to_clipboard(Command::new("wl-copy"), &prev);
     }
     Ok(())
+}
+
+/// Feed `bytes` to a clipboard tool on its stdin, waiting for it however it
+/// goes.
+///
+/// The wait is unconditional because every path here holds the `Child`: a `?`
+/// on the write would drop it, and a dropped handle is never waited for, so a
+/// `wl-copy` that cannot reach the compositor -- no `WAYLAND_DISPLAY`, a
+/// restarted compositor, a broken wl-clipboard -- would be left defunct. A
+/// failure to type is logged and the session goes on (see `session.rs`), so
+/// that is one defunct process per fragment spoken, several a minute, rather
+/// than one per session.
+///
+/// The command is a parameter rather than a name so a test can hand it one
+/// that fails; `wl-copy` is the only thing that reaches here in a real run.
+fn copy_to_clipboard(mut cmd: Command, bytes: &[u8]) -> Result<()> {
+    let what = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {what}"))?;
+    let written = write_to_stdin(&mut child, bytes).with_context(|| format!("writing to {what}"));
+    // `wait` closes stdin before it waits, so a tool still reading is told the
+    // input has ended rather than left to block against a handle we hold.
+    let waited = child.wait().with_context(|| format!("waiting for {what}"));
+    written?;
+    waited?;
+    Ok(())
+}
+
+/// Hand `bytes` to a child's stdin.
+///
+/// Its own function so its `?` returns to a caller that still has the child to
+/// wait for, which is the whole point of the split.
+fn write_to_stdin(child: &mut std::process::Child, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let stdin = child.stdin.as_mut().context("stdin missing")?;
+    Ok(stdin.write_all(bytes)?)
 }
 
 fn run(cmd: &mut Command, what: &str) -> Result<()> {
@@ -402,6 +418,53 @@ mod tests {
         let n = l.len();
         l.dedup();
         assert_eq!(l.len(), n);
+    }
+
+    /// Whether the kernel still holds a record of this process.
+    ///
+    /// Signal 0 checks permission without sending anything. A zombie answers
+    /// yes -- it stays in the table until someone reads its exit status -- and
+    /// that is the distinction the test below is about. It also leaves the
+    /// status where it is, which a `waitpid` would not: a test that reaped the
+    /// child itself could not tell whether the code under test had.
+    #[cfg(unix)]
+    fn still_in_the_process_table(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_clipboard_tool_that_fails_is_waited_for_rather_than_left_defunct() {
+        // A stand-in that exits without reading a byte, which is what wl-copy
+        // does when it cannot reach a compositor. It reports its own pid
+        // because nothing hands one back: the handle never leaves the code
+        // under test.
+        let pid_file =
+            std::env::temp_dir().join(format!("syrinx-copier-pid-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("echo $$ > {}", pid_file.display()));
+
+        // More than a pipe will buffer, so the write cannot quietly land in
+        // the buffer of a reader that has already gone: it blocks, the reader
+        // exits, and the failure is a broken pipe every time rather than
+        // sometimes.
+        let err = copy_to_clipboard(cmd, &vec![b'x'; 256 * 1024])
+            .expect_err("a tool that exits without reading fails the write");
+        assert!(
+            format!("{err:#}").contains("writing to sh"),
+            "expected the write to be what failed: {err:#}"
+        );
+
+        let reported = std::fs::read_to_string(&pid_file)
+            .expect("the stand-in never reported its pid; was `sh` runnable?");
+        let _ = std::fs::remove_file(&pid_file);
+        let pid: i32 = reported.trim().parse().expect("a pid from the stand-in");
+        assert!(
+            !still_in_the_process_table(pid),
+            "the copy failed and {pid} was never waited for, so it is defunct"
+        );
     }
 
     #[test]
