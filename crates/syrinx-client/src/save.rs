@@ -374,10 +374,33 @@ pub fn save_per_source(
 /// Default directory for saved transcripts.
 pub fn default_dir() -> PathBuf {
     // XDG_DOCUMENTS_DIR if the user has set one, else ~/Documents, else ~.
-    if let Ok(d) = std::env::var("XDG_DOCUMENTS_DIR") {
-        return PathBuf::from(d).join("syrinx");
+    default_dir_from(
+        std::env::var("XDG_DOCUMENTS_DIR").ok().as_deref(),
+        std::env::var("HOME")
+            // Windows sets neither HOME nor XDG anything, which is exactly
+            // where the "ask me where to save" dialog matters most.
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The body of [`default_dir`], with the environment handed in.
+///
+/// Separated to be testable: the answer depends on two variables, and a test
+/// that set them would be setting them for every other test in the process.
+fn default_dir_from(documents: Option<&str>, home: Option<&str>) -> PathBuf {
+    // A documents directory that has been moved or deleted is worse than
+    // none: the dialog opens somewhere arbitrary, and every save silently
+    // rebuilds a tree under a path the user abandoned. The dialog seed
+    // applies exactly this test to the folder it remembers.
+    if let Some(d) = documents.map(PathBuf::from).filter(|d| d.is_dir()) {
+        return d.join("syrinx");
     }
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    // "." is the last resort and a poor one -- it is relative to whatever
+    // working directory this process inherited -- but there is nothing else
+    // to say when the system will not name a home.
+    let home = PathBuf::from(home.unwrap_or("."));
     let docs = home.join("Documents");
     if docs.is_dir() {
         docs.join("syrinx")
@@ -639,6 +662,51 @@ mod tests {
         assert!(!is_stamp("2026-08-20_09-14-0x"), "letters are not digits");
         assert!(!is_stamp("2026:08:20_09-14-03"), "separators are part of it");
         assert!(!is_stamp("notes"));
+    }
+
+    #[test]
+    fn a_documents_folder_that_has_gone_is_not_offered() {
+        // `XDG_DOCUMENTS_DIR` outlives the directory it names. Returning it
+        // unchecked opens the dialog somewhere arbitrary and rebuilds a tree
+        // under a path the user abandoned -- the very thing the `.is_dir()`
+        // test on the remembered folder exists to prevent.
+        let home = tmp("defaultdir-home");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let gone = home.join("no-such-documents");
+        assert_eq!(
+            default_dir_from(
+                Some(&gone.display().to_string()),
+                Some(&home.display().to_string())
+            ),
+            home.join("syrinx")
+        );
+
+        let docs = home.join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        assert_eq!(
+            default_dir_from(
+                Some(&docs.display().to_string()),
+                Some(&home.display().to_string())
+            ),
+            docs.join("syrinx")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_home_that_is_only_in_userprofile_is_still_a_home() {
+        // Windows sets USERPROFILE and not HOME. `config::expand_tilde` has
+        // always known that and this did not, so the answer there was
+        // `./syrinx` -- relative to whatever working directory the daemon
+        // happened to hand the GUI it spawned.
+        let home = tmp("defaultdir-windows");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let dir = default_dir_from(None, Some(&home.display().to_string()));
+        assert_eq!(dir, home.join("syrinx"));
+        assert!(dir.is_absolute(), "{dir:?} points at nothing in particular");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
