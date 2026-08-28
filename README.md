@@ -140,10 +140,28 @@ reads lines, not paragraphs. `plain` is prose and names the speaker once,
 where the turn starts, because repeating it every time somebody drew breath
 would wreck the reading.
 
-The one thing no format can attribute is the start of a session, before any
-voice has been given a number. Those lines arrive bare and stay that way: the
-streamed file is written as it is spoken, so the first label to arrive is
-never applied backwards over what is already on disk.
+The start of a session is the hard case, because a voice has to be heard for
+several seconds before it can be given a number, and the words are on screen
+long before that. When the name arrives the server sends a correction, and the
+lines that had none acquire it — on screen, and in whatever **Save as…**
+writes.
+
+**A file written by `stream_to` never gets that correction**, and the
+difference is deliberate rather than an oversight. That file is written as the
+words are spoken and flushed sentence by sentence, so that a crash at minute
+forty costs the last line and not the meeting; nothing can be taken back out
+of it afterwards. It therefore keeps the honest record of what was known live,
+with the opening lines bare, while the saved file and the screen carry the
+corrected attribution. If you want one file with the corrections in it, use
+**Save as…** at the end; if you want one that survives the machine going away,
+use `stream_to`; there is no reason not to use both.
+
+Corrections can be switched off entirely, if text acquiring a speaker's name a
+few seconds after it appears reads worse to you than a gap:
+
+```toml
+diarize_relabel_window = 0   # seconds of transcript still open to correction
+```
 
 ### Asking is not receiving
 
@@ -186,8 +204,11 @@ Both of those numbers are settings, in case your meetings disagree with the
 recordings they were measured on:
 
 ```toml
-diarize_lag_chunks = 2    # chunks a commit waits for its label
-diarize_min_pool = 4      # agreeing windows before a new speaker is minted
+diarize_lag_chunks = 2          # chunks a commit waits for its label
+diarize_min_pool = 4            # agreeing windows before a new speaker is minted
+diarize_margin = 0.10           # how far the best voice must beat the second
+diarize_change_threshold = 0.30 # how much the voice must change to end a turn
+diarize_relabel_window = 30     # seconds of transcript still open to correction
 ```
 
 Dropping the lag to 1 hands text over half a second sooner and pays for it at
@@ -196,8 +217,19 @@ the wait off altogether. Dropping the pool to 3 gives a quiet participant a
 number three quarters of a second earlier, and risks the split this whole
 design is arranged to avoid — on the 87-minute meeting a pool of 3 found six
 speakers in a room of five, and a pool of 2 found twenty in a room of four.
-Both keys are optional, both are refused at startup if they are wildly out of
-range, and neither is environment-overridable, for the same reason
+The three below them are newer and, unlike the two above, are **engineering
+estimates rather than measurements** — they were chosen by reasoning from the
+numbers the AMI recordings gave and have not themselves been measured against
+a meeting. `diarize_margin` is how much clearer the best-matching voice has to
+be than the runner-up before anybody is named; raising it says less and guesses
+less, and 0 is the behaviour of every release before this one.
+`diarize_change_threshold` is how much the voice has to change between one
+three-quarter-second stretch and the next before the diarizer calls it a new
+turn; 0 never does. `diarize_relabel_window` is how far back a correction may
+reach, and 0 sends none.
+
+All five keys are optional, all five are refused at startup if they are wildly
+out of range, and none is environment-overridable, for the same reason
 `diarize_model_dir` is not.
 
 What has *not* been measured is the caveat worth carrying. No split (one

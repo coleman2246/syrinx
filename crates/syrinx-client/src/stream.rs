@@ -256,6 +256,7 @@ mod tests {
 
     fn seg(at: f64, text: &str) -> Segment {
         Segment {
+            seq: None,
             at,
             text: text.into(),
             source: None,
@@ -265,6 +266,7 @@ mod tests {
 
     fn seg_spk(at: f64, text: &str, speaker: Option<u32>) -> Segment {
         Segment {
+            seq: None,
             at,
             text: text.into(),
             source: None,
@@ -350,6 +352,7 @@ mod tests {
         let p = scratch("speakers");
         let mut w = StreamWriter::open(&p, Format::Labelled).unwrap();
         let mk = |at: f64, text: &str, src: &str| Segment {
+            seq: None,
             at,
             text: text.into(),
             source: Some(src.into()),
@@ -385,6 +388,7 @@ mod tests {
         let p = scratch("labelled");
         let mut w = StreamWriter::open(&p, Format::Labelled).unwrap();
         w.append(&Segment {
+            seq: None,
             at: 0.0,
             text: "hello".into(),
             source: Some("Yeti".into()),
@@ -505,6 +509,7 @@ mod tests {
         // speaker, and one microphone can carry several people.
         let p = scratch("spk-gap-labelled");
         let mk = |at: f64, text: &str, speaker: Option<u32>| Segment {
+            seq: None,
             at,
             text: text.into(),
             source: Some("Yeti".into()),
@@ -565,6 +570,7 @@ mod tests {
         // numbering there for the same reason.
         let p = scratch("spk-source");
         let mk = |at: f64, text: &str, src: &str, speaker: Option<u32>| Segment {
+            seq: None,
             at,
             text: text.into(),
             source: Some(src.into()),
@@ -617,6 +623,7 @@ mod tests {
         // rather than within one.
         let p = scratch("two-writers");
         let mk = |at: f64, text: &str, src: &str| Segment {
+            seq: None,
             at,
             text: text.into(),
             source: Some(src.into()),
@@ -640,6 +647,72 @@ mod tests {
             out.ends_with("no we don't and Friday"),
             "the mic's continuation should land after the system's line: {out:?}"
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_relabel_never_reaches_the_streamed_file() {
+        // The divergence this design accepted on purpose, from the side that
+        // would have had to do the rewriting.
+        //
+        // A speaker needs several agreeing windows before the server can mint
+        // them, so a session's opening lines are committed with nobody's name
+        // on them and `transcript.relabel` fills them in afterwards. The GUI
+        // applies that and Save-as writes it, because both render from the
+        // in-memory segments. This file does not: it is opened for append and
+        // flushed per fragment, so what is on disk cannot be taken back, and
+        // taking it back is exactly what a correction would mean here.
+        //
+        // What that buys is the property the tear test rests on -- one writer,
+        // one direction, nothing seeking backwards -- and an honest record of
+        // what was known live. The README's paragraph about session-opening
+        // lines staying unattributed remains true, and true of this file
+        // specifically, which is where its reasoning came from.
+        //
+        // There is no API to call: `StreamWriter::append` takes a segment and
+        // there is no `relabel`. So the test is that correcting the segments
+        // and streaming them again produces a *different* file from the one
+        // the live session wrote -- and that the live file is byte-for-byte
+        // what it was before the correction arrived.
+        let p = scratch("relabel");
+        let mut segs = vec![
+            crate::session::Segment {
+                at: 0.0,
+                text: "we ship Thursday".into(),
+                source: None,
+                speaker: None,
+                seq: Some(1),
+            },
+            crate::session::Segment {
+                at: 0.6,
+                text: " or Friday".into(),
+                source: None,
+                speaker: None,
+                seq: Some(2),
+            },
+        ];
+        let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
+        for seg in &segs {
+            w.append(seg).unwrap();
+        }
+        drop(w);
+        let live = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(live, "[00:00] we ship Thursday or Friday");
+
+        // The correction arrives and is applied to the in-memory segments.
+        assert!(crate::session::apply_relabel(&mut segs, 1, 2, 1));
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            live,
+            "the streamed file moved under a correction"
+        );
+
+        // And it really was a correction with something to say: rendering the
+        // corrected segments gives a different, better-attributed file, which
+        // is what Save-as writes.
+        let saved = crate::save::render(&segs, "", Format::Timestamped);
+        assert_eq!(saved, "[00:00] Speaker 1: we ship Thursday or Friday");
+        assert_ne!(saved, live);
         let _ = std::fs::remove_file(&p);
     }
 

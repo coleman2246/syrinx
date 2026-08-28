@@ -587,6 +587,7 @@ mod tests {
 
     fn seg(at: f64, text: &str) -> Segment {
         Segment {
+            seq: None,
             at,
             text: text.into(),
             source: None,
@@ -596,6 +597,7 @@ mod tests {
 
     fn seg_src(at: f64, text: &str, src: &str) -> Segment {
         Segment {
+            seq: None,
             at,
             text: text.into(),
             source: Some(src.into()),
@@ -605,6 +607,7 @@ mod tests {
 
     fn seg_spk(at: f64, text: &str, speaker: Option<u32>) -> Segment {
         Segment {
+            seq: None,
             at,
             text: text.into(),
             source: None,

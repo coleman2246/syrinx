@@ -56,6 +56,45 @@ pub struct Segment {
     pub source: Option<String>,
     /// Anonymous speaker from the server's diarizer, when one ran.
     pub speaker: Option<u32>,
+    /// The `seq` of the transcript message this came from, so a later
+    /// `transcript.relabel` naming a range of seqs can find it.
+    ///
+    /// `None` for a segment that did not come from a commit -- a revision
+    /// rewrites the tail, and its replacement is nobody's commit -- and for one
+    /// read back from a state file written before corrections existed. Omitted
+    /// from the wire when absent, for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+}
+
+/// Give `from_seq..=to_seq` a speaker, reporting whether anything moved.
+///
+/// The client half of `transcript.relabel`. A voice needs several agreeing
+/// windows before the server can mint it, so a turn's opening sentences are
+/// committed before anyone can be named for them; this is where the name
+/// catches up. It changes attribution and never text, which is what makes it
+/// safe to apply to a buffer somebody is reading.
+///
+/// A free function rather than a branch inside the reader loop because the
+/// reader is a spawned task inside an async session and this is the part worth
+/// testing. Segments carry their commit's `seq`, so the range is matched
+/// exactly rather than by counting backwards from the end the way a revision
+/// has to.
+///
+/// Deliberately *not* mirrored into the streamed file: `StreamWriter` is
+/// append-only and keeps the honest record of what was known live, while these
+/// segments -- which the GUI paints and Save-as writes -- carry the corrected
+/// attribution. That divergence is the design's, and `stream.rs` proves the
+/// writer ignores corrections rather than leaving it to be believed.
+pub fn apply_relabel(segments: &mut [Segment], from_seq: u64, to_seq: u64, speaker: u32) -> bool {
+    let mut moved = false;
+    for seg in segments {
+        if seg.seq.is_some_and(|s| s >= from_seq && s <= to_seq) && seg.speaker != Some(speaker) {
+            seg.speaker = Some(speaker);
+            moved = true;
+        }
+    }
+    moved
 }
 
 /// Everything a front-end needs to render. Cheap to clone.
@@ -438,14 +477,15 @@ async fn run(
         while let Some(Ok(msg)) = rx.next().await {
             let Ws::Text(t) = msg else { continue };
             match serde_json::from_str::<ServerMessage>(&t) {
-                Ok(ServerMessage::TranscriptCommit { text, speaker, .. })
-                | Ok(ServerMessage::TranscriptProvisional { text, speaker, .. }) => {
+                Ok(ServerMessage::TranscriptCommit { seq, text, speaker })
+                | Ok(ServerMessage::TranscriptProvisional { seq, text, speaker }) => {
                     if mode.types_at_cursor()
                         && let Err(e) = inject::type_text(&text, inject_method)
                     {
                         error!("failed to type {text:?}: {e:#}");
                     }
                     let seg = Segment {
+                        seq: Some(seq),
                         at: started.elapsed().as_secs_f64(),
                         text: text.clone(),
                         source: label.clone(),
@@ -489,6 +529,7 @@ async fn run(
                         }
                     }
                     s.segments.push(Segment {
+                        seq: None,
                         at: started.elapsed().as_secs_f64(),
                         text: text.clone(),
                         source: label.clone(),
@@ -500,6 +541,22 @@ async fn run(
                     s.changes += 1;
                     drop(s);
                     n();
+                }
+                Ok(ServerMessage::TranscriptRelabel {
+                    from_seq,
+                    to_seq,
+                    speaker,
+                }) => {
+                    // Attribution only: not a character of text moves, so this
+                    // is safe to apply under a reader's eyes in a way a
+                    // revision would not be. The streamed file is deliberately
+                    // not told -- see `apply_relabel`.
+                    let mut s = st.lock().expect("state lock poisoned");
+                    if apply_relabel(&mut s.segments, from_seq, to_seq, speaker) {
+                        s.changes += 1;
+                        drop(s);
+                        n();
+                    }
                 }
                 Ok(ServerMessage::SessionClosed { .. }) => break,
                 Ok(ServerMessage::Error { code, message, .. }) => {
@@ -627,6 +684,100 @@ mod tests {
         assert_eq!(
             merged.error.as_deref(),
             Some("connecting to the server: refused")
+        );
+    }
+
+    // ------------------------------------------------------------ relabels
+
+    /// Segments as a commit stream would produce them: `seq` counting from 1,
+    /// one second apart, unattributed unless the caller says otherwise.
+    fn committed(speakers: &[Option<u32>]) -> Vec<Segment> {
+        speakers
+            .iter()
+            .enumerate()
+            .map(|(i, speaker)| Segment {
+                at: i as f64,
+                text: format!("fragment {i} "),
+                source: None,
+                speaker: *speaker,
+                seq: Some(i as u64 + 1),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_relabel_names_the_segments_in_its_range_and_no_others() {
+        let mut segs = committed(&[None, None, None, Some(2)]);
+        assert!(apply_relabel(&mut segs, 1, 2, 1));
+        assert_eq!(
+            segs.iter().map(|s| s.speaker).collect::<Vec<_>>(),
+            vec![Some(1), Some(1), None, Some(2)]
+        );
+    }
+
+    #[test]
+    fn a_relabel_changes_attribution_and_never_a_character_of_text() {
+        // What makes it safe to apply to a buffer somebody is reading, and the
+        // whole reason it is not `transcript.revise`.
+        let before = committed(&[None, None]);
+        let mut after = before.clone();
+        apply_relabel(&mut after, 1, 2, 3);
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(a.text, b.text);
+            assert_eq!(a.at, b.at);
+            assert_eq!(a.source, b.source);
+            assert_eq!(a.seq, b.seq);
+        }
+    }
+
+    #[test]
+    fn a_relabel_for_seqs_this_client_never_saw_moves_nothing() {
+        // A viewer can join late, or have dropped frames, or be looking at a
+        // merged view where another source's session numbered its own commits.
+        let mut segs = committed(&[None, None]);
+        assert!(!apply_relabel(&mut segs, 90, 99, 1));
+        assert!(segs.iter().all(|s| s.speaker.is_none()));
+    }
+
+    #[test]
+    fn a_relabel_that_agrees_with_what_is_there_reports_no_change() {
+        // The return value drives a repaint, so a correction that corrects
+        // nothing must not cause one.
+        let mut segs = committed(&[Some(1), Some(1)]);
+        assert!(!apply_relabel(&mut segs, 1, 2, 1));
+    }
+
+    #[test]
+    fn a_segment_with_no_seq_is_never_relabelled() {
+        // A revision's replacement segment is nobody's commit, and neither is
+        // anything read back from a state file written before corrections
+        // existed. A relabel has no way to know which commit either belongs
+        // to, so it leaves both alone rather than guessing by position.
+        let mut segs = committed(&[None, None]);
+        segs[0].seq = None;
+        assert!(apply_relabel(&mut segs, 0, 99, 1));
+        assert_eq!(
+            segs.iter().map(|s| s.speaker).collect::<Vec<_>>(),
+            vec![None, Some(1)]
+        );
+    }
+
+    #[test]
+    fn a_relabel_reaches_the_saved_transcript() {
+        // Save-as renders from these segments, so corrected attribution is
+        // what lands in the file the user keeps. The other half of the
+        // divergence -- that the streamed file does not move -- is stated in
+        // `stream.rs`, from the side that would have had to do the moving.
+        let mut segs = committed(&[None, None]);
+        segs[1].at = 0.5;
+        assert_eq!(
+            crate::save::render(&segs, "", crate::save::Format::Plain),
+            "fragment 0 fragment 1"
+        );
+        apply_relabel(&mut segs, 1, 2, 1);
+        assert_eq!(
+            crate::save::render(&segs, "", crate::save::Format::Plain),
+            "Speaker 1: fragment 0 fragment 1"
         );
     }
 

@@ -831,6 +831,7 @@ mod stream_tests {
         let dir = std::env::temp_dir().join(format!("syrinx-cli-split-{}", std::process::id()));
         let base = dir.join("meeting.txt");
         let seg = |at: f64, text: &str, source: &str| syrinx_client::session::Segment {
+            seq: None,
             at,
             text: text.into(),
             source: Some(source.into()),
