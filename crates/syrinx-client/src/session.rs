@@ -8,6 +8,7 @@ use crate::inject;
 use crate::mode::OutputMode;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
+use syrinx_audio::mixer::{STARVE_AFTER, SourceHealth};
 use syrinx_audio::{Capture, Source};
 use syrinx_proto::{ClientMessage, Encoding, SAMPLE_RATE, ServerMessage};
 use std::sync::{Arc, Mutex};
@@ -84,6 +85,13 @@ pub struct SessionState {
     /// is receiving sound rather than only that it is running.
     pub levels: Vec<f32>,
     pub rms: f32,
+    /// What each selected source is contributing, one row per source.
+    ///
+    /// `levels` and `rms` above are measured downstream of the mixer, so with
+    /// two sources they say nothing about which of the two is carrying
+    /// anything -- a session with a live microphone and a dead loopback looks
+    /// exactly like one with both live. These are taken upstream, per source.
+    pub sources: Vec<SourceHealth>,
     /// How many times `transcript` and `segments` have moved.
     ///
     /// Read by the daemon on every tick to answer "has the transcript
@@ -117,6 +125,7 @@ impl SessionState {
             error: self.error.clone(),
             levels: self.levels.clone(),
             rms: self.rms,
+            sources: self.sources.clone(),
             changes: self.changes,
         }
     }
@@ -165,6 +174,11 @@ pub fn merge_states(states: &[SessionState]) -> SessionState {
         // than one real one.
         levels: states.first().map(|s| s.levels.clone()).unwrap_or_default(),
         rms: states.first().map(|s| s.rms).unwrap_or(0.0),
+        // Concatenated rather than folded. Separate mode runs one session per
+        // source and each knows only about its own, so the merged view is
+        // every session's rows in selection order -- which is exactly the one
+        // row per selected source a viewer needs.
+        sources: states.iter().flat_map(|s| s.sources.clone()).collect(),
         last_fragment: states
             .iter()
             .map(|s| s.last_fragment.clone())
@@ -390,26 +404,29 @@ async fn run(
 
     // Either the caller feeds us, or we open a device ourselves. The rest of
     // the session cannot tell the difference: it only ever sees a receiver.
-    let (_capture, mut audio_rx): (Option<Box<dyn std::any::Any + Send>>, _) =
+    //
+    // The mixer's own view of each source comes out here too, because the
+    // capture itself disappears behind `dyn Any` a line later and the levels
+    // that matter are the ones taken before everything was averaged together.
+    type Capt = Option<Box<dyn std::any::Any + Send>>;
+    let (_capture, mut audio_rx, mixed): (Capt, _, Option<syrinx_audio::mixer::Health>) =
         match opts.external_audio.take() {
-            Some(rx) => (None, rx),
+            Some(rx) => (None, rx, None),
             None => {
                 let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(32);
                 // One source opens directly; several are mixed. A single source
                 // through the mixer would work but adds a queue and a timer for
                 // nothing.
-                let cap: Box<dyn std::any::Any + Send> = if opts.sources.len() == 1 {
-                    Box::new(
-                        Capture::start(&opts.sources[0], audio_tx)
-                            .context("starting audio capture")?,
-                    )
+                if opts.sources.len() == 1 {
+                    let cap = Capture::start(&opts.sources[0], audio_tx)
+                        .context("starting audio capture")?;
+                    (Some(Box::new(cap) as _), audio_rx, None)
                 } else {
-                    Box::new(
-                        syrinx_audio::mixer::MixedCapture::start(&opts.sources, audio_tx)
-                            .context("starting the combined capture")?,
-                    )
-                };
-                (Some(cap), audio_rx)
+                    let cap = syrinx_audio::mixer::MixedCapture::start(&opts.sources, audio_tx)
+                        .context("starting the combined capture")?;
+                    let health = cap.health();
+                    (Some(Box::new(cap) as _), audio_rx, Some(health))
+                }
             }
         };
     info!(
@@ -523,11 +540,36 @@ async fn run(
     // stream the server receives rather than a second capture of the same
     // device.
     let mut window: Vec<f32> = Vec::with_capacity(4096);
+
+    // A single source has no mixer to ask, so its row is assembled from the
+    // metering below. Caller-supplied audio has no device behind it at all and
+    // reports no rows.
+    let solo = (mixed.is_none() && opts.sources.len() == 1).then(|| opts.sources[0].short_label());
+    let mut last_audio = std::time::Instant::now();
+    // On a timer rather than only when a chunk lands: a source going quiet is
+    // exactly what these rows exist to report, and a session whose only source
+    // died would otherwise never publish the fact.
+    let mut health_tick = tokio::time::interval(std::time::Duration::from_millis(200));
+
     loop {
         tokio::select! {
             _ = &mut stop_rx => break,
+            _ = health_tick.tick() => {
+                let mut s = state.lock().expect("state lock poisoned");
+                let rows = match (&mixed, &solo) {
+                    (Some(h), _) => h.read(),
+                    (None, Some(label)) => vec![SourceHealth {
+                        label: label.clone(),
+                        rms: s.rms,
+                        silent: last_audio.elapsed() >= STARVE_AFTER,
+                    }],
+                    (None, None) => Vec::new(),
+                };
+                s.sources = rows;
+            }
             chunk = audio_rx.recv() => match chunk {
                 Some(samples) => {
+                    last_audio = std::time::Instant::now();
                     window.extend_from_slice(&samples);
                     if window.len() > 4096 {
                         let excess = window.len() - 4096;
@@ -630,6 +672,37 @@ mod tests {
         assert_eq!(
             merged.error.as_deref(),
             Some("connecting to the server: refused")
+        );
+    }
+
+    #[test]
+    fn a_merge_keeps_a_meter_row_for_every_source() {
+        // Separate mode runs a session per source and each knows only about
+        // its own, so a merge that took the first session's rows -- as it does
+        // for `levels` -- would leave the second source unmetered everywhere,
+        // which is the state that made this invisible in the first place.
+        let row = |label: &str, silent: bool| syrinx_audio::mixer::SourceHealth {
+            label: label.into(),
+            rms: 0.3,
+            silent,
+        };
+        let merged = merge_states(&[
+            SessionState {
+                sources: vec![row("Yeti", false)],
+                ..Default::default()
+            },
+            SessionState {
+                sources: vec![row("System audio", true)],
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(
+            merged
+                .sources
+                .iter()
+                .map(|s| (s.label.as_str(), s.silent))
+                .collect::<Vec<_>>(),
+            [("Yeti", false), ("System audio", true)]
         );
     }
 

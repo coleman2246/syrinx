@@ -161,7 +161,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         sessions: Vec::new(),
         overlay: None,
         file_job: None,
-        preview: None,
+        previews: Vec::new(),
         last_viewer: None,
         last: Default::default(),
         // One rather than zero, so the first tick's token cannot match the
@@ -457,10 +457,15 @@ struct DaemonRuntime {
     sessions: Vec<SessionHandle>,
     /// The level overlay, shown only for typing sessions.
     overlay: Option<std::process::Child>,
-    /// Live level meter, running only while idle and only while a viewer is
-    /// watching. Holding a capture open otherwise would keep a microphone
-    /// active for no reason.
-    preview: Option<crate::preview::Preview>,
+    /// Live level meters, one per selected source, running only while idle and
+    /// only while a viewer is watching. Holding a capture open otherwise would
+    /// keep a microphone active for no reason.
+    ///
+    /// One each rather than one for the first: metering only
+    /// `source_keys.first()` meant the second source was never metered
+    /// anywhere at any time, idle or running, which is precisely the question
+    /// somebody with two sources selected is asking.
+    previews: Vec<crate::preview::Preview>,
     /// When a viewer last asked for state. Metering stops shortly after the
     /// last one closes.
     last_viewer: Option<std::time::Instant>,
@@ -548,32 +553,43 @@ impl DaemonRuntime {
         let want = watched && !self.running();
 
         if !want {
-            self.preview = None;
+            self.previews.clear();
             return;
         }
 
-        let key = self.opts.source_keys.first().cloned();
-        // Re-point when the selection changes, so the meter always shows what
-        // pressing Start would actually record.
-        let stale = match (&self.preview, &key) {
-            (Some(p), Some(k)) => &p.source_key != k,
-            (Some(_), None) => true,
-            (None, _) => true,
+        let keys = self.opts.source_keys.clone();
+        let current: Vec<String> = self.previews.iter().map(|p| p.source_key.clone()).collect();
+        // Re-point when the selection changes, so the meters always show what
+        // pressing Start would actually record. With nothing selected the
+        // meter falls back to whatever `choose_source` would pick, and the
+        // comparison cannot be made against an empty list -- doing so tore the
+        // preview down and rebuilt it on every tick.
+        let stale = if keys.is_empty() {
+            self.previews.is_empty()
+        } else {
+            current != keys
         };
         if !stale {
             return;
         }
 
-        self.preview = None;
+        self.previews.clear();
         let Ok(sources) = list_sources() else { return };
-        let Ok(source) = choose_source(&sources, key.as_deref()) else {
-            return;
+        let wanted: Vec<Option<&str>> = if keys.is_empty() {
+            vec![None]
+        } else {
+            keys.iter().map(|k| Some(k.as_str())).collect()
         };
-        match crate::preview::Preview::start(&source) {
-            Ok(p) => self.preview = Some(p),
-            // A source that cannot be metered is not fatal; Start will report
-            // the real error.
-            Err(e) => warn!("could not meter {}: {e:#}", source.display()),
+        for key in wanted {
+            let Ok(source) = choose_source(&sources, key) else {
+                continue;
+            };
+            match crate::preview::Preview::start(&source) {
+                Ok(p) => self.previews.push(p),
+                // A source that cannot be metered is not fatal; Start will
+                // report the real error.
+                Err(e) => warn!("could not meter {}: {e:#}", source.display()),
+            }
         }
     }
 
@@ -666,11 +682,12 @@ impl DaemonRuntime {
         }
         // Preview levels apply only when idle; a running session meters the
         // audio it is actually sending.
-        if !self.running()
-            && let Some(p) = &self.preview
-        {
-            out.levels = p.levels().to_vec();
-            out.rms = p.rms();
+        if !self.running() && !self.previews.is_empty() {
+            let first = &self.previews[0];
+            out.levels = first.levels().to_vec();
+            out.rms = first.rms();
+            // Every source, not only the one the spectrum above is showing.
+            out.sources = self.previews.iter().map(|p| p.health()).collect();
         }
         out
     }
@@ -1078,7 +1095,7 @@ mod tests {
             },
             sessions: Vec::new(),
             overlay: None,
-            preview: None,
+            previews: Vec::new(),
             last_viewer: None,
             file_job: None,
             last,
@@ -1351,10 +1368,19 @@ mod tests {
             error: Some("boom".into()),
             levels: vec![0.5; 10],
             rms: 0.25,
+            sources: vec![syrinx_audio::mixer::SourceHealth {
+                label: "Yeti".into(),
+                rms: 0.4,
+                silent: false,
+            }],
             changes: 7,
         };
         let live = full.live();
         assert!(live.transcript.is_empty() && live.segments.is_empty());
+        assert_eq!(
+            live.sources, full.sources,
+            "the per-source meters went missing"
+        );
         assert_eq!(
             (live.status, live.model.clone(), live.chunk_ms, live.changes),
             (full.status, full.model.clone(), full.chunk_ms, full.changes)

@@ -860,12 +860,19 @@ impl App {
         }
     }
 
-    /// Ten-band spectrum of the selected source.
+    /// Ten-band spectrum of the selected source, and a row per source under it.
     ///
     /// Answers "is this device actually carrying audio" before a session is
     /// started, which otherwise can only be discovered by recording and getting
     /// an empty transcript.
-    fn meter_row(&mut self, ui: &mut egui::Ui, running: bool) {
+    ///
+    /// The spectrum is measured downstream of the mixer while a session runs,
+    /// and from the first source alone while idle, so with two sources ticked
+    /// it cannot say which of them is contributing. The per-source rows can.
+    ///
+    /// `_running` is no longer read: the readout used to be suppressed while a
+    /// session ran, and not suppressing it is the point.
+    fn meter_row(&mut self, ui: &mut egui::Ui, _running: bool) {
         let bands = &self.state.levels;
         ui.horizontal(|ui| {
             ui.label("Level:");
@@ -904,14 +911,59 @@ impl App {
 
             if self.state.status == Status::Transcribing {
                 ui.weak(format!("file {:.0}%", self.state.progress * 100.0));
-            } else if running {
-                ui.weak("(session running)");
             } else if self.state.rms > 0.001 {
+                // Shown while a session runs too. This used to read "(session
+                // running)", which made a session at 0% and one at 40% look
+                // identical -- so the one thing a user with a suspect source
+                // wanted to know was the one thing the window would not say.
                 ui.weak(format!("{:.0}%", self.state.rms * 100.0));
             } else {
                 ui.weak("silent");
             }
         });
+
+        // One row per source, once there is more than one. With a single
+        // source the spectrum above is already that source's row, and
+        // repeating it would only take space from the transcript.
+        if self.state.sources.len() > 1 {
+            for s in &self.state.sources {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        egui::vec2(104.0, 14.0),
+                        egui::Label::new(egui::RichText::new(&s.label).small()),
+                    );
+
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(140.0, 10.0), egui::Sense::hover());
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+                    let v = s.rms.clamp(0.0, 1.0);
+                    let bar = egui::Rect::from_min_size(
+                        rect.min,
+                        egui::vec2(rect.width() * v.max(0.01), rect.height()),
+                    );
+                    let colour = if s.silent {
+                        theme::palette::BORDER
+                    } else if v > 0.85 {
+                        theme::palette::RECORDING
+                    } else if v > 0.6 {
+                        theme::palette::WARNING
+                    } else {
+                        theme::palette::SUCCESS
+                    };
+                    painter.rect_filled(bar, 1.0, colour);
+
+                    // "Silent", not "failed", and not in red. A Windows
+                    // loopback on an output with nothing playing delivers
+                    // nothing at all, and that is it working correctly.
+                    if s.silent {
+                        ui.weak("silent");
+                    } else {
+                        ui.weak(format!("{:.0}%", s.rms * 100.0));
+                    }
+                });
+            }
+        }
     }
 
     fn transcript_box(&self, ui: &mut egui::Ui, height: f32) {

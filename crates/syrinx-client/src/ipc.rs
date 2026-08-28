@@ -158,6 +158,19 @@ pub struct DaemonState {
     /// Overall level of the same, 0.0 to 1.0.
     #[serde(default)]
     pub rms: f32,
+    /// One row per selected source: its label, its level, and whether it has
+    /// gone quiet.
+    ///
+    /// The two fields above are measured downstream of the mixer while a
+    /// session runs, and from the first source alone while idle, so with two
+    /// sources selected neither says which one is carrying anything. That was
+    /// impossible to see from a viewer at all: a running session at 0% and one
+    /// at 40% looked identical.
+    ///
+    /// Empty from a daemon too old to report them, which a viewer must read as
+    /// "not known" rather than "no sources".
+    #[serde(default)]
+    pub sources: Vec<syrinx_audio::mixer::SourceHealth>,
     /// Progress through a file, 0.0 to 1.0. Only meaningful while transcribing
     /// a file.
     #[serde(default)]
@@ -204,6 +217,7 @@ impl DaemonState {
             // these from the idle preview when there is no session.
             levels: s.levels.clone(),
             rms: s.rms,
+            sources: s.sources.clone(),
             progress: 0.0,
             // Stamped by the daemon, which is the only thing that knows.
             hotkey: crate::hotkey::Report::Unset,
@@ -364,6 +378,43 @@ mod tests {
         assert_eq!(s.revision, 0);
         assert_eq!(s.transcript, "hello");
         assert!(s.turns.is_empty());
+    }
+
+    #[test]
+    fn per_source_meters_cross_the_wire() {
+        // The viewer renders one row per source from these; a field that did
+        // not survive serialisation would leave every source reading silent.
+        let r = Response::State(DaemonState {
+            sources: vec![
+                syrinx_audio::mixer::SourceHealth {
+                    label: "Yeti".into(),
+                    rms: 0.42,
+                    silent: false,
+                },
+                syrinx_audio::mixer::SourceHealth {
+                    label: "System audio".into(),
+                    rms: 0.0,
+                    silent: true,
+                },
+            ],
+            ..Default::default()
+        });
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), r);
+    }
+
+    #[test]
+    fn a_state_from_a_daemon_without_per_source_meters_still_decodes() {
+        // A daemon too old to report them sends no such field, and the viewer
+        // must fall back to its single overall meter rather than refuse the
+        // reply outright.
+        let old = r#"{"type":"state","status":"idle","mode":"transcribe",
+            "transcript":"","last_fragment":"","model":null,
+            "chunk_ms":null,"error":null,"source_key":null}"#;
+        let Response::State(s) = serde_json::from_str::<Response>(old).unwrap() else {
+            panic!("expected a state");
+        };
+        assert!(s.sources.is_empty());
     }
 
     #[test]

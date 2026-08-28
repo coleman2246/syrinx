@@ -170,7 +170,7 @@ impl SourceMode {
     pub fn summary(self) -> &'static str {
         match self {
             SourceMode::Combined => "mix every source into one transcript",
-            SourceMode::Separate => "transcribe each source on its own, labelled by where it came from",
+            SourceMode::Separate => "one transcript per source, labelled by where it came from",
         }
     }
 
