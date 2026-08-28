@@ -113,7 +113,10 @@ mod tests {
 
     #[test]
     fn resampling_at_the_target_rate_is_a_passthrough() {
-        assert_eq!(resample_to_16k(&[0.1, 0.2, 0.3], 16_000), vec![0.1, 0.2, 0.3]);
+        assert_eq!(
+            resample_to_16k(&[0.1, 0.2, 0.3], 16_000),
+            vec![0.1, 0.2, 0.3]
+        );
     }
 
     #[test]

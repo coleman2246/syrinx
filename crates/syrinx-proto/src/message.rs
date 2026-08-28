@@ -95,6 +95,38 @@ pub enum ServerMessage {
         text: String,
     },
 
+    /// Correct who said `from_seq..=to_seq`, leaving every word of it alone.
+    ///
+    /// A speaker needs several agreeing windows before it is minted, so the
+    /// opening of a turn is committed before anyone can be named for it. This
+    /// is how the name catches up: the commits it covers were emitted with no
+    /// speaker, or with a provisional guess a later full window contradicted,
+    /// and both are corrected rather than left wrong. It never renumbers a
+    /// speaker and never touches a commit that already carries a confident
+    /// label of its own.
+    ///
+    /// Deliberately *not* [`ServerMessage::TranscriptRevise`]. That message is
+    /// reserved for a post-processing layer, says the *text* changed, and
+    /// carries no speaker; relabelling shares none of those three properties,
+    /// and a client's handling of the two differs -- the GUI repaints its
+    /// segments, while `StreamWriter` ignores relabels outright to keep the
+    /// streamed file append-only.
+    ///
+    /// Additive, so a client that does not know this tag drops the frame and
+    /// keeps the attribution it was given live. That is a supported outcome,
+    /// not a degraded one: it is exactly what the streamed file does anyway.
+    #[serde(rename = "transcript.relabel")]
+    TranscriptRelabel {
+        /// First commit `seq` covered, inclusive.
+        from_seq: u64,
+        /// Last commit `seq` covered, inclusive. Equal to `from_seq` for a
+        /// single commit; the range is always contiguous in `seq`.
+        to_seq: u64,
+        /// Who it was, numbered from 1 exactly as on a commit. Never 0, and
+        /// never a number that has not already appeared as a speaker.
+        speaker: u32,
+    },
+
     #[serde(rename = "error")]
     Error {
         code: ErrorCode,
@@ -212,6 +244,80 @@ mod tests {
     }
 
     #[test]
+    fn relabel_round_trips() {
+        let m = ServerMessage::TranscriptRelabel {
+            from_seq: 3,
+            to_seq: 7,
+            speaker: 2,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&s).unwrap(), m);
+    }
+
+    #[test]
+    fn a_relabel_names_a_range_and_a_speaker_and_no_text() {
+        // The whole point of the message being its own variant rather than a
+        // speaker bolted onto `transcript.revise`: nothing here says the words
+        // changed, so a client that applies it never has to touch its buffer.
+        let s = serde_json::to_string(&ServerMessage::TranscriptRelabel {
+            from_seq: 3,
+            to_seq: 7,
+            speaker: 2,
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["type"], "transcript.relabel");
+        assert_eq!(v["from_seq"], 3);
+        assert_eq!(v["to_seq"], 7);
+        assert_eq!(v["speaker"], 2);
+        assert!(!s.contains("text"), "got: {s}");
+        assert!(!s.contains("retract"), "got: {s}");
+    }
+
+    #[test]
+    fn a_relabel_never_names_speaker_zero() {
+        // Speakers are numbered from 1, so 0 has no referent. Nothing on the
+        // wire enforces it -- `u32` cannot -- and this is the note that says
+        // the server must not send one rather than a check that it did not.
+        let m: ServerMessage = serde_json::from_str(
+            r#"{"type":"transcript.relabel","from_seq":1,"to_seq":1,"speaker":1}"#,
+        )
+        .unwrap();
+        let ServerMessage::TranscriptRelabel { speaker, .. } = m else {
+            panic!()
+        };
+        assert!(speaker >= 1);
+    }
+
+    #[test]
+    fn an_old_client_skips_a_relabel_rather_than_breaking() {
+        // Forward compatibility for the *server* messages is a skipped frame,
+        // not a tolerated field: a client built before this variant existed
+        // fails to decode the tag and its reader loop logs and carries on --
+        // `syrinx-client`'s `undecodable server frame` arm. So the property to
+        // pin is that an unknown tag is an ordinary `Err`, which is what that
+        // arm is reachable by. `syrinx-client`'s own tests cover the arm.
+        let unknown = r#"{"type":"transcript.teleport","seq":1}"#;
+        let e = serde_json::from_str::<ServerMessage>(unknown);
+        assert!(e.is_err(), "an unknown tag must be a decode error");
+
+        // And the messages an *old server* sends still decode against this
+        // enum, so adding the variant costs nothing in the other direction.
+        for old in [
+            r#"{"type":"transcript.commit","seq":1,"text":"hi"}"#,
+            r#"{"type":"transcript.provisional","seq":1,"text":"hi"}"#,
+            r#"{"type":"transcript.revise","seq":1,"retract_n":2,"text":"hi"}"#,
+            r#"{"type":"session.ready","session_id":"x","chunk_ms":560,"model":"m"}"#,
+            r#"{"type":"session.closed","reason":"ended"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ServerMessage>(old).is_ok(),
+                "an old server's {old} stopped parsing"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_field_on_a_known_variant_is_ignored() {
         // Forward compatibility: a future client field this server does not
         // know about yet must not break parsing.
@@ -224,7 +330,9 @@ mod tests {
         // A new client against an old server must not choke on the handshake.
         let s = r#"{"type":"session.ready","session_id":"x","chunk_ms":560,"model":"m"}"#;
         let m: ServerMessage = serde_json::from_str(s).unwrap();
-        let ServerMessage::SessionReady { diarize, .. } = m else { panic!() };
+        let ServerMessage::SessionReady { diarize, .. } = m else {
+            panic!()
+        };
         assert!(!diarize);
     }
 
@@ -236,7 +344,11 @@ mod tests {
             model: "m".into(),
             diarize: true,
         };
-        assert!(serde_json::to_string(&m).unwrap().contains("\"diarize\":true"));
+        assert!(
+            serde_json::to_string(&m)
+                .unwrap()
+                .contains("\"diarize\":true")
+        );
     }
 
     #[test]
