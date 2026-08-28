@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use syrinx_client::{Config, OutputMode, SessionOptions, save, state};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(name = "syrinx", about = "Live speech to text")]
@@ -344,7 +344,8 @@ fn run(
     split: bool,
     pid_path: PathBuf,
 ) -> Result<()> {
-    let cfg = Config::load(config)?;
+    let config_path = config.clone().unwrap_or_else(Config::default_path);
+    let mut cfg = Config::load(config)?;
     let mode = mode.map(OutputMode::from).unwrap_or(cfg.mode);
 
     let available = syrinx_client::list_sources()?;
@@ -368,6 +369,26 @@ fn run(
     } else {
         syrinx_client::mode::SourceMode::Combined
     };
+
+    // A generated name in the config gets today's date before it is opened,
+    // exactly as it does in the daemon: `stream_to` is remembered, and a file
+    // named 2026-08-20_09-14-03.txt would otherwise collect every session
+    // since under that day's date. Written back for the same reason the
+    // daemon writes it back -- so the next run today continues this file
+    // rather than minting one of its own.
+    //
+    // `--stream` is left exactly as typed. It was typed for this run, which
+    // is nothing like a name remembered from a fortnight ago.
+    if let Some(current) = cfg.stream_to.clone() {
+        let current = PathBuf::from(current);
+        let fresh = save::restamped(&current, &save::timestamp());
+        if fresh != current {
+            cfg.stream_to = Some(fresh.display().to_string());
+            if let Err(e) = cfg.save(&config_path) {
+                warn!("saving the config: {e:#}");
+            }
+        }
+    }
 
     // The flag wins over the config, so a one-off run can stream somewhere
     // else without editing anything.
