@@ -163,6 +163,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         file_job: None,
         previews: Vec::new(),
         preview_keys: Vec::new(),
+        preview_tried: None,
         last_viewer: None,
         last: Default::default(),
         // One rather than zero, so the first tick's token cannot match the
@@ -452,24 +453,90 @@ struct FileJob {
     error: Option<String>,
 }
 
+/// How long a selection that produced no meter waits before being tried again.
+///
+/// Retried at all because a device can come back. Not on every tick, because
+/// the loop that calls this runs forty times a second and also answers the
+/// GUI: a device that will not open would otherwise be reopened at that rate
+/// for ever, each attempt holding the loop for as long as it took to fail.
+const PREVIEW_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the meters have to be built again.
+///
+/// The selection is compared against what was *asked for*, not against what
+/// the meters resolved to. A key that no longer names a device falls back to
+/// `choose_source`, whose answer has a different key -- so comparing resolved
+/// keys would find them stale for ever and tear down and reopen every capture
+/// on every tick.
+fn previews_are_stale(
+    built_for: &[String],
+    wanted: &[String],
+    metering: bool,
+    since_tried: Option<std::time::Duration>,
+    retry: std::time::Duration,
+) -> bool {
+    if built_for != wanted {
+        return true;
+    }
+    if metering {
+        return false;
+    }
+    // Nothing is metering. Worth another go, but only once the wait is up.
+    since_tried.is_none_or(|d| d >= retry)
+}
+
+/// One selected source's level meter, or why there is not one.
+///
+/// A slot per source the user *selected*, not per meter that started. Built
+/// the other way round, the window shows one row when one of two sources is
+/// broken -- and the row it leaves out is the broken one, which is the only
+/// one the user is looking for.
+struct PreviewSlot {
+    /// What to call this row.
+    label: String,
+    /// The meter, while there is one.
+    preview: Option<crate::preview::Preview>,
+    /// Why there is no meter.
+    error: Option<String>,
+}
+
+impl PreviewSlot {
+    /// This source as a meter row.
+    fn health(&self) -> syrinx_audio::mixer::SourceHealth {
+        match &self.preview {
+            Some(p) => p.health(),
+            None => syrinx_audio::mixer::SourceHealth {
+                label: self.label.clone(),
+                rms: 0.0,
+                silent: true,
+                dropped: 0,
+                error: self.error.clone(),
+            },
+        }
+    }
+}
+
 struct DaemonRuntime {
     opts: DaemonOptions,
     /// Running sessions. One in combined mode, one per source in separate mode.
     sessions: Vec<SessionHandle>,
     /// The level overlay, shown only for typing sessions.
     overlay: Option<std::process::Child>,
-    /// Live level meters, one per selected source, running only while idle and
-    /// only while a viewer is watching. Holding a capture open otherwise would
-    /// keep a microphone active for no reason.
+    /// Live level meters, one slot per selected source, running only while
+    /// idle and only while a viewer is watching. Holding a capture open
+    /// otherwise would keep a microphone active for no reason.
     ///
     /// One each rather than one for the first: metering only
     /// `source_keys.first()` meant the second source was never metered
     /// anywhere at any time, idle or running, which is precisely the question
     /// somebody with two sources selected is asking.
-    previews: Vec<crate::preview::Preview>,
+    previews: Vec<PreviewSlot>,
     /// The selection `previews` was built for, so re-pointing can compare
     /// against what was asked for rather than what it resolved to.
     preview_keys: Vec<String>,
+    /// When the meters were last built. A selection that produced none is
+    /// retried on this, rather than on every tick.
+    preview_tried: Option<std::time::Instant>,
     /// When a viewer last asked for state. Metering stops shortly after the
     /// last one closes.
     last_viewer: Option<std::time::Instant>,
@@ -559,24 +626,41 @@ impl DaemonRuntime {
         if !want {
             self.previews.clear();
             self.preview_keys.clear();
+            self.preview_tried = None;
             return;
         }
 
-        // Re-point when the selection changes, so the meters always show what
-        // pressing Start would actually record.
-        //
-        // Compared against what was *asked for*, not against what the previews
-        // resolved to. A key that no longer names a device falls back to
-        // `choose_source`, whose answer has a different key -- so comparing
-        // resolved keys would find them stale for ever and tear down and
-        // reopen every capture on every tick, forty times a second.
-        if self.preview_keys == self.opts.source_keys && !self.previews.is_empty() {
+        // Whatever has finished opening since the last tick. `Preview::start`
+        // does not wait for its device, so this is where the answer lands.
+        for slot in &mut self.previews {
+            let Some(p) = &slot.preview else { continue };
+            if let crate::preview::Opening::Failed(e) = p.opening() {
+                warn!("could not meter {}: {e}", slot.label);
+                slot.error = Some(e);
+                slot.preview = None;
+            }
+        }
+
+        if !previews_are_stale(
+            &self.preview_keys,
+            &self.opts.source_keys,
+            self.previews.iter().any(|s| s.preview.is_some()),
+            self.preview_tried.map(|t| t.elapsed()),
+            PREVIEW_RETRY,
+        ) {
             return;
         }
 
         self.previews.clear();
         self.preview_keys = self.opts.source_keys.clone();
-        let Ok(sources) = list_sources() else { return };
+        self.preview_tried = Some(std::time::Instant::now());
+        let sources = match list_sources() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("listing sources for the meters: {e:#}");
+                return;
+            }
+        };
         // Nothing selected means "whatever Start would choose", which is one
         // source, not none.
         let wanted: Vec<Option<&str>> = if self.preview_keys.is_empty() {
@@ -585,15 +669,24 @@ impl DaemonRuntime {
             self.preview_keys.iter().map(|k| Some(k.as_str())).collect()
         };
         for key in wanted {
-            let Ok(source) = choose_source(&sources, key) else {
-                continue;
+            // A slot either way. A source that cannot be metered is not fatal
+            // -- Start will report the real error -- but it still has to keep
+            // its row, or the window is a source short with no explanation.
+            let slot = match choose_source(&sources, key) {
+                Ok(source) => PreviewSlot {
+                    label: source.short_label(),
+                    preview: Some(crate::preview::Preview::start(&source)),
+                    error: None,
+                },
+                // Named by its key: there is no source left to ask for a
+                // label, and the key is what the user picked.
+                Err(e) => PreviewSlot {
+                    label: key.unwrap_or("default source").to_string(),
+                    preview: None,
+                    error: Some(format!("{e:#}")),
+                },
             };
-            match crate::preview::Preview::start(&source) {
-                Ok(p) => self.previews.push(p),
-                // A source that cannot be metered is not fatal; Start will
-                // report the real error.
-                Err(e) => warn!("could not meter {}: {e:#}", source.display()),
-            }
+            self.previews.push(slot);
         }
     }
 
@@ -684,14 +777,22 @@ impl DaemonRuntime {
                 out.diarize_requested = false;
             }
         }
-        // Preview levels apply only when idle; a running session meters the
-        // audio it is actually sending.
-        if !self.running() && !self.previews.is_empty() {
-            let first = &self.previews[0];
-            out.levels = first.levels().to_vec();
-            out.rms = first.rms();
-            // Every source, not only the one the spectrum above is showing.
-            out.sources = self.previews.iter().map(|p| p.health()).collect();
+        // Meters describe whatever is capturing now. With nothing running the
+        // previews are the only honest source of them, so what the last
+        // session left behind is cleared rather than passed off as live: a
+        // finished session's frozen levels and silent flags presented as
+        // current are worse than no meter at all, because they cannot be
+        // told apart from a live one.
+        if !self.running() {
+            out.levels.clear();
+            out.rms = 0.0;
+            if let Some(p) = self.previews.iter().find_map(|s| s.preview.as_ref()) {
+                out.levels = p.levels().to_vec();
+                out.rms = p.rms();
+            }
+            // A row per selected source, not per meter that started: the one
+            // that would not start is the one worth showing.
+            out.sources = self.previews.iter().map(|s| s.health()).collect();
         }
         out
     }
@@ -714,6 +815,18 @@ impl DaemonRuntime {
         if self.running() {
             return;
         }
+        // Told to let go before the session asks for anything. `update_preview`
+        // would drop them later in this same tick, because `Status::Connecting`
+        // is set synchronously -- but that is an accident of ordering rather
+        // than a promise, and the exposed surface went from one endpoint to
+        // one per source when metering became per-source. The release itself
+        // happens on each preview's own thread; what is guaranteed here is
+        // that no meter is still being asked to hold anything by the time a
+        // session starts opening devices.
+        self.previews.clear();
+        self.preview_keys.clear();
+        self.preview_tried = None;
+
         let available = match list_sources() {
             Ok(s) => s,
             Err(e) => {
@@ -1101,6 +1214,7 @@ mod tests {
             overlay: None,
             previews: Vec::new(),
             preview_keys: Vec::new(),
+            preview_tried: None,
             last_viewer: None,
             file_job: None,
             last,
@@ -1398,6 +1512,90 @@ mod tests {
         );
         assert_eq!((live.error, live.levels), (full.error, full.levels));
         assert_eq!(live.last_fragment, full.last_fragment);
+    }
+
+    #[test]
+    fn a_finished_session_stops_reporting_its_last_levels_as_live() {
+        // With nothing running and no meter open, the window kept showing the
+        // spectrum and the per-source rows the previous session ended on,
+        // indistinguishable from a live reading of a device nobody is
+        // holding. The transcript stays -- it is there to be read and saved --
+        // but a meter is a claim about right now.
+        let mut d = daemon_holding(SessionState {
+            transcript: "we ship Thursday".into(),
+            segments: vec![seg(0.0, "we ship Thursday", None, None)],
+            levels: vec![0.7; 10],
+            rms: 0.7,
+            sources: vec![syrinx_audio::mixer::SourceHealth {
+                label: "Yeti".into(),
+                rms: 0.7,
+                silent: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let snap = d.live_snapshot();
+        assert!(
+            snap.levels.is_empty(),
+            "a finished session's spectrum was shown as live"
+        );
+        assert_eq!(snap.rms, 0.0);
+        assert!(
+            snap.sources.is_empty(),
+            "a finished session's meter rows were shown as live"
+        );
+
+        let mut p = Published::default();
+        tick(&mut d, &mut p);
+        assert_eq!(p.transcript, "we ship Thursday", "the text went with them");
+    }
+
+    #[test]
+    fn meters_that_all_failed_are_retried_on_a_timer_not_on_every_tick() {
+        // `update_preview` runs forty times a second in the loop that also
+        // answers the GUI. With every meter failing, an unconditional retry
+        // reopened a failing device at that rate for ever, holding the loop
+        // for as long as each attempt took to fail.
+        let keys = vec!["cpal:out:Speakers".to_string()];
+        let short = std::time::Duration::from_secs(5);
+        assert!(
+            !previews_are_stale(&keys, &keys, false, Some(short / 5), short),
+            "a failing device was reopened before the wait was up"
+        );
+        assert!(
+            previews_are_stale(&keys, &keys, false, Some(short), short),
+            "a device that could come back was never tried again"
+        );
+        // Never tried at all is not the same as tried and failed.
+        assert!(previews_are_stale(&keys, &keys, false, None, short));
+    }
+
+    #[test]
+    fn a_new_selection_repoints_the_meters_without_waiting() {
+        // The wait is for a device that failed, not for the user changing
+        // their mind: a tick that took five seconds to be reflected would
+        // read as the picker not working.
+        let short = std::time::Duration::from_secs(5);
+        assert!(previews_are_stale(
+            &["a".to_string()],
+            &["a".to_string(), "b".to_string()],
+            true,
+            Some(std::time::Duration::ZERO),
+            short,
+        ));
+    }
+
+    #[test]
+    fn meters_that_are_running_are_left_alone() {
+        let keys = vec!["a".to_string()];
+        assert!(!previews_are_stale(
+            &keys,
+            &keys,
+            true,
+            Some(std::time::Duration::from_secs(600)),
+            std::time::Duration::from_secs(5),
+        ));
     }
 
     #[test]

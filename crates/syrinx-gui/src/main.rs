@@ -480,6 +480,39 @@ mod ensure_daemon_tests {
     }
 }
 
+/// A label and a row for every selected source, paired up.
+///
+/// One entry per source in `selected`, in that order, because that is what the
+/// user ticked and what the window has to account for. `reporting` is what the
+/// daemon has rows for, which is not always the same list: a source that would
+/// not open has no meter behind it, an older daemon reports fewer rows than
+/// this one, and a selection can be a tick ahead of what the daemon has acted
+/// on. Anything unaccounted for still needs a name, which is what `known` --
+/// the enumerated sources behind the picker -- is for.
+fn meter_rows(
+    selected: &[String],
+    reporting: &[syrinx_audio::mixer::SourceHealth],
+    known: &[Source],
+) -> Vec<(String, Option<syrinx_audio::mixer::SourceHealth>)> {
+    (0..selected.len().max(reporting.len()))
+        .map(|i| {
+            let health = reporting.get(i).cloned();
+            let label = match (&health, selected.get(i)) {
+                (Some(h), _) => h.label.clone(),
+                (None, Some(key)) => known
+                    .iter()
+                    .find(|s| &s.stable_key() == key)
+                    .map(|s| s.short_label())
+                    // The key itself, when the device is no longer there to
+                    // be asked. It is at least what the user picked.
+                    .unwrap_or_else(|| key.clone()),
+                (None, None) => "unknown source".to_string(),
+            };
+            (label, health)
+        })
+        .collect()
+}
+
 struct App {
     config: Config,
     /// Mirrored from the daemon; the GUI owns no session.
@@ -611,7 +644,7 @@ impl eframe::App for App {
         ui.add_space(6.0);
         self.source_row(ui, running);
         self.mode_row(ui, running);
-        self.meter_row(ui, running);
+        self.meter_row(ui);
         ui.add_space(8.0);
 
         // The card carries the visual weight now, so the rules above and below
@@ -864,15 +897,13 @@ impl App {
     ///
     /// Answers "is this device actually carrying audio" before a session is
     /// started, which otherwise can only be discovered by recording and getting
-    /// an empty transcript.
+    /// an empty transcript. It answers it while one runs, too, which is why
+    /// nothing here is conditional on that.
     ///
     /// The spectrum is measured downstream of the mixer while a session runs,
     /// and from the first source alone while idle, so with two sources ticked
     /// it cannot say which of them is contributing. The per-source rows can.
-    ///
-    /// `_running` is no longer read: the readout used to be suppressed while a
-    /// session ran, and not suppressing it is the point.
-    fn meter_row(&mut self, ui: &mut egui::Ui, _running: bool) {
+    fn meter_row(&mut self, ui: &mut egui::Ui) {
         let bands = &self.state.levels;
         ui.horizontal(|ui| {
             ui.label("Level:");
@@ -922,49 +953,85 @@ impl App {
             }
         });
 
-        // One row per source, once there is more than one. With a single
-        // source the spectrum above is already that source's row, and
+        // One row per *selected* source, once there is more than one. With a
+        // single source the spectrum above is already that source's row, and
         // repeating it would only take space from the transcript.
-        if self.state.sources.len() > 1 {
-            for s in &self.state.sources {
+        //
+        // Gated on how many were selected rather than on how many are
+        // reporting. Only sources that started report, so with two ticked and
+        // one broken this drew nothing at all -- in precisely the case the
+        // rows exist for, leaving the user with the same silence and the same
+        // absence of explanation they came here to diagnose.
+        if self.state.source_keys.len() > 1 {
+            for (label, health) in
+                meter_rows(&self.state.source_keys, &self.state.sources, &self.sources)
+            {
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         egui::vec2(104.0, 14.0),
-                        egui::Label::new(egui::RichText::new(&s.label).small()),
+                        egui::Label::new(egui::RichText::new(&label).small()),
                     );
 
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(140.0, 10.0), egui::Sense::hover());
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-                    let v = s.rms.clamp(0.0, 1.0);
+                    let v = health.as_ref().map_or(0.0, |s| s.rms.clamp(0.0, 1.0));
                     let bar = egui::Rect::from_min_size(
                         rect.min,
                         egui::vec2(rect.width() * v.max(0.01), rect.height()),
                     );
-                    let colour = if s.silent {
+                    let colour = if health.as_ref().is_some_and(|s| s.error.is_some()) {
+                        // A device that would not open is a fault, unlike a
+                        // device that merely has nothing to play.
+                        theme::palette::WARNING
+                    } else if health.as_ref().is_none_or(|s| s.silent) {
                         theme::palette::BORDER
                     } else if v > 0.85 {
                         theme::palette::RECORDING
-                    } else if v > 0.6 {
-                        theme::palette::WARNING
                     } else {
                         theme::palette::SUCCESS
                     };
                     painter.rect_filled(bar, 1.0, colour);
 
-                    // "Silent", not "failed", and not in red. A Windows
-                    // loopback on an output with nothing playing delivers
-                    // nothing at all, and that is it working correctly.
-                    if s.silent {
-                        ui.weak("silent");
-                    } else {
-                        ui.weak(format!("{:.0}%", s.rms * 100.0));
+                    match &health {
+                        Some(s) if s.error.is_some() => {
+                            ui.weak("not available")
+                                .on_hover_text(s.error.clone().unwrap_or_default());
+                        }
+                        // "Silent", not "failed", and not in red. A Windows
+                        // loopback on an output with nothing playing delivers
+                        // nothing at all, and that is it working correctly.
+                        Some(s) if s.silent => {
+                            ui.weak("silent");
+                        }
+                        Some(s) => {
+                            ui.weak(format!("{:.0}%", s.rms * 100.0));
+                        }
+                        // Selected, and nothing is reporting it. Said rather
+                        // than left out: a row that is simply missing reads as
+                        // a source that was never ticked.
+                        None => {
+                            ui.weak("not reporting");
+                        }
+                    }
+
+                    // Trimming is words going missing mid-utterance, and this
+                    // is the only place a reader can find out that happened.
+                    if let Some(dropped) =
+                        health.as_ref().map(|s| s.dropped).filter(|d| *d > 0)
+                    {
+                        let seconds = dropped as f32 / syrinx_proto::SAMPLE_RATE as f32;
+                        ui.weak(format!("-{seconds:.1}s")).on_hover_text(
+                            "Audio trimmed from this source, because the mix could not \
+                             keep up with it or it could not keep up with the mix.",
+                        );
                     }
                 });
             }
         }
     }
+
 
     fn transcript_box(&self, ui: &mut egui::Ui, height: f32) {
         // A surface of its own rather than bare canvas. The transcript is the
@@ -1387,6 +1454,68 @@ mod tests {
     fn an_address_without_a_scheme_is_refused() {
         assert!(normalise_server("192.168.1.10").is_err());
         assert!(normalise_server("dictate.example.com").is_err());
+    }
+
+    fn row(label: &str, silent: bool) -> syrinx_audio::mixer::SourceHealth {
+        syrinx_audio::mixer::SourceHealth {
+            label: label.into(),
+            rms: if silent { 0.0 } else { 0.4 },
+            silent,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn two_sources_with_one_broken_still_get_two_rows() {
+        // The case the rows exist for. Only sources that started report, so a
+        // window drawing one row per reporting source drew a single row for
+        // two ticked boxes -- and the row it left out was the broken one,
+        // which is the only one the user was looking for.
+        let selected = vec!["cpal:in:Yeti".to_string(), "cpal:out:Speakers".to_string()];
+        let rows = meter_rows(&selected, &[row("Yeti", false)], &[]);
+        assert_eq!(rows.len(), 2, "the source that is not reporting went missing");
+        assert_eq!(rows[0].0, "Yeti");
+        assert!(rows[0].1.is_some());
+        // Named from the key, since nothing enumerated matches it here.
+        assert_eq!(rows[1].0, "cpal:out:Speakers");
+        assert!(rows[1].1.is_none(), "a row was invented for a silent source");
+    }
+
+    #[test]
+    fn a_source_with_no_row_is_named_from_what_was_enumerated() {
+        // The key is a last resort. When the picker still knows the device,
+        // the row reads as the same name the picker shows.
+        let speakers = Source {
+            target: syrinx_audio::SourceTarget::CpalDevice {
+                name: "Speakers".into(),
+                loopback: true,
+            },
+            name: "Everything playing on Speakers".into(),
+            kind: SourceKind::Monitor,
+            detail: None,
+            stable_name: Some("cpal:out:Speakers".into()),
+            sink_description: Some("Speakers".into()),
+        };
+        let selected = vec!["cpal:in:Yeti".to_string(), speakers.stable_key()];
+        let rows = meter_rows(
+            &selected,
+            &[row("Yeti", false)],
+            std::slice::from_ref(&speakers),
+        );
+        assert_eq!(rows[1].0, speakers.short_label());
+    }
+
+    #[test]
+    fn every_reporting_source_keeps_its_row_even_past_the_selection() {
+        // A session's rows arrive before a selection change has been acted
+        // on, and dropping the extra would blank a meter that is running.
+        let rows = meter_rows(
+            &["cpal:in:Yeti".to_string()],
+            &[row("Yeti", false), row("System audio", true)],
+            &[],
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0, "System audio");
     }
 
     #[test]

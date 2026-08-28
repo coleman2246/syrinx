@@ -620,12 +620,21 @@ fn run_meter(
     use syrinx_audio::meter;
 
     let cfg = Config::load(config).ok();
-    let want = source.or_else(|| cfg.and_then(|c| c.source_key));
+    // The first of the remembered selection, through the same accessor the
+    // daemon uses: reading the singular `source_key` directly meant a config
+    // holding only `source_keys` metered the default input instead of what
+    // the user had chosen.
+    let want = source.or_else(|| {
+        cfg.and_then(|c| c.selected_sources().into_iter().next())
+    });
     let sources = syrinx_client::list_sources()?;
     let src = syrinx_client::choose_source(&sources, want.as_deref())?;
     eprintln!("metering: {}  (ctrl-c to stop)", src.display());
 
-    let preview = syrinx_client::preview::Preview::start(&src)?;
+    // Waited for here, unlike in the daemon: this command is one long wait on
+    // this meter and has no loop of its own to keep turning.
+    let preview = syrinx_client::preview::Preview::start(&src);
+    preview.wait_until_open()?;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let stop = stop.clone();
