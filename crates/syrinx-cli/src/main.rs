@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use std::path::{Path, PathBuf};
 use syrinx_client::{Config, OutputMode, SessionOptions, save, state};
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 #[derive(Parser)]
@@ -200,7 +200,9 @@ fn main() -> Result<()> {
             format,
         } => run_daemon(cli.config, mode, source, save_default, format),
 
-        Cmd::Transcribe { file, save, format } => run_transcribe(cli.config, file, save, format),
+        Cmd::Transcribe { file, save, format } => {
+            run_transcribe(cli.config, file, save, format)
+        }
 
         Cmd::Meter { source, seconds } => run_meter(cli.config, source, seconds),
 
@@ -284,18 +286,7 @@ fn main() -> Result<()> {
                 ask_daemon(syrinx_client::ipc::Request::Toggle)?;
                 return Ok(());
             }
-            run(
-                cli.config,
-                mode,
-                source,
-                separate,
-                stream,
-                save,
-                save_default,
-                format,
-                split,
-                pid_path,
-            )
+            run(cli.config, mode, source, separate, stream, save, save_default, format, split, pid_path)
         }
 
         Cmd::Start {
@@ -311,18 +302,7 @@ fn main() -> Result<()> {
             if let Some(pid) = state::running_pid(&pid_path) {
                 anyhow::bail!("already running (pid {pid})");
             }
-            run(
-                cli.config,
-                mode,
-                source,
-                separate,
-                stream,
-                save,
-                save_default,
-                format,
-                split,
-                pid_path,
-            )
+            run(cli.config, mode, source, separate, stream, save, save_default, format, split, pid_path)
         }
     }
 }
@@ -626,7 +606,11 @@ fn run_daemon(
 ///
 /// Uses the same analysis the GUI draws, so the two agree about whether a
 /// source is carrying audio.
-fn run_meter(config: Option<PathBuf>, source: Option<String>, seconds: Option<u64>) -> Result<()> {
+fn run_meter(
+    config: Option<PathBuf>,
+    source: Option<String>,
+    seconds: Option<u64>,
+) -> Result<()> {
     use syrinx_audio::meter;
 
     let cfg = Config::load(config).ok();

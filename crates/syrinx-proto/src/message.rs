@@ -330,9 +330,7 @@ mod tests {
         // A new client against an old server must not choke on the handshake.
         let s = r#"{"type":"session.ready","session_id":"x","chunk_ms":560,"model":"m"}"#;
         let m: ServerMessage = serde_json::from_str(s).unwrap();
-        let ServerMessage::SessionReady { diarize, .. } = m else {
-            panic!()
-        };
+        let ServerMessage::SessionReady { diarize, .. } = m else { panic!() };
         assert!(!diarize);
     }
 
@@ -344,11 +342,7 @@ mod tests {
             model: "m".into(),
             diarize: true,
         };
-        assert!(
-            serde_json::to_string(&m)
-                .unwrap()
-                .contains("\"diarize\":true")
-        );
+        assert!(serde_json::to_string(&m).unwrap().contains("\"diarize\":true"));
     }
 
     #[test]

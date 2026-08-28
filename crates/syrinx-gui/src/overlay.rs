@@ -166,8 +166,10 @@ impl eframe::App for Overlay {
             // rather than "not running at all".
             let h = (rect.height() * v).max(2.0);
             let x = rect.left() + i as f32 * (bar_w + gap);
-            let bar =
-                egui::Rect::from_min_size(egui::pos2(x, rect.bottom() - h), egui::vec2(bar_w, h));
+            let bar = egui::Rect::from_min_size(
+                egui::pos2(x, rect.bottom() - h),
+                egui::vec2(bar_w, h),
+            );
             let colour = if v > 0.9 {
                 palette::RECORDING
             } else if v > 0.7 {
@@ -184,11 +186,7 @@ impl eframe::App for Overlay {
         painter.text(
             egui::pos2(full.left() + pad, full.bottom() - pad - text_h + 2.0),
             egui::Align2::LEFT_TOP,
-            if line.is_empty() {
-                "listening…"
-            } else {
-                &line
-            },
+            if line.is_empty() { "listening…" } else { &line },
             egui::FontId::proportional(12.0),
             if line.is_empty() {
                 palette::TEXT_MUTED

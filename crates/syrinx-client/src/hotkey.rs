@@ -254,17 +254,9 @@ mod tests {
         // blank line where an explanation should be.
         let reports = [
             Report::Unset,
-            Report::Active {
-                spelled: "ctrl+alt+d".into(),
-            },
-            Report::Unavailable {
-                spelled: "ctrl+alt+d".into(),
-                why: "because".into(),
-            },
-            Report::Failed {
-                spelled: "ctrl+alt+d".into(),
-                error: "taken".into(),
-            },
+            Report::Active { spelled: "ctrl+alt+d".into() },
+            Report::Unavailable { spelled: "ctrl+alt+d".into(), why: "because".into() },
+            Report::Failed { spelled: "ctrl+alt+d".into(), error: "taken".into() },
         ];
         for r in reports {
             assert!(!r.summary().trim().is_empty(), "{r:?}");
@@ -273,38 +265,21 @@ mod tests {
 
     #[test]
     fn only_a_registered_hotkey_reads_as_active() {
-        assert!(
-            Report::Active {
-                spelled: "x".into()
-            }
-            .is_active()
-        );
+        assert!(Report::Active { spelled: "x".into() }.is_active());
         assert!(!Report::Unset.is_active());
-        assert!(
-            !Report::Failed {
-                spelled: "x".into(),
-                error: "e".into()
-            }
-            .is_active()
-        );
+        assert!(!Report::Failed { spelled: "x".into(), error: "e".into() }.is_active());
     }
 
     #[test]
     fn a_failure_explains_itself() {
         // "could not be registered" alone leaves nowhere to go.
-        let r = Report::Failed {
-            spelled: "ctrl+alt+d".into(),
-            error: "already in use".into(),
-        };
+        let r = Report::Failed { spelled: "ctrl+alt+d".into(), error: "already in use".into() };
         assert_eq!(r.detail(), Some("already in use"));
     }
 
     #[test]
     fn reports_round_trip_over_ipc() {
-        let r = Report::Unavailable {
-            spelled: "ctrl+alt+d".into(),
-            why: "wayland".into(),
-        };
+        let r = Report::Unavailable { spelled: "ctrl+alt+d".into(), why: "wayland".into() };
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<Report>(&s).unwrap(), r);
     }

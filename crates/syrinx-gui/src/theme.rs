@@ -141,8 +141,9 @@ mod tests {
     fn text_is_lighter_than_every_surface_it_sits_on() {
         // A palette where a text colour is darker than its background is
         // unreadable, and that is easy to do by mistyping one hex digit.
-        let luma =
-            |c: Color32| 0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32;
+        let luma = |c: Color32| {
+            0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32
+        };
         for surface in [p::CANVAS, p::SURFACE, p::SURFACE_RAISED, p::SUNKEN] {
             for text in [p::TEXT, p::TEXT_SECONDARY, p::TEXT_MUTED] {
                 assert!(

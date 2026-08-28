@@ -20,9 +20,9 @@ use crate::mode::OutputMode;
 use crate::save::Format;
 use crate::session::{SessionState, Status};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::{Name, Stream};
-use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
@@ -45,48 +45,29 @@ pub enum Request {
     Start,
     Stop,
     Toggle,
-    SetMode {
-        mode: OutputMode,
-    },
+    SetMode { mode: OutputMode },
     /// Ask the server for speaker labels on the next session. Refused while
     /// one is running, for the same reason as `SetMode`.
-    SetDiarize {
-        diarize: bool,
-    },
-    SetSource {
-        key: String,
-    },
+    SetDiarize { diarize: bool },
+    SetSource { key: String },
     /// Replace the whole selection, and optionally how they are combined.
     SetSources {
         keys: Vec<String>,
         source_mode: Option<crate::mode::SourceMode>,
     },
     /// Point the daemon at a different machine. Applies to the next session.
-    SetServer {
-        server: String,
-    },
+    SetServer { server: String },
     /// Layout for saved and streamed transcripts.
-    SetFormat {
-        format: Format,
-    },
+    SetFormat { format: Format },
     /// Append the transcript to this file as it is dictated. `None` stops.
     /// Takes effect on the next session.
-    SetStreamFile {
-        path: Option<String>,
-    },
+    SetStreamFile { path: Option<String> },
     /// Save the current transcript, returning the path written.
-    Save {
-        format: Format,
-        path: Option<String>,
-    },
+    Save { format: Format, path: Option<String> },
     /// Transcribe an audio file, replacing the current transcript.
-    TranscribeFile {
-        path: String,
-    },
+    TranscribeFile { path: String },
     /// Save one file per source. Separate mode only.
-    SaveSplit {
-        format: Format,
-    },
+    SaveSplit { format: Format },
     /// Discard the retained transcript.
     Clear,
     /// Stop the daemon entirely.
@@ -104,13 +85,9 @@ pub enum Request {
 pub enum Response {
     State(DaemonState),
     /// A path, for `Save`.
-    Saved {
-        path: String,
-    },
+    Saved { path: String },
     Ok,
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 /// Everything a viewer needs. Flattened from [`SessionState`] plus the

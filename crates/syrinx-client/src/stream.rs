@@ -184,11 +184,7 @@ impl StreamWriter {
     /// somebody drew breath would wreck the reading.
     fn line_speaker(&self, seg: &Segment) -> Option<u32> {
         if matches!(self.format, Format::Plain) {
-            return if self.opens_turn(seg) {
-                seg.speaker
-            } else {
-                None
-            };
+            return if self.opens_turn(seg) { seg.speaker } else { None };
         }
         self.turn_speaker(seg)
     }
@@ -403,8 +399,7 @@ mod tests {
     fn a_speaker_change_breaks_the_line_and_names_the_speaker() {
         let p = scratch("spk-change");
         let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
-        w.append(&seg_spk(0.0, "we ship Thursday", Some(1)))
-            .unwrap();
+        w.append(&seg_spk(0.0, "we ship Thursday", Some(1))).unwrap();
         w.append(&seg_spk(0.6, "no we don't", Some(2))).unwrap();
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
@@ -552,8 +547,7 @@ mod tests {
         let p = scratch("spk-leading");
         let mut w = StreamWriter::open(&p, Format::Timestamped).unwrap();
         w.append(&seg_spk(0.0, "hello", None)).unwrap();
-        w.append(&seg_spk(65.0, "we ship Thursday", Some(1)))
-            .unwrap();
+        w.append(&seg_spk(65.0, "we ship Thursday", Some(1))).unwrap();
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "[00:00] hello\n[01:05] Speaker 1: we ship Thursday"
@@ -577,8 +571,7 @@ mod tests {
             speaker,
         };
         let mut w = StreamWriter::open(&p, Format::Labelled).unwrap();
-        w.append(&mk(0.0, "we ship Thursday", "Mic", Some(1)))
-            .unwrap();
+        w.append(&mk(0.0, "we ship Thursday", "Mic", Some(1))).unwrap();
         w.append(&mk(0.6, "hmm", "System audio", None)).unwrap();
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),

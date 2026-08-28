@@ -13,8 +13,8 @@
 
 use anyhow::{Result, bail};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_RETURN,
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, KEYBD_EVENT_FLAGS,
+    SendInput, VIRTUAL_KEY, VK_RETURN,
 };
 
 /// Type `text` into whatever window has focus.
@@ -83,7 +83,9 @@ mod tests {
     /// Build the event list without sending it, so the encoding can be checked
     /// without typing into whatever window happens to be focused.
     fn encode(text: &str) -> Vec<u16> {
-        text.encode_utf16().filter(|u| *u != b'\r' as u16).collect()
+        text.encode_utf16()
+            .filter(|u| *u != b'\r' as u16)
+            .collect()
     }
 
     #[test]
@@ -102,9 +104,6 @@ mod tests {
     fn crlf_presses_enter_once() {
         // Both halves reaching the key builder would submit a chat message
         // twice.
-        assert_eq!(
-            encode("a\r\nb"),
-            vec![b'a' as u16, b'\n' as u16, b'b' as u16]
-        );
+        assert_eq!(encode("a\r\nb"), vec![b'a' as u16, b'\n' as u16, b'b' as u16]);
     }
 }

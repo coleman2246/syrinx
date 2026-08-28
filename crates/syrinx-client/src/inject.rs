@@ -275,10 +275,7 @@ pub fn preflight(method: Method) -> Result<()> {
         match Command::new(bin).arg("--help").output() {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                bail!(
-                    "{bin} not found on PATH; it is required for {}",
-                    method.label()
-                )
+                bail!("{bin} not found on PATH; it is required for {}", method.label())
             }
             Err(e) => return Err(e).with_context(|| format!("checking for {bin}")),
         }

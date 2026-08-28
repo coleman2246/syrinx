@@ -414,8 +414,7 @@ mod tests {
 
     #[test]
     fn provider_parses_from_config() {
-        let c =
-            Config::from_toml("token = \"a\"\nmodel_dir = \"/m\"\nprovider = \"cuda\"").unwrap();
+        let c = Config::from_toml("token = \"a\"\nmodel_dir = \"/m\"\nprovider = \"cuda\"").unwrap();
         assert_eq!(c.provider, Provider::Cuda);
     }
 
@@ -463,8 +462,10 @@ mod tests {
 
     #[test]
     fn diarize_model_dir_parses() {
-        let c = Config::from_toml("token = \"a\"\nmodel_dir = \"/m\"\ndiarize_model_dir = \"/d\"")
-            .unwrap();
+        let c = Config::from_toml(
+            "token = \"a\"\nmodel_dir = \"/m\"\ndiarize_model_dir = \"/d\"",
+        )
+        .unwrap();
         assert_eq!(c.diarize_model_dir.as_deref(), Some("/d"));
     }
 

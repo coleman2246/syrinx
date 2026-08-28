@@ -17,9 +17,9 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowTextW, MSG, PM_REMOVE, PeekMessageW,
-    SW_SHOW, SetForegroundWindow, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowTextW, PeekMessageW,
+    SetForegroundWindow, ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW,
+    WINDOW_EX_STYLE, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 // SetFocus lives with the keyboard APIs rather than the window ones.
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;

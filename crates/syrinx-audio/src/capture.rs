@@ -28,7 +28,9 @@ impl Capture {
                 // produced silence while the same card's capture device
                 // happened to work, which reads as the two being swapped.
                 let cap = match source.kind {
-                    crate::SourceKind::Microphone => crate::pipewire::PwCapture::start(*id, tx)?,
+                    crate::SourceKind::Microphone => {
+                        crate::pipewire::PwCapture::start(*id, tx)?
+                    }
                     crate::SourceKind::Monitor | crate::SourceKind::Application => {
                         crate::pipewire::PwCapture::start_linked(*id, tx)?
                     }
@@ -107,7 +109,8 @@ impl CpalCapture {
                     config,
                     move |d: &[u8], _| {
                         // U8 is unsigned with 128 as silence.
-                        let f: Vec<f32> = d.iter().map(|s| (*s as f32 - 128.0) / 128.0).collect();
+                        let f: Vec<f32> =
+                            d.iter().map(|s| (*s as f32 - 128.0) / 128.0).collect();
                         let _ = tx.try_send(resample_to_16k(&downmix_to_mono(&f, channels), rate));
                     },
                     err_fn,

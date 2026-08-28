@@ -11,10 +11,10 @@
 
 #![cfg(feature = "cuda")]
 
-use std::path::PathBuf;
 use syrinx_proto::Mode;
 use syrinx_server::asr::parakeet::ParakeetBackend;
 use syrinx_server::session::Session;
+use std::path::PathBuf;
 
 fn model_dir() -> PathBuf {
     PathBuf::from(
@@ -66,9 +66,7 @@ fn transcribes_golden_audio() {
     // A word-overlap ratio still fails loudly if the model regresses or the
     // execution provider silently changes, without breaking on a single
     // stubborn word.
-    let expected = [
-        "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog",
-    ];
+    let expected = ["the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog"];
     let hits = expected.iter().filter(|w| got.contains(*w)).count();
     let ratio = hits as f32 / expected.len() as f32;
     assert!(
@@ -91,12 +89,7 @@ fn streams_share_one_model_and_decode_independently() {
 
     let collect = |s: &mut Session, audio: &[f32]| -> String {
         let mut out = String::new();
-        for m in s
-            .push_audio(audio)
-            .unwrap()
-            .into_iter()
-            .chain(s.finish().unwrap())
-        {
+        for m in s.push_audio(audio).unwrap().into_iter().chain(s.finish().unwrap()) {
             if let syrinx_proto::ServerMessage::TranscriptCommit { text, .. } = m {
                 out.push_str(&text);
             }

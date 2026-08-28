@@ -201,7 +201,10 @@ impl ModelHandle {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.loaded.lock().expect("model lock poisoned").is_some()
+        self.loaded
+            .lock()
+            .expect("model lock poisoned")
+            .is_some()
     }
 
     /// Background task dropping the model once idle. Runs for the process
@@ -301,15 +304,8 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.message().contains("refusing to load"), "got: {err}");
-        assert!(
-            err.is_retryable(),
-            "VRAM pressure is transient, so retryable"
-        );
-        assert_eq!(
-            n.load(Ordering::SeqCst),
-            0,
-            "must not have attempted a load"
-        );
+        assert!(err.is_retryable(), "VRAM pressure is transient, so retryable");
+        assert_eq!(n.load(Ordering::SeqCst), 0, "must not have attempted a load");
     }
 
     #[test]

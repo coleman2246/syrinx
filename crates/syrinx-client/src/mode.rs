@@ -1,7 +1,7 @@
 //! What to do with transcribed text.
 
-use serde::{Deserialize, Serialize};
 use syrinx_proto::Mode as WireMode;
+use serde::{Deserialize, Serialize};
 
 /// What the client does with text as it arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -69,7 +69,11 @@ impl OutputMode {
         }
     }
 
-    pub const ALL: [OutputMode; 3] = [OutputMode::Transcribe, OutputMode::Type, OutputMode::Both];
+    pub const ALL: [OutputMode; 3] = [
+        OutputMode::Transcribe,
+        OutputMode::Type,
+        OutputMode::Both,
+    ];
 }
 
 #[cfg(test)]

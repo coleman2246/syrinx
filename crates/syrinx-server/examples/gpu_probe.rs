@@ -17,9 +17,9 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn main() -> anyhow::Result<()> {
-    use std::time::Instant;
     use syrinx_server::asr::AsrBackend;
     use syrinx_server::asr::parakeet::ParakeetBackend;
+    use std::time::Instant;
 
     // ort logs through `tracing`. Without a subscriber its provider-registration
     // errors are silently discarded, which is how a CPU fallback stays hidden.
@@ -54,11 +54,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "real-time factor:    {:.2}x -> {}",
         median / chunk_ms,
-        if median < chunk_ms {
-            "KEEPS UP"
-        } else {
-            "TOO SLOW"
-        }
+        if median < chunk_ms { "KEEPS UP" } else { "TOO SLOW" }
     );
     println!(
         "concurrent streams:  ~{:.0} before saturating",

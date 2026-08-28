@@ -147,9 +147,7 @@ pub fn render(segments: &[Segment], fallback: &str, format: Format) -> String {
             turns(segments)
                 .into_iter()
                 .map(|(speaker, segs)| {
-                    let prefix = speaker
-                        .map(|n| format!("Speaker {n}: "))
-                        .unwrap_or_default();
+                    let prefix = speaker.map(|n| format!("Speaker {n}: ")).unwrap_or_default();
                     let text: String = segs.iter().map(|s| s.text.as_str()).collect();
                     format!("{prefix}{text}")
                 })
@@ -254,9 +252,7 @@ fn render_line(segs: &[&Segment], speaker: Option<u32>, format: Format) -> Strin
         (Format::Labelled, Some(src)) => format!("[{src}] "),
         _ => String::new(),
     };
-    let speaker_prefix = speaker
-        .map(|n| format!("Speaker {n}: "))
-        .unwrap_or_default();
+    let speaker_prefix = speaker.map(|n| format!("Speaker {n}: ")).unwrap_or_default();
     // Only the first segment is ever trimmed: fully, if it is also the last
     // (matching the pre-turns single-line-per-segment convention); from the
     // left only otherwise, since `StreamWriter` writes every continuation
@@ -347,7 +343,11 @@ pub fn path_for_source(base: &Path, source: &str) -> PathBuf {
 }
 
 /// Save each source to its own file beside `base`, returning the paths.
-pub fn save_per_source(base: &Path, segments: &[Segment], format: Format) -> Result<Vec<PathBuf>> {
+pub fn save_per_source(
+    base: &Path,
+    segments: &[Segment],
+    format: Format,
+) -> Result<Vec<PathBuf>> {
     let groups = by_source(segments);
     if groups.is_empty() {
         anyhow::bail!("nothing to save: the transcript is empty");
@@ -427,7 +427,8 @@ pub fn write(path: &Path, transcript: &str) -> Result<()> {
     }
     // Trailing newline: this is a text file, and tools that read it line-wise
     // expect one.
-    std::fs::write(path, format!("{body}\n")).with_context(|| format!("writing {}", path.display()))
+    std::fs::write(path, format!("{body}\n"))
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Save to the default directory under a timestamped name, returning the path.
@@ -468,10 +469,7 @@ mod tests {
         for i in [4, 7] {
             assert_eq!(bytes[i], b'-', "expected a date separator at {i} in {s:?}");
         }
-        assert_eq!(
-            bytes[10], b'_',
-            "expected date and time to be split in {s:?}"
-        );
+        assert_eq!(bytes[10], b'_', "expected date and time to be split in {s:?}");
         for i in [13, 16] {
             assert_eq!(bytes[i], b'-', "expected a time separator at {i} in {s:?}");
         }
@@ -493,28 +491,17 @@ mod tests {
     fn timestamps_sort_the_same_way_as_time() {
         // The whole reason for this ordering: a folder of these listed
         // alphabetically is in the order they were recorded.
-        let mut names = [
-            "2026-08-21_09-00-00",
-            "2026-01-02_23-59-59",
-            "2026-08-21_10-00-00",
-        ];
+        let mut names = ["2026-08-21_09-00-00", "2026-01-02_23-59-59", "2026-08-21_10-00-00"];
         names.sort_unstable();
         assert_eq!(
             names,
-            [
-                "2026-01-02_23-59-59",
-                "2026-08-21_09-00-00",
-                "2026-08-21_10-00-00"
-            ]
+            ["2026-01-02_23-59-59", "2026-08-21_09-00-00", "2026-08-21_10-00-00"]
         );
     }
 
     #[test]
     fn a_filename_is_the_timestamp_and_nothing_else() {
-        assert_eq!(
-            filename_for("2026-08-21_14-53-07"),
-            "2026-08-21_14-53-07.txt"
-        );
+        assert_eq!(filename_for("2026-08-21_14-53-07"), "2026-08-21_14-53-07.txt");
     }
 
     #[test]
@@ -836,7 +823,10 @@ mod tests {
         let segs = [seg_spk(0.0, "hello ", None), seg_spk(0.6, "there", Some(1))];
         assert_eq!(
             turn_texts(&segs),
-            vec![(None, "hello ".to_string()), (Some(1), "there".to_string()),]
+            vec![
+                (None, "hello ".to_string()),
+                (Some(1), "there".to_string()),
+            ]
         );
     }
 

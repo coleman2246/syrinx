@@ -8,9 +8,9 @@ use crate::inject;
 use crate::mode::OutputMode;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use std::sync::{Arc, Mutex};
 use syrinx_audio::{Capture, Source};
 use syrinx_proto::{ClientMessage, Encoding, SAMPLE_RATE, ServerMessage};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
@@ -293,7 +293,10 @@ impl Drop for SessionHandle {
 ///
 /// `on_change` fires whenever state moves, so a UI can repaint on demand rather
 /// than polling.
-pub fn start(opts: SessionOptions, on_change: impl Fn() + Send + Sync + 'static) -> SessionHandle {
+pub fn start(
+    opts: SessionOptions,
+    on_change: impl Fn() + Send + Sync + 'static,
+) -> SessionHandle {
     let state = Arc::new(Mutex::new(SessionState {
         status: Status::Connecting,
         ..Default::default()

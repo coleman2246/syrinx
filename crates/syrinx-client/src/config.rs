@@ -100,8 +100,10 @@ impl Config {
                     // field, and naming it without showing a whole valid file
                     // invites replacing the file with just that field.
                     let cfg: Config = toml::from_str(&text).map_err(|e| {
-                        anyhow::anyhow!("{}\n\n{}", e, EXAMPLE_HINT)
-                            .context(format!("the config at {} is not valid", p.display()))
+                        anyhow::anyhow!("{}\n\n{}", e, EXAMPLE_HINT).context(format!(
+                            "the config at {} is not valid",
+                            p.display()
+                        ))
                     })?;
                     // Loading a legacy path is announced. It used to be
                     // silent, so deleting the canonical config did not
@@ -193,7 +195,8 @@ impl Config {
         set_or_remove(&mut doc, "stream_to", self.stream_to.as_deref());
         set_or_remove(&mut doc, "hotkey", self.hotkey.as_deref());
 
-        std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+        std::fs::write(path, doc.to_string())
+            .with_context(|| format!("writing {}", path.display()))
     }
 }
 
@@ -290,12 +293,7 @@ pub fn template() -> String {
 
     s.push_str("# What to do with the text that comes back.\n");
     for m in OutputMode::ALL {
-        s.push_str(&format!(
-            "#   \"{}\"{} -- {}\n",
-            m.name(),
-            pad(m.name()),
-            m.summary()
-        ));
+        s.push_str(&format!("#   \"{}\"{} -- {}\n", m.name(), pad(m.name()), m.summary()));
     }
     s.push_str(&format!("mode = \"{}\"\n\n", OutputMode::default().name()));
 
@@ -310,12 +308,7 @@ pub fn template() -> String {
 
     s.push_str("# How text is typed at the cursor, for the modes above that type.\n");
     for m in crate::inject::Method::ALL {
-        s.push_str(&format!(
-            "#   \"{}\"{} -- {}\n",
-            m.name(),
-            pad(m.name()),
-            m.summary()
-        ));
+        s.push_str(&format!("#   \"{}\"{} -- {}\n", m.name(), pad(m.name()), m.summary()));
     }
     s.push_str(&format!(
         "inject = \"{}\"\n\n",
@@ -509,7 +502,8 @@ mod tests {
             "ws://localhost:9000/some/other/path",
             "wss://edge.example.com:8443/asr",
         ] {
-            let c: Config = toml::from_str(&format!("token = \"t\"\nurl = \"{written}\"")).unwrap();
+            let c: Config =
+                toml::from_str(&format!("token = \"t\"\nurl = \"{written}\"")).unwrap();
             assert_eq!(c.url, written, "the address was rewritten");
         }
     }
@@ -518,9 +512,10 @@ mod tests {
     fn server_is_accepted_as_a_name_for_the_same_setting() {
         // Configs written before this change say `server`. They must keep
         // working, and mean exactly the same thing.
-        let c: Config =
-            toml::from_str("token = \"t\"\nserver = \"wss://dictate.example.com/v1/stream\"")
-                .unwrap();
+        let c: Config = toml::from_str(
+            "token = \"t\"\nserver = \"wss://dictate.example.com/v1/stream\"",
+        )
+        .unwrap();
         assert_eq!(c.url, "wss://dictate.example.com/v1/stream");
     }
 
@@ -530,10 +525,7 @@ mod tests {
         // reported against the config file rather than at connect time.
         let e = check_url("192.168.1.10").unwrap_err();
         assert!(e.contains("ws://"), "got: {e}");
-        assert!(
-            e.contains("192.168.1.10"),
-            "should quote what was written: {e}"
-        );
+        assert!(e.contains("192.168.1.10"), "should quote what was written: {e}");
     }
 
     #[test]
@@ -669,10 +661,7 @@ mod tests {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap();
-        assert_eq!(
-            expand_tilde("~/notes.txt"),
-            PathBuf::from(&home).join("notes.txt")
-        );
+        assert_eq!(expand_tilde("~/notes.txt"), PathBuf::from(&home).join("notes.txt"));
         assert_eq!(expand_tilde("~"), PathBuf::from(&home));
     }
 
@@ -710,10 +699,7 @@ mod tests {
 
         write_template(&path).unwrap();
 
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "token = \"mine\"\n"
-        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "token = \"mine\"\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -781,17 +767,14 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(&path, template()).unwrap();
 
-        let mut c: Config =
-            toml::from_str(&template().replace("token = \"\"", "token = \"t\"")).unwrap();
+        let mut c: Config = toml::from_str(&template().replace("token = \"\"", "token = \"t\""))
+            .unwrap();
         c.source_key = Some("some_source".into());
         c.save(&path).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains('#'), "comments were lost:\n{after}");
-        assert!(
-            after.contains("What to do with the text"),
-            "lost the mode docs"
-        );
+        assert!(after.contains("What to do with the text"), "lost the mode docs");
         assert!(after.contains("some_source"), "the new value was not saved");
 
         // And it must still load.
@@ -816,7 +799,8 @@ mod tests {
 
     #[test]
     fn the_injection_method_parses_from_config() {
-        let c: Config = toml::from_str("token = \"a\"\ninject = \"ydotool\"").unwrap();
+        let c: Config =
+            toml::from_str("token = \"a\"\ninject = \"ydotool\"").unwrap();
         assert_eq!(c.inject, crate::inject::Method::Ydotool);
     }
 

@@ -321,9 +321,7 @@ mod tests {
 
     #[test]
     fn the_version_string_is_nul_terminated() {
-        let v = unsafe { CStr::from_ptr(syrinx_version()) }
-            .to_str()
-            .unwrap();
+        let v = unsafe { CStr::from_ptr(syrinx_version()) }.to_str().unwrap();
         assert!(!v.is_empty());
     }
 
