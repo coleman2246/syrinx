@@ -575,7 +575,13 @@ fn run_daemon(
     let cfg = Config::load(config)?;
     let format = resolve_format(format, &cfg);
     let mode = mode.map(OutputMode::from).unwrap_or(cfg.mode);
-    let source_key = source.or_else(|| cfg.source_key.clone());
+    // A source named on the command line replaces the whole remembered
+    // selection; it is an explicit instruction about this run.
+    let source_keys = match source {
+        Some(s) => vec![s],
+        None => cfg.selected_sources(),
+    };
+    let source_mode = cfg.source_mode;
 
     // Signals stop the daemon, so ^C and `systemctl stop` behave.
     let stop_path = state::default_pid_path();
@@ -588,8 +594,8 @@ fn run_daemon(
     syrinx_client::daemon::run(syrinx_client::daemon::DaemonOptions {
         config: cfg,
         mode,
-        source_keys: source_key.into_iter().collect(),
-        source_mode: Default::default(),
+        source_keys,
+        source_mode,
         save_each,
         format,
         // Sits beside this binary, so a viewer opens from the same build.

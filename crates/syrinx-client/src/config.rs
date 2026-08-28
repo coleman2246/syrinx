@@ -23,8 +23,24 @@ pub struct Config {
     pub token: String,
     /// Remembered source, as a `Source::stable_key`. Node ids change between
     /// runs, so a key is stored rather than an id.
+    ///
+    /// Superseded by `source_keys`, and kept in step with its first element so
+    /// that downgrading to a build that only knows this one still finds a
+    /// source the user actually chose.
     #[serde(default)]
     pub source_key: Option<String>,
+    /// Every remembered source, in order. The first is the one that types at
+    /// the cursor in separate mode.
+    ///
+    /// Read through [`Config::selected_sources`], which falls back to the
+    /// singular `source_key` above, so a config written before this existed
+    /// keeps working.
+    #[serde(default)]
+    pub source_keys: Vec<String>,
+    /// How several selected sources are handled: mixed into one transcript, or
+    /// transcribed independently.
+    #[serde(default)]
+    pub source_mode: crate::mode::SourceMode,
     #[serde(default)]
     pub mode: OutputMode,
     /// Ask the server for anonymous speaker labels (Speaker 1, Speaker 2,
@@ -69,6 +85,18 @@ impl Config {
     /// Where to stream the transcript, with `~` expanded.
     pub fn stream_path(&self) -> Option<PathBuf> {
         self.stream_to.as_deref().map(expand_tilde)
+    }
+
+    /// Every remembered source, whichever shape the file is in.
+    ///
+    /// `source_keys` is authoritative when it has anything in it. Otherwise
+    /// the singular `source_key` is the whole selection, which is what every
+    /// config written before multiple sources existed says.
+    pub fn selected_sources(&self) -> Vec<String> {
+        if !self.source_keys.is_empty() {
+            return self.source_keys.clone();
+        }
+        self.source_key.iter().cloned().collect()
     }
 
     /// Canonical location.
@@ -186,7 +214,21 @@ impl Config {
         doc["diarize"] = toml_edit::value(self.diarize);
         doc["inject"] = toml_edit::value(self.inject.name());
         doc["format"] = toml_edit::value(self.format.name());
+        doc["source_mode"] = toml_edit::value(self.source_mode.name());
         doc["waybar_signal"] = toml_edit::value(i64::from(self.waybar_signal));
+
+        // An empty selection is written as no key at all rather than an empty
+        // array, so `selected_sources` falls back to `source_key` exactly as it
+        // does for a config that predates this.
+        if self.source_keys.is_empty() {
+            doc.remove("source_keys");
+        } else {
+            let mut keys = toml_edit::Array::new();
+            for k in &self.source_keys {
+                keys.push(k.as_str());
+            }
+            doc["source_keys"] = toml_edit::value(keys);
+        }
 
         // Every optional field has to be handled, or a setting changed from a
         // front-end is applied and then lost on restart. Three of these were
@@ -344,10 +386,25 @@ pub fn template() -> String {
     ));
 
     s.push_str(
-        "# Capture source to use, as printed by `syrinx sources`.\n\
+        "# Capture sources to use, as printed by `syrinx sources`.\n\
          # Left unset, syrinx asks or uses the default input.\n\
-         # source_key = \"...\"\n\n",
+         # source_keys = [\"...\", \"...\"]\n\
+         # source_key = \"...\"    # the older single-source spelling\n\n",
     );
+
+    s.push_str("# What to do when more than one source is selected.\n");
+    for m in crate::mode::SourceMode::ALL {
+        s.push_str(&format!(
+            "#   \"{}\"{} -- {}\n",
+            m.name(),
+            pad(m.name()),
+            m.summary()
+        ));
+    }
+    s.push_str(&format!(
+        "source_mode = \"{}\"\n\n",
+        crate::mode::SourceMode::default().name()
+    ));
 
     s.push_str("# Realtime signal number for the waybar status indicator.\n");
     s.push_str("# Linux only; ignored elsewhere.\n");
@@ -718,6 +775,8 @@ mod tests {
             url: "ws://laptop.lan:9001/v1/stream".into(),
             token: "a-token".into(),
             source_key: Some("some-source".into()),
+            source_keys: vec!["some-source".into(), "another-source".into()],
+            source_mode: crate::mode::SourceMode::Separate,
             stream_to: Some("~/notes.txt".into()),
             format: crate::save::Format::Labelled,
             mode: OutputMode::Both,
@@ -844,6 +903,8 @@ mod tests {
             token: "t".into(),
             hotkey: Some("ctrl+alt+d".into()),
             source_key: Some("rnnoise_source".into()),
+            source_keys: vec!["rnnoise_source".into(), "cpal:out:Speakers".into()],
+            source_mode: crate::mode::SourceMode::Separate,
             mode: OutputMode::Both,
             diarize: true,
             inject: Default::default(),
@@ -851,8 +912,106 @@ mod tests {
         };
         let back: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
         assert_eq!(back.source_key, c.source_key);
+        assert_eq!(back.source_keys, c.source_keys);
+        assert_eq!(back.source_mode, c.source_mode);
         assert_eq!(back.mode, c.mode);
         assert_eq!(back.diarize, c.diarize);
         assert_eq!(back.waybar_signal, c.waybar_signal);
+    }
+
+    #[test]
+    fn a_two_source_selection_survives_a_restart() {
+        // The fault this fixes: `SetSources` stored the selection on the
+        // daemon and never wrote it down, unlike every other setting a
+        // front-end can change. Restarting silently reverted to one source,
+        // the user re-ticked the second box, and was straight back into the
+        // mixer's starvation gate. "A few times before it works" is that loop.
+        let dir = scratch("twosources");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, template()).unwrap();
+
+        let mut c: Config =
+            toml::from_str(&template().replace("token = \"\"", "token = \"t\"")).unwrap();
+        c.source_keys = vec!["cpal:in:Yeti".into(), "cpal:out:Speakers".into()];
+        c.source_key = c.source_keys.first().cloned();
+        c.source_mode = crate::mode::SourceMode::Separate;
+        c.save(&path).unwrap();
+
+        let back = Config::load(Some(path.clone())).unwrap();
+        assert_eq!(back.selected_sources(), c.source_keys);
+        assert_eq!(back.source_mode, crate::mode::SourceMode::Separate);
+        // And written through, so a downgrade to a build that only knows the
+        // singular key still finds a source the user actually chose.
+        assert_eq!(back.source_key.as_deref(), Some("cpal:in:Yeti"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_config_carrying_only_the_legacy_source_key_still_resolves_to_one_source() {
+        // Every config written before multiple sources existed says this and
+        // nothing else. It has to keep meaning what it always meant.
+        let c: Config =
+            toml::from_str("token = \"t\"\nsource_key = \"rnnoise_source\"").unwrap();
+        assert!(c.source_keys.is_empty());
+        assert_eq!(c.selected_sources(), vec!["rnnoise_source".to_string()]);
+        assert_eq!(c.source_mode, crate::mode::SourceMode::Combined);
+    }
+
+    #[test]
+    fn a_config_naming_no_source_at_all_selects_nothing() {
+        // Not one empty string: the daemon reads this list to decide what to
+        // open, and a phantom entry would have it look for a device named "".
+        let c: Config = toml::from_str("token = \"t\"").unwrap();
+        assert!(c.selected_sources().is_empty());
+    }
+
+    #[test]
+    fn several_sources_win_over_the_single_one_they_replaced() {
+        // Both are written, so both are present; the list is the authority.
+        let c: Config = toml::from_str(
+            "token = \"t\"\nsource_key = \"a\"\nsource_keys = [\"a\", \"b\"]",
+        )
+        .unwrap();
+        assert_eq!(c.selected_sources(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn clearing_the_selection_removes_the_list_rather_than_emptying_it() {
+        // An empty array left in the file would be a selection of no sources,
+        // which is not the same as an unset one -- the fallback to
+        // `source_key` would stop working.
+        let dir = scratch("clearsources");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "token = \"t\"\nsource_key = \"a\"\nsource_keys = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+
+        let mut c = Config::load(Some(path.clone())).unwrap();
+        c.source_keys.clear();
+        c.save(&path).unwrap();
+
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("source_keys"));
+        assert_eq!(
+            Config::load(Some(path.clone())).unwrap().selected_sources(),
+            vec!["a".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_template_documents_how_sources_are_combined() {
+        let text = template();
+        assert!(text.contains("source_keys"), "the list is undocumented:\n{text}");
+        for m in crate::mode::SourceMode::ALL {
+            assert!(
+                text.contains(&format!("\"{}\"", m.name())),
+                "source mode {} is undocumented:\n{text}",
+                m.name()
+            );
+        }
     }
 }

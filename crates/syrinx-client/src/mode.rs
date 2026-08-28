@@ -158,6 +158,22 @@ impl SourceMode {
         }
     }
 
+    /// The value as written in the config file. See `OutputMode::name`.
+    pub fn name(self) -> &'static str {
+        match self {
+            SourceMode::Combined => "combined",
+            SourceMode::Separate => "separate",
+        }
+    }
+
+    /// One line for the generated config.
+    pub fn summary(self) -> &'static str {
+        match self {
+            SourceMode::Combined => "mix every source into one transcript",
+            SourceMode::Separate => "transcribe each source on its own, labelled by where it came from",
+        }
+    }
+
     pub const ALL: [SourceMode; 2] = [SourceMode::Combined, SourceMode::Separate];
 }
 
@@ -183,5 +199,16 @@ mod source_mode_tests {
     #[test]
     fn labels_are_distinct() {
         assert_ne!(SourceMode::Combined.label(), SourceMode::Separate.label());
+    }
+
+    #[test]
+    fn config_names_match_what_serde_accepts() {
+        // Written into the generated config and back out by `Config::save`; a
+        // mismatch would emit a file syrinx cannot read back, which for this
+        // setting means silently reverting to Combined on the next start.
+        for m in SourceMode::ALL {
+            let quoted = format!("\"{}\"", m.name());
+            assert_eq!(serde_json::from_str::<SourceMode>(&quoted).unwrap(), m);
+        }
     }
 }

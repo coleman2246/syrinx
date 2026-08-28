@@ -239,7 +239,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                     Response::Ok
                 }
                 Request::SetSource { key } => {
-                    state.opts.source_keys = vec![key];
+                    state.remember_sources(vec![key], None);
                     Response::Ok
                 }
                 Request::SetSources { keys, source_mode } => {
@@ -248,10 +248,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                             message: "stop the session before changing sources".into(),
                         }
                     } else {
-                        state.opts.source_keys = keys;
-                        if let Some(m) = source_mode {
-                            state.opts.source_mode = m;
-                        }
+                        state.remember_sources(keys, source_mode);
                         Response::Ok
                     }
                 }
@@ -510,6 +507,31 @@ struct TranscriptCache {
 impl DaemonRuntime {
     fn running(&self) -> bool {
         self.sessions.iter().any(|s| s.is_running())
+    }
+
+    /// Take a new source selection, and write it down.
+    ///
+    /// Written back to the config for the same reason `set_diarize` is: this
+    /// selection reaches a session from `opts`, and a choice that died with
+    /// the daemon sent the user back to the picker on every start. It used to,
+    /// and the reset was silent -- the daemon fell back to `config.source_key`
+    /// or to `choose_source(.., None)`, which never picks a monitor -- so a
+    /// two-source selection came back as one working source with no
+    /// explanation.
+    ///
+    /// `source_key` is kept in step with the first element so that a build
+    /// which only knows the singular key still finds a source the user chose.
+    fn remember_sources(&mut self, keys: Vec<String>, mode: Option<crate::mode::SourceMode>) {
+        self.opts.source_keys = keys.clone();
+        self.opts.config.source_key = keys.first().cloned();
+        self.opts.config.source_keys = keys;
+        if let Some(m) = mode {
+            self.opts.source_mode = m;
+            self.opts.config.source_mode = m;
+        }
+        if let Err(e) = self.opts.config.save(&crate::Config::default_path()) {
+            warn!("saving the config: {e:#}");
+        }
     }
 
     /// Start, stop or re-point the level meter.
@@ -1028,6 +1050,8 @@ mod tests {
             url: "ws://127.0.0.1:8770/v1/stream".into(),
             token: "t".into(),
             source_key: None,
+            source_keys: Vec::new(),
+            source_mode: Default::default(),
             mode: OutputMode::Transcribe,
             diarize: true,
             inject: Default::default(),
