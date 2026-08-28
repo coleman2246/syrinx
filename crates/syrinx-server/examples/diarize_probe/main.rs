@@ -16,6 +16,7 @@
 //! | `sweep` | which constants are best, and how sharp is the cliff? |
 //! | `bench` | what does one session cost on one core? |
 //! | `lag` | how long must a chunk wait for a label to exist? |
+//! | `live` | what does a *session* do -- first-label and turn-switch latency? |
 //!
 //! **Models and audio live outside the repository**, in `$DIARIZE_SPIKE_DIR`
 //! (default `~/models/diarize-spike`) -- the directory the spike left behind,
@@ -55,12 +56,14 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 
 use syrinx_server::diarize::cluster::{
-    EMA_ALPHA, MIN_POOL, OnlineClusterer, T_ASSIGN, T_MARGIN, T_RETIRE, cosine,
+    EMA_ALPHA, MIN_POOL, OnlineClusterer, T_ASSIGN, T_CHANGE, T_MARGIN, T_RETIRE, cosine,
 };
 use syrinx_server::diarize::fbank::SAMPLE_RATE;
 use syrinx_server::diarize::real::{Embedder, Vad, norm_for};
 use syrinx_server::diarize::window::{Cut, FRAME, Framed, WINDOW_SAMPLES, WindowAssembler};
+use syrinx_server::session::{LAG_CHUNKS, RELABEL_WINDOW};
 
+mod live;
 mod reference;
 use reference::Reference;
 
@@ -789,6 +792,34 @@ const BENCH: Spec = Spec {
         ("--runs", true, "windows to average over"),
     ],
 };
+const LIVE: Spec = Spec {
+    name: "live",
+    what: "replay a real session and measure the two latencies it is judged on",
+    operand: "<wav>",
+    flags: &[
+        MODEL_FLAG,
+        (
+            "--wav",
+            true,
+            "comma-separated recordings; several are spliced into one larger room",
+        ),
+        ("--chunk", true, "ASR chunk length in seconds"),
+        ("--lag", true, "diarize_lag_chunks"),
+        MIN_POOL_FLAG,
+        MARGIN_FLAG,
+        ("--change", true, "diarize_change_threshold"),
+        (
+            "--relabel-window",
+            true,
+            "diarize_relabel_window, in seconds",
+        ),
+        (
+            "--slice",
+            true,
+            "seconds of each recording per turn when splicing",
+        ),
+    ],
+};
 const LAG: Spec = Spec {
     name: "lag",
     what: "how long a chunk waits for a label to exist",
@@ -921,6 +952,7 @@ const SPECS: &[Subcommand] = &[
     (&SWEEP, sweep),
     (&BENCH, bench),
     (&LAG, lag),
+    (&LIVE, live),
 ];
 
 fn usage() -> String {
@@ -1433,6 +1465,141 @@ fn lag(args: &Args) -> Result<()> {
             pct(0.9),
             pct(0.99),
             pct(0.9) / chunk
+        );
+    }
+    Ok(())
+}
+
+/// Replay a real session over a recording and report the two latencies the
+/// 2026-08-27 design is judged on.
+///
+/// The other subcommands measure a batch diarization: `label_frames` paints
+/// each frame with the majority of the windows covering it, which is backwards
+/// painting and cannot see either latency a live session has. This one runs
+/// `RealDiarizerFactory` and a real `Session`, so every rule that decides a
+/// label -- carry-forward, the majority vote, the lag, change detection,
+/// corrections -- is the server's own rather than a copy of it.
+///
+/// **Nothing here has been run.** `T_MARGIN`, `T_CHANGE`, `T_ZNORM`,
+/// `T_MARGIN_SHORT` and `RELABEL_WINDOW` are engineering estimates, and these
+/// are the measurements that replace them.
+fn live(args: &Args) -> Result<()> {
+    let names = match args.positional() {
+        Some(one) => vec![one.to_string()],
+        None => args.list("--wav", "ES2002a.Mix-Headset.wav"),
+    };
+    let chunk_s = args.num("--chunk", 0.56)?;
+    let chunk_samples = (chunk_s * SAMPLE_RATE) as usize;
+    ensure!(
+        chunk_samples.is_multiple_of(160),
+        "--chunk {chunk_s} is {chunk_samples} samples, which is not a whole \
+         number of 10 ms reference frames; the painting below aligns to those"
+    );
+
+    let tuning = syrinx_server::diarize::DiarizeTuning {
+        min_pool: args.num("--min-pool", MIN_POOL as f32)? as usize,
+        margin: args.num("--margin", T_MARGIN)?,
+        change_threshold: args.num("--change", T_CHANGE)?,
+    };
+    let session_tuning = syrinx_server::session::SessionTuning {
+        lag_chunks: args.num("--lag", LAG_CHUNKS as f32)? as usize,
+        relabel_window: args.num("--relabel-window", RELABEL_WINDOW as f32)? as u64,
+    };
+
+    // Every recording, with its annotation, then spliced if there is more than
+    // one. A single recording goes through the same path, so a one-wav run and
+    // the first slice of a two-wav run differ in nothing but the room.
+    let mut sources = Vec::new();
+    for name in &names {
+        let wav = resolve("audio", name);
+        let reference = Reference::load_ami(&format!("{}/annot", probe_dir()), &meeting_of(&wav))?;
+        sources.push((reference::read_wav(&wav)?, reference));
+    }
+    let slice_frames = (args.num("--slice", 10.0)? / reference::FRAME_MS) as usize;
+    let (samples, reference) = if sources.len() == 1 {
+        sources.pop().expect("one source")
+    } else {
+        live::splice(sources, slice_frames)?
+    };
+
+    eprintln!(
+        "{} / {} speakers / {:.1} min / {:?} {:?}",
+        names.join(" + "),
+        reference.names.len(),
+        samples.len() as f32 / SAMPLE_RATE / 60.0,
+        tuning,
+        session_tuning,
+    );
+
+    let model = model_path(args.get("--model").unwrap_or(CHOSEN));
+    // The factory checks the models at load, exactly as the server does at
+    // startup, so a broken directory fails here rather than mid-replay.
+    let factory = live::factory(&probe_dir(), tuning)?;
+    eprintln!("  model directory {} ({})", probe_dir(), basename(&model));
+
+    let started = std::time::Instant::now();
+    let replay = live::replay(&samples, &factory, chunk_samples, session_tuning)?;
+    eprintln!(
+        "  replayed {:.1} min in {:.0}s ({:.1}x real time)",
+        samples.len() as f32 / SAMPLE_RATE / 60.0,
+        started.elapsed().as_secs_f32(),
+        (samples.len() as f32 / SAMPLE_RATE) / started.elapsed().as_secs_f32().max(0.001),
+    );
+
+    let frames = reference.frames.len();
+    let painted = [
+        ("live", live::paint(&replay.live, chunk_samples, frames)),
+        (
+            "corrected",
+            live::paint(&replay.corrected, chunk_samples, frames),
+        ),
+    ];
+
+    println!(
+        "  {} corrections covering {} commits",
+        replay.relabels, replay.relabelled_commits
+    );
+
+    for (what, hyp) in &painted {
+        let m = reference::score(hyp, &reference);
+        println!(
+            "  {what:<10} {} labels for {} speakers, splits {}, merges {}, \
+             miss {:.1}%, confusion {:.1}%",
+            m.hyp_speakers,
+            m.ref_speakers,
+            m.splits,
+            m.merges,
+            100.0 * m.miss,
+            100.0 * m.confusion
+        );
+
+        let first = live::first_label_latency(hyp, &reference, chunk_samples);
+        let shown: Vec<String> = reference
+            .names
+            .iter()
+            .zip(&first)
+            .map(|(name, latency)| match latency {
+                Some(s) => format!("{name} {s:.2}s"),
+                None => format!("{name} never"),
+            })
+            .collect();
+        println!(
+            "    first label, in that speaker's own speech: {}",
+            shown.join(", ")
+        );
+
+        let (switches, real) = live::turn_switch_latency(hyp, &reference, chunk_samples);
+        if switches.is_empty() {
+            println!("    turn switch: none of {real} real turn changes was followed");
+            continue;
+        }
+        let pct = |p: f32| switches[((switches.len() - 1) as f32 * p) as usize];
+        println!(
+            "    turn switch: {} of {real} followed, p50 {:.2}s p90 {:.2}s p99 {:.2}s",
+            switches.len(),
+            pct(0.5),
+            pct(0.9),
+            pct(0.99),
         );
     }
     Ok(())

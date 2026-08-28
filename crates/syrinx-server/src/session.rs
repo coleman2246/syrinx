@@ -492,7 +492,10 @@ impl Session {
         provisional: bool,
     ) -> ServerMessage {
         self.seq += 1;
-        if self.tuning.relabel_window > 0 {
+        // Only a labelling session can ever be corrected, so a live-mode
+        // session keeps no ring at all rather than a bounded one it will
+        // never consult.
+        if self.tuning.relabel_window > 0 && self.diarizer.is_some() {
             self.emitted.push_back(Emitted {
                 seq: self.seq,
                 from_chunk,
