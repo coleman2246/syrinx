@@ -47,6 +47,8 @@
 // three that are, `MIN_POOL`, `T_MARGIN` and `T_MINT_CEILING`, are only the
 // defaults of config keys.
 
+use super::DiarizeTuning;
+
 /// Cosine similarity above which an embedding joins its nearest centroid.
 /// 0.45, not the 0.6 the design first guessed: the spike measured
 /// same-speaker windows at a median cosine of 0.52, so 0.6 rejects most true
@@ -401,13 +403,12 @@ impl Default for OnlineClusterer {
 
 impl OnlineClusterer {
     pub fn new() -> Self {
-        Self::with_config(MIN_POOL, T_MARGIN, T_MINT_CEILING)
+        Self::with_config(DiarizeTuning::default())
     }
 
-    /// A clusterer at a configured pool size, margin and mint ceiling: the
-    /// server's `diarize_min_pool`, `diarize_margin` and
-    /// `diarize_mint_ceiling`, whose defaults are [`MIN_POOL`], [`T_MARGIN`]
-    /// and [`T_MINT_CEILING`].
+    /// A clusterer at a deployment's settings: `diarize_min_pool`,
+    /// `diarize_margin` and `diarize_mint_ceiling`, whose defaults are
+    /// [`MIN_POOL`], [`T_MARGIN`] and [`T_MINT_CEILING`].
     ///
     /// The three clustering parameters the configuration exposes. The others
     /// have no trade an operator could make with them -- `T_RETIRE` never
@@ -418,17 +419,26 @@ impl OnlineClusterer {
     /// before it names anybody at all, and how far into a known speaker's
     /// territory a pool of orphans may still turn out to be somebody else.
     ///
+    /// **The whole [`DiarizeTuning`], not the three fields it reads.** Two of
+    /// them are cosines in overlapping ranges, so as loose arguments a caller
+    /// that transposed them would compile and run: `margin = 0.55`, which the
+    /// config loader refuses outright, against `mint_ceiling = 0.10`, which is
+    /// below `T_ASSIGN` and switches the split guard off. Taking the struct
+    /// makes that a type error at the one call site the server has. The
+    /// clusterer ignores `change_threshold`, which belongs to the diarizer
+    /// around it; carrying it costs nothing and buys a checked boundary.
+    ///
     /// Both this and [`OnlineClusterer::new`] reach the fields through
     /// [`OnlineClusterer::with_params`], so there is still exactly one place
     /// the constants are assigned.
-    pub fn with_config(min_pool: usize, margin: f32, mint_ceiling: f32) -> Self {
+    pub fn with_config(tuning: DiarizeTuning) -> Self {
         Self::with_params(
             T_ASSIGN,
             T_RETIRE,
             EMA_ALPHA,
-            min_pool,
-            margin,
-            mint_ceiling,
+            tuning.min_pool,
+            tuning.margin,
+            tuning.mint_ceiling,
         )
     }
 
@@ -1858,17 +1868,23 @@ mod tests {
         // that it is genuinely a different clusterer when handed another. The
         // same two agreeing windows separate the cases.
         let script = vec![noisy(0, 0), noisy(0, 1)];
+        let named = DiarizeTuning {
+            min_pool: MIN_POOL,
+            margin: T_MARGIN,
+            mint_ceiling: T_MINT_CEILING,
+            change_threshold: T_CHANGE,
+        };
         assert_eq!(
-            observe_all(
-                OnlineClusterer::with_config(MIN_POOL, T_MARGIN, T_MINT_CEILING),
-                &script
-            ),
+            observe_all(OnlineClusterer::with_config(named), &script),
             observe_all(OnlineClusterer::new(), &script),
             "the default must be the calibrated clusterer, exactly"
         );
 
         let (configured, _) = observe_all(
-            OnlineClusterer::with_config(2, T_MARGIN, T_MINT_CEILING),
+            OnlineClusterer::with_config(DiarizeTuning {
+                min_pool: 2,
+                ..named
+            }),
             &script,
         );
         assert_eq!(
@@ -1876,6 +1892,34 @@ mod tests {
             vec![Heard::Unknown, Heard::Settled(1)],
             "a configured pool of 2 should have minted where 4 waits"
         );
+    }
+
+    #[test]
+    fn every_configured_setting_lands_in_the_field_that_uses_it() {
+        // `margin` and `mint_ceiling` are both cosines, so a transposition
+        // between them runs rather than fails: a server would assign at 0.55,
+        // a margin the loader refuses outright, and mint under a ceiling of
+        // 0.10, below `T_ASSIGN`, which is the split guard switched off.
+        // Taking the whole struct is what stops that at the call site; this is
+        // what stops it inside `with_config`.
+        //
+        // Three values distinct from each other and from every shipped
+        // constant, so any pairing but the right one fails.
+        let c = OnlineClusterer::with_config(DiarizeTuning {
+            min_pool: 7,
+            margin: 0.11,
+            mint_ceiling: 0.62,
+            change_threshold: 0.99,
+        });
+        assert_eq!(c.min_pool, 7);
+        assert_eq!(c.margin, 0.11);
+        assert_eq!(c.mint_ceiling, 0.62);
+        // `change_threshold` is the diarizer's, and travels with the rest only
+        // so that the boundary can be one struct. The other three are not a
+        // configuration surface at all and must survive any tuning.
+        assert_eq!(c.t_assign, T_ASSIGN);
+        assert_eq!(c.t_retire, T_RETIRE);
+        assert_eq!(c.alpha, EMA_ALPHA);
     }
 
     #[test]
@@ -2444,7 +2488,10 @@ mod tests {
         // is the original one, nobody over the threshold near the mean, so the
         // crowded newcomer the shipped configuration mints is refused. That is
         // honest about what the hatch costs.
-        let mut c = OnlineClusterer::with_config(MIN_POOL, 0.0, T_MINT_CEILING);
+        let mut c = OnlineClusterer::with_config(DiarizeTuning {
+            margin: 0.0,
+            ..DiarizeTuning::default()
+        });
         for _ in 0..MIN_POOL {
             c.observe(&at(0.0));
         }
@@ -2486,7 +2533,11 @@ mod tests {
     /// to reach. Being identical, their mean is the window itself, so the
     /// number the ceiling decides on is exactly `cos(HALF_WIDE)`.
     fn pool_on_the_bisector(margin: f32, mint_ceiling: f32) -> OnlineClusterer {
-        let mut c = OnlineClusterer::with_config(MIN_POOL, margin, mint_ceiling);
+        let mut c = OnlineClusterer::with_config(DiarizeTuning {
+            margin,
+            mint_ceiling,
+            ..DiarizeTuning::default()
+        });
         for _ in 0..MIN_POOL {
             c.observe(&at(0.0));
         }
@@ -2569,11 +2620,12 @@ mod tests {
     /// 0.56 is near the top of the band such a pool can occupy at all. Every
     /// member being under `T_ASSIGN` bounds `cos(mean, member)` from above,
     /// and `cohesion - rival >= T_MINT_MARGIN` then holds `rival` under 0.579.
-    fn pool_whose_mean_lands_on_speaker_one(
-        margin: f32,
-        mint_ceiling: f32,
-    ) -> OnlineClusterer {
-        let mut c = OnlineClusterer::with_config(MIN_POOL, margin, mint_ceiling);
+    fn pool_whose_mean_lands_on_speaker_one(margin: f32, mint_ceiling: f32) -> OnlineClusterer {
+        let mut c = OnlineClusterer::with_config(DiarizeTuning {
+            margin,
+            mint_ceiling,
+            ..DiarizeTuning::default()
+        });
         for _ in 0..MIN_POOL {
             c.observe(&voice(0));
         }
@@ -2745,7 +2797,10 @@ mod tests {
         // at `diarize_margin = 0.30` hold its *hops* to a looser rule than its
         // windows, which inverts the reason the number exists.
         let build = |margin: f32| {
-            let mut c = OnlineClusterer::with_config(MIN_POOL, margin, T_MINT_CEILING);
+            let mut c = OnlineClusterer::with_config(DiarizeTuning {
+                margin,
+                ..DiarizeTuning::default()
+            });
             for _ in 0..MIN_POOL {
                 c.observe(&voice(0));
             }

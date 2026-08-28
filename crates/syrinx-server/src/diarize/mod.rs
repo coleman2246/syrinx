@@ -27,7 +27,10 @@ use anyhow::Result;
 /// at session start.
 ///
 /// Held as a struct rather than passed as four arguments because three of them
-/// are cosines and a caller that swapped them would compile.
+/// are cosines and a caller that swapped them would compile. For the same
+/// reason it is handed on whole: [`cluster::OnlineClusterer::with_config`]
+/// takes this type rather than the three fields it reads, so the last place a
+/// transposition could still have happened is a type error instead.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DiarizeTuning {
     /// `diarize_min_pool`: agreeing windows before a speaker is minted.
