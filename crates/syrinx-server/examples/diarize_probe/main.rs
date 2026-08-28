@@ -61,7 +61,9 @@ use syrinx_server::diarize::cluster::{
 };
 use syrinx_server::diarize::fbank::SAMPLE_RATE;
 use syrinx_server::diarize::real::{Embedder, Vad, norm_for};
-use syrinx_server::diarize::window::{Cut, FRAME, Framed, WINDOW_SAMPLES, WindowAssembler};
+use syrinx_server::diarize::window::{
+    Cut, FRAME, Framed, HOP_SAMPLES, WINDOW_SAMPLES, WindowAssembler,
+};
 use syrinx_server::session::{LAG_CHUNKS, RELABEL_WINDOW};
 
 mod live;
@@ -1536,6 +1538,18 @@ fn live(args: &Args) -> Result<()> {
         chunk_samples.is_multiple_of(160),
         "--chunk {chunk_s} is {chunk_samples} samples, which is not a whole \
          number of 10 ms reference frames; the painting below aligns to those"
+    );
+    // `RealDiarizer::push` refuses a chunk this long, and `Session` answers a
+    // failing diarizer by warning and retiring it after five chunks -- so
+    // without this the replay would run to the end and report a session with
+    // no labels in it as though that were the longer chunk's doing.
+    ensure!(
+        chunk_samples.div_ceil(FRAME) < HOP_SAMPLES / FRAME,
+        "--chunk {chunk_s} can carry {} of the {} frames a hop needs; the gap \
+         seam is deferred across a chunk and cannot be if a hop can complete \
+         either side of one silence within it",
+        chunk_samples.div_ceil(FRAME),
+        HOP_SAMPLES / FRAME
     );
 
     let tuning = syrinx_server::diarize::DiarizeTuning {

@@ -802,6 +802,89 @@ impl RealDiarizer {
         }
     }
 
+    /// One chunk's assembled pieces, and the silence the batch ended with.
+    ///
+    /// **The order of the two halves is the whole correctness of the
+    /// deferral**, in both directions, which is why they are one function with
+    /// one doc comment rather than two stretches of `push`.
+    ///
+    /// *Pieces first*, because every piece in a batch that restarted was
+    /// assembled **before** the silence -- `push` refuses a chunk that is not
+    /// shorter than a hop, so nothing can complete on the far side of a
+    /// restart in the same batch. Recording the gap first would hand the
+    /// pre-gap hop to the comparison meant for the post-gap one, which would
+    /// answer "same voice" for the trivial reason that both sides of it are
+    /// the same stretch of speech.
+    ///
+    /// *And the silence second whatever a piece did*, because
+    /// [`WindowAssembler::restarted`] is cleared at the top of the next
+    /// `push`: a silence not recorded here is not recorded at all -- not
+    /// committed, not pending, not assumed. The next hop would be treated as
+    /// adjoining, held to the looser [`Self::change_threshold`], and a
+    /// correction could reach straight through the pause with no gap test made
+    /// at all. The way a piece fails is a failed embedding, which is the
+    /// transient [`Fuse`] exists to survive and the case [`Gap::Assumed`] was
+    /// written for, so it must not also be the case that loses the gap.
+    ///
+    /// `embed` is a parameter for that second reason: the failure it stands
+    /// for has no other way into a test, and the ordering above is what a test
+    /// needs to be able to ask about.
+    fn batch(
+        &mut self,
+        pieces: Vec<Cut>,
+        restarted: bool,
+        chunk: u64,
+        out: &mut Attribution,
+        mut embed: impl FnMut(&[f32]) -> Result<Vec<f32>>,
+    ) -> Result<()> {
+        // A change point invalidates every window still to come out of this
+        // batch: they were assembled before the cut, from audio either side of
+        // the boundary, which is exactly the mixture the cut says they are.
+        //
+        // They can share a chunk, which is what this is for. They cannot share
+        // a frame -- windows complete at 47 + 23k voiced frames and hops at
+        // 23m, and 47 is 1 mod 23 -- but that is arithmetic about the shipped
+        // geometry rather than a property worth relying on, and the flag costs
+        // nothing either way.
+        let mut cut = false;
+        let mut failed = None;
+        for piece in pieces {
+            let (Cut::Hop(audio) | Cut::Window(audio)) = &piece;
+            if matches!(piece, Cut::Window(_)) && cut {
+                continue;
+            }
+            let embedding = match embed(audio) {
+                Ok(embedding) => embedding,
+                Err(e) => {
+                    failed = Some(self.window_failed(e));
+                    break;
+                }
+            };
+            self.fuse.passed();
+            match piece {
+                Cut::Hop(_) => cut |= self.hop(embedding, chunk, out),
+                Cut::Window(_) => self.window(&embedding, chunk, out),
+            }
+        }
+
+        if restarted {
+            // Half a second of silence cleared the accumulator, so the hop
+            // being held is from before it. That makes it the wrong thing to
+            // ask "did the voice just change" of -- two stretches of a meeting
+            // either side of a pause are not the voice now and the voice a
+            // moment ago -- and the right thing to ask "is this the same person
+            // again" of, which is the only question a correction's reach turns
+            // on. So it is kept, and the seam waits for it to be asked. A
+            // second silence before that happens moves the seam forward to the
+            // later one, which is the tighter bound.
+            self.gap = Gap::Pending(chunk);
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// A full 1.5 s window: the only thing that moves a centroid, mints a
     /// speaker, or corrects one.
     fn window(&mut self, embedding: &[f32], chunk: u64, out: &mut Attribution) {
@@ -885,6 +968,32 @@ impl Diarizer for RealDiarizer {
             );
         }
 
+        // Read off the raw chunk, before the load and before the framer, so
+        // that neither is disturbed by asking and the answer is the same on
+        // every chunk of a session. A chunk shorter than a hop is what lets
+        // the gap be recorded *after* the pieces in `RealDiarizer::batch`,
+        // and that ordering is the whole correctness of the deferral.
+        //
+        // Not a constant to be reasoned from: the length is the ASR backend's,
+        // via `AsrBackend::chunk_samples()`, and `asr::parakeet` merely
+        // happens to fix it at 0.56 s against a hop's 0.736. A longer chunk
+        // could complete a hop on the far side of a silence within one push;
+        // that hop would then be put to the adjoining-hop test at the looser
+        // `T_CHANGE`, could claim a turn boundary `MAX_GAP_FRAMES` measured
+        // and declined to claim, and would leave the gap recorded pointing at
+        // a silence whose far side had already gone by. Refusing is the honest
+        // answer: the deferral cannot be done at that geometry, and doing it
+        // wrongly is invisible.
+        const HOP_FRAMES: usize = HOP_SAMPLES / FRAME;
+        ensure!(
+            audio.len().div_ceil(FRAME) < HOP_FRAMES,
+            "an ASR chunk of {} samples can carry {} of the {HOP_FRAMES} frames a \
+             hop needs; a chunk has to be shorter than a hop for a silence inside \
+             one to still have its far side ahead of it",
+            audio.len(),
+            audio.len().div_ceil(FRAME)
+        );
+
         // The lazy load has to fail *before* the framer sees this chunk, and
         // that ordering is load-bearing rather than incidental: the framer
         // mirrors a remainder that only exists once the VAD does, so consuming
@@ -912,67 +1021,17 @@ impl Diarizer for RealDiarizer {
         );
 
         let mut out = Attribution::default();
-        // A change point invalidates every window still to come out of this
-        // batch: they were assembled before the cut, from audio either side of
-        // the boundary, which is exactly the mixture the cut says they are.
-        //
-        // They can share a chunk, which is what this is for. They cannot share
-        // a frame -- windows complete at 47 + 23k voiced frames and hops at
-        // 23m, and 47 is 1 mod 23 -- but that is arithmetic about the shipped
-        // geometry rather than a property worth relying on, and the flag costs
-        // nothing either way.
-        let mut cut = false;
         let pieces = self.assembler.push(&framed, &voiced);
-        for piece in pieces {
-            let (Cut::Hop(audio) | Cut::Window(audio)) = &piece;
-            if matches!(piece, Cut::Window(_)) && cut {
-                continue;
-            }
-            let embedding = match self
-                .state
-                .as_mut()
-                .expect("loaded above")
-                .embedder
-                .embed(audio)
-            {
-                Ok(embedding) => embedding,
-                Err(e) => return Err(self.window_failed(e)),
-            };
-            self.fuse.passed();
-            match piece {
-                Cut::Hop(_) => cut |= self.hop(embedding, chunk, &mut out),
-                Cut::Window(_) => self.window(&embedding, chunk, &mut out),
-            }
-        }
-
-        // After the pieces, not before them, and the ordering is the whole
-        // correctness of the deferral: every piece in a batch that restarted
-        // was assembled *before* the silence. The restart empties the
-        // accumulator and a chunk carries at most 18 frames against a hop's
-        // 23, so nothing can complete on the far side of it in the same push
-        // -- the arithmetic `WindowAssembler::push` states and
-        // `asr::parakeet::CHUNK_SAMPLES` fixes at 0.56 s. Recording the gap
-        // first would hand the pre-gap hop to the comparison meant for the
-        // post-gap one, which would answer "same voice" for the trivial reason
-        // that both sides of it are the same stretch of speech.
-        //
-        // A backend with a chunk longer than a hop would break that, and it is
-        // worth knowing how far: the post-gap hop would arrive here as an
-        // ordinary one and be put to the ordinary change test, which is looser
-        // but is the same question, and a boundary it accepted would lay the
-        // seam itself. The deferral would lose its evidence, not its guard.
-        if self.assembler.restarted() {
-            // Half a second of silence cleared the accumulator, so the hop
-            // being held is from before it. That makes it the wrong thing to
-            // ask "did the voice just change" of -- two stretches of a meeting
-            // either side of a pause are not the voice now and the voice a
-            // moment ago -- and the right thing to ask "is this the same person
-            // again" of, which is the only question a correction's reach turns
-            // on. So it is kept, and the seam waits for it to be asked. A
-            // second silence before that happens moves the seam forward to the
-            // later one, which is the tighter bound.
-            self.gap = Gap::Pending(chunk);
-        }
+        let restarted = self.assembler.restarted();
+        // The embedder is lifted out of `self` for the call and put back
+        // straight after, which is what lets it be borrowed alongside the
+        // diarizer -- and what lets a test hand `batch` a closure that fails.
+        let mut state = self.state.take().expect("loaded above");
+        let consumed = self.batch(pieces, restarted, chunk, &mut out, |audio| {
+            state.embedder.embed(audio)
+        });
+        self.state = Some(state);
+        consumed?;
 
         // Silence answers None rather than repeating itself. Carrying a label
         // across a chunk with no voice in it would attribute the pause to
@@ -1614,6 +1673,69 @@ mod tests {
         d.gap = Gap::Pending(10);
         d.hop(axis(0), 13, &mut out);
         assert_eq!(d.correctable_since, Some(13));
+    }
+
+    #[test]
+    fn a_piece_that_fails_to_embed_still_records_the_silence_it_arrived_with() {
+        // The ordering `batch` exists for. A batch can both cut a piece and
+        // report a restart -- `window.rs` proves the precondition against the
+        // assembler's own API -- and if the piece fails to embed on the way
+        // through, the silence has to survive it. `WindowAssembler::restarted`
+        // is cleared on the next push, so a gap lost here is lost for good:
+        // not committed, not pending, not assumed, and the next hop compared
+        // as though it adjoined the one before the pause.
+        let mut d = headless(DiarizeTuning::default());
+        let mut out = Attribution::default();
+        d.hop(axis(0), 3, &mut out);
+
+        let mut out = Attribution::default();
+        let err = d
+            .batch(
+                vec![Cut::Hop(vec![0.1; HOP_SAMPLES])],
+                true,
+                10,
+                &mut out,
+                |_| bail!("the embedder is having a moment"),
+            )
+            .expect_err("the piece did not embed");
+        assert!(format!("{err:#}").contains("having a moment"), "{err:#}");
+        assert_eq!(
+            d.gap,
+            Gap::Pending(10),
+            "the silence vanished with the embedding that failed"
+        );
+
+        // And the seam it was recorded for still lands: a different voice on
+        // the far side of the pause commits it.
+        let mut out = Attribution::default();
+        d.hop(axis(1), 13, &mut out);
+        assert_eq!(d.correctable_since, Some(13));
+    }
+
+    #[test]
+    fn a_chunk_that_is_not_shorter_than_a_hop_is_refused() {
+        // The arithmetic the deferral rests on, checked rather than assumed:
+        // the chunk length is `AsrBackend::chunk_samples()`, and at 0.8 s it
+        // is longer than a hop. A hop could then complete on the far side of a
+        // silence inside one push -- it would be compared at the looser
+        // `T_CHANGE`, could claim a boundary `MAX_GAP_FRAMES` declines to
+        // claim, and the gap recorded afterwards would point at a silence
+        // whose far side had already gone by. All of it silent.
+        let mut d = headless(DiarizeTuning::default());
+        let err = d
+            .push(&vec![0.0; HOP_SAMPLES])
+            .expect_err("a chunk as long as a hop");
+        let message = format!("{err:#}");
+        assert!(message.contains("shorter than a hop"), "{message}");
+
+        // Before the lazy load, so asking costs nothing and the answer does
+        // not depend on a model directory: the shipped 0.56 s chunk gets past
+        // this check and fails on the models instead.
+        let err = d.push(&[0.0; 8960]).expect_err("no models to load");
+        assert!(
+            format!("{err:#}").contains("diarization models"),
+            "the chunk-length check moved below the load: {err:#}"
+        );
     }
 
     #[test]

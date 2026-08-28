@@ -80,16 +80,13 @@ const REFRACTORY_SAMPLES: usize = REFRACTORY_FRAMES * FRAME;
 /// [`WindowAssembler::cut_at_boundary`] when they differ -- which may refuse,
 /// since boundaries have a refractory floor and this rule does not. Two rules
 /// that look alike and are not: this one asks how long the silence was, that
-/// one asks who is talking. So the measurement above still stands and this
-/// constant is unchanged.
+/// one asks who is talking.
 ///
-/// The diarizer used to read a break here as a bound on how far back a
-/// *correction* may reach, which is the same inference in a quieter place and
-/// measurably had the same problem: it truncated the backfill to whatever
-/// followed the last breath. It now asks who is talking there too, comparing
-/// the hops either side of the break against `cluster::T_GAP_CHANGE`. What a
-/// break still decides on its own is only what it was measured for -- whether
-/// the audio either side of it may go into one embedding.
+/// How far back a *correction* may reach is the same inference in a quieter
+/// place, and the diarizer does not make it here either: it compares the hops
+/// either side of the break against `cluster::T_GAP_CHANGE`. What a break
+/// decides on its own is only what it was measured for -- whether the audio
+/// either side of it may go into one embedding.
 const MAX_GAP_FRAMES: usize = 15;
 
 /// A piece of voiced audio the assembler has finished with.
@@ -670,6 +667,34 @@ mod tests {
         assert!(a.restarted());
         a.push(&frames(broken + 1, 1, 1.0), &[true]);
         assert!(!a.restarted(), "the flag describes the last push only");
+    }
+
+    #[test]
+    fn one_push_can_both_cut_a_piece_and_report_a_restart() {
+        // The precondition behind `real::diarizer`'s ordering, proved here
+        // rather than assumed there: a batch that ends in a restart can still
+        // carry pieces out of the accumulator the restart then emptied. The
+        // hop is from *before* the silence, which is why the diarizer consumes
+        // the pieces first -- and why the silence has to be recorded whatever
+        // happens to one of them, since `restarted` is cleared by the very
+        // next push and nothing else remembers.
+        //
+        // It takes no unusual geometry: the hop needs one more frame, and the
+        // rest of an ordinary 0.56 s chunk is quiet.
+        let mut a = WindowAssembler::default();
+        for i in 0..HOP_FRAMES - 1 {
+            a.push(&frames(i, 1, 1.0), &[true]);
+        }
+        let first = HOP_FRAMES - 1;
+        let n = MAX_GAP_FRAMES + 2;
+        let mut voiced = vec![false; n];
+        voiced[0] = true;
+        voiced[n - 1] = true;
+        assert!(n <= 18, "{n} frames is more than one ASR chunk carries");
+
+        let cuts = a.push(&frames(first, n, 2.0), &voiced);
+        assert_eq!(hops(cuts).len(), 1, "the hop completed on the first frame");
+        assert!(a.restarted(), "and the last frame broke the accumulator");
     }
 
     #[test]
