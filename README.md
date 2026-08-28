@@ -267,6 +267,16 @@ value of the other. The one place they meet is the escape hatch above:
 is really only setting the first. Of all the numbers here it is the one most
 in need of being measured.
 
+**If you already run a non-default `diarize_margin`, this key moved your mint
+policy.** The ceiling used to be `0.45 + diarize_margin`, capped at 0.80, and
+is now 0.55 whatever the margin is — so a margin below 0.10 used to mint more
+cautiously than the shipped ceiling does, and a margin above it more freely.
+The band a new voice could be minted into topped out at 0.50 for a margin of
+0.05, at 0.65 for 0.20, and at 0.80 for anything from 0.40 up. Setting
+`diarize_mint_ceiling = 0.45 + your margin` restores exactly what you had.
+The default 0.10 and the escape hatch at 0 are the two values that did not
+move.
+
 `diarize_change_threshold` is how much the voice has to change between one
 three-quarter-second stretch and the next before the diarizer calls it a new
 turn; **0** never does. Turns shorter than about three quarters of a second of

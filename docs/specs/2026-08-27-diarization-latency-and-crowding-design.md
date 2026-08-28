@@ -448,6 +448,15 @@ is 0.55 either way, so nothing at the shipped settings changed; `margin = 0`
 still switches it off, now because `may_mint` says so rather than because
 `T_ASSIGN + 0` happened to make its clause unreachable.
 
+A deployment at a *tuned* margin does see its mint policy move, which is the
+correction rather than a side effect of it. With a perfectly cohesive pool the
+mintable-rival band topped out at `min(T_ASSIGN + margin, T_RETIRE)` — 0.470 at
+a margin of 0.02, 0.500 at 0.05, 0.600 at 0.15, 0.650 at 0.20, 0.750 at 0.30
+and 0.800 from 0.40 up — and is 0.550 at every one of them now, tighter above
+the shipped margin and looser below it. Only 0.10 and the hatch at 0 are
+unchanged. `diarize_mint_ceiling = T_ASSIGN + margin` puts any of them back for
+an operator who would rather wait for the probe than take the new value.
+
 **"More like itself" has to be measured against the pool's own mean, on both
 sides.** The obvious reading — worst *pairwise* agreement among the members,
 against the mean's cosine to the nearest centroid — compares two different

@@ -106,6 +106,15 @@ pub struct Config {
     /// mint ceiling as well, because the hatch is documented as switching off
     /// everything that arrived with it. Accepted range 0 to 0.5.
     ///
+    /// **A deployment already running a non-default value here has had its
+    /// mint policy moved by that separation**, which is the fix and not a
+    /// regression, but is worth knowing. The ceiling used to be `T_assign +
+    /// this key`, capped at `T_retire`, and is now `diarize_mint_ceiling`
+    /// alone: below 0.10 that is a looser mint policy than the deployment had,
+    /// above it a stricter one. `diarize_mint_ceiling = 0.45 + this key`
+    /// restores the old one exactly. The default 0.10 and the hatch at 0 are
+    /// unchanged.
+    ///
     /// **The default is an engineering estimate, not a measurement.** See
     /// `docs/specs/2026-08-27-diarization-latency-and-crowding-design.md`; the
     /// probe's live-emulation mode exists to replace it.
