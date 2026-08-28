@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use super::{Embedder, Norm, Vad};
-use crate::diarize::cluster::OnlineClusterer;
-use crate::diarize::window::{FRAME, Framer, WINDOW_SAMPLES, WindowAssembler};
-use crate::diarize::{Diarizer, DiarizerFactory};
+use crate::diarize::cluster::{OnlineClusterer, cosine};
+use crate::diarize::window::{Cut, FRAME, Framer, WINDOW_SAMPLES, WindowAssembler};
+use crate::diarize::{Attribution, DiarizeTuning, Diarizer, DiarizerFactory, Relabel};
 
 /// The VAD, by name, in `diarize_model_dir`. Fixed rather than sniffed:
 /// silero is the only VAD this code knows how to drive -- 512-sample frames,
@@ -57,8 +57,8 @@ struct Models {
 /// thread. Four sessions of unshared models cost ~112 MB and no lock.
 pub struct RealDiarizerFactory {
     models: Models,
-    /// The server's `diarize_min_pool`, handed to every session's clusterer.
-    min_pool: usize,
+    /// The server's diarization settings, handed to every session.
+    tuning: DiarizeTuning,
 }
 
 impl RealDiarizerFactory {
@@ -67,10 +67,11 @@ impl RealDiarizerFactory {
     /// Blocking, and slow enough to matter (both graphs are committed and both
     /// are run), so this belongs at startup and nowhere near a request.
     ///
-    /// `min_pool` is carried rather than read from the const so a deployment
-    /// can trade pickup speed against splitting one voice in two; the config
-    /// key's default is that const, and its range is checked at config load.
-    pub fn load(dir: &Path, min_pool: usize) -> Result<Self> {
+    /// `tuning` is carried rather than read from the constants so a deployment
+    /// can trade pickup speed against splitting one voice in two, and caution
+    /// against coverage; each key's default is the constant that documents it,
+    /// and each range is checked at config load.
+    pub fn load(dir: &Path, tuning: DiarizeTuning) -> Result<Self> {
         let models = Models::resolve(dir)?;
         let dim = models.self_check()?;
         info!(
@@ -78,16 +79,18 @@ impl RealDiarizerFactory {
             embed = %models.embed.display(),
             norm = ?models.norm,
             dim,
-            min_pool,
+            min_pool = tuning.min_pool,
+            margin = tuning.margin,
+            change_threshold = tuning.change_threshold,
             "speaker labelling available"
         );
-        Ok(Self { models, min_pool })
+        Ok(Self { models, tuning })
     }
 }
 
 impl DiarizerFactory for RealDiarizerFactory {
     fn diarizer(&self) -> Box<dyn Diarizer> {
-        Box::new(RealDiarizer::new(self.models.clone(), self.min_pool))
+        Box::new(RealDiarizer::new(self.models.clone(), self.tuning))
     }
 }
 
@@ -326,21 +329,27 @@ fn speech_like(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Consecutive embedding windows the embedder may fail before `RealDiarizer`
-/// calls itself broken.
+/// Consecutive embeddings the embedder may fail before `RealDiarizer` calls
+/// itself broken.
 ///
-/// Three, and not five to match the session's strikes, because the two count
+/// Six, and not five to match the session's strikes, because the two count
 /// different things and stack: each of these failures is also a chunk the
-/// session warns about, so the whole episode is at most three plus five lines.
-/// Three consecutive windows is a little over two seconds of *voiced* audio,
+/// session warns about, so the whole episode is at most six plus five lines.
+/// Six consecutive embeddings is a little over two seconds of *voiced* audio,
 /// which is enough that a failure with a cause outside the model -- a failed
 /// allocation under memory pressure is the plausible one -- does not cost a
 /// session its labels. Nothing else transient can reach here: audio arrives as
 /// `pcm_s16le_to_f32` output, so a non-finite embedding is the model's doing
 /// and will not stop being the model's doing.
-const MAX_WINDOW_FAILURES: u32 = 3;
+///
+/// It was three while a window was the only thing embedded. There are now two
+/// embeddings per hop -- the hop itself and, on most hops, the window it
+/// completes -- so three would have halved the tolerance measured in seconds
+/// of speech, which is the quantity the paragraph above is reasoning about.
+/// The number moved so the reasoning would not have to.
+const MAX_EMBED_FAILURES: u32 = 6;
 
-/// Whether the embedder is still worth asking, counted in windows.
+/// Whether the embedder is still worth asking, counted in embeddings.
 ///
 /// A latch, not a policy. It answers one question -- can this diarizer still
 /// produce a label? -- and once the answer is no it stays no. What to *do*
@@ -350,14 +359,14 @@ const MAX_WINDOW_FAILURES: u32 = 3;
 ///
 /// The two counts are deliberately different quantities. The session's is
 /// chunks, because a chunk is what it hands over and a warning is what a
-/// failed one costs. This one is windows, because a window is what the
-/// embedder is actually asked for. Counting windows here is what lets the
+/// failed one costs. This one is embeddings, because an embedding is what the
+/// embedder is actually asked for. Counting embeddings here is what lets the
 /// chunk count downstream terminate; see `RealDiarizer`'s failure notes.
 #[derive(Default)]
 struct Fuse {
-    /// Failed windows since the last one that embedded.
+    /// Failed embeddings since the last one that worked.
     consecutive: u32,
-    /// The failure that blew it. Set once, at [`MAX_WINDOW_FAILURES`] in a
+    /// The failure that blew it. Set once, at [`MAX_EMBED_FAILURES`] in a
     /// row, and never cleared.
     terminal: Option<String>,
 }
@@ -369,15 +378,15 @@ impl Fuse {
         self.terminal.as_deref()
     }
 
-    /// A window that embedded: whatever came before it was a blip.
+    /// An embedding that worked: whatever came before it was a blip.
     fn passed(&mut self) {
         self.consecutive = 0;
     }
 
-    /// A window that did not, returning how many that makes in a row.
+    /// One that did not, returning how many that makes in a row.
     fn failed(&mut self, e: &anyhow::Error) -> u32 {
         self.consecutive += 1;
-        if self.consecutive >= MAX_WINDOW_FAILURES {
+        if self.consecutive >= MAX_EMBED_FAILURES {
             self.terminal.get_or_insert_with(|| format!("{e:#}"));
         }
         self.consecutive
@@ -386,21 +395,43 @@ impl Fuse {
 
 /// One session's speaker attribution.
 ///
-/// Per [`Diarizer::push`]: one ASR chunk in, at most one label out. The chunk
-/// is framed, the VAD marks which frames carry speech, the voiced ones
-/// accumulate into 1.5 s windows, and each completed window is embedded and
-/// handed to the clusterer.
+/// Per [`Diarizer::push`]: one ASR chunk in, one [`Attribution`] out. The
+/// chunk is framed, the VAD marks which frames carry speech, and the voiced
+/// ones accumulate into two sizes of audio, each of which is embedded.
 ///
-/// A chunk that completes no window -- most of them, since a hop is 0.75 s of
+/// **1.5 s windows** are what the spike measured, and they keep exclusive
+/// ownership of everything that has to be right: only a window updates a
+/// centroid, and only a window can mint a speaker.
+///
+/// **0.75 s hops** are the second embedding, one per hop of voiced audio, and
+/// they answer two questions a window answers too late. Comparing a hop
+/// against the one before it detects a turn change at hop resolution, 0.736 s,
+/// against an effective resolution of a window and a half; and a hop matched
+/// against the existing centroids under a stricter margin offers a provisional
+/// label about 0.75 s into a turn rather than after a clean window plus the
+/// session's vote. A hop is noisier than a window, so it is never allowed to
+/// write anything down -- `OnlineClusterer::observe_short` takes `&self`.
+///
+/// A chunk that completes neither -- most of them, since a hop is 0.75 s of
 /// *voiced* audio and a chunk is 0.56 s of any -- answers with the last label
-/// the clusterer settled on. That carry-forward is what keeps a turn from
-/// arriving in labelled and unlabelled halves, and it is the one place the
-/// streaming pipeline cannot follow the spike: the spike paints each window's
-/// label back over the audio the window was built from, and a live session has
-/// no past to paint. Only two things end it: a chunk with no voiced frame in
-/// it, which answers `None` rather than attributing a pause to whoever spoke
-/// before it, and a window the clusterer cannot place, which makes the
-/// previous answer stale.
+/// settled on. That carry-forward is what keeps a turn from arriving in
+/// labelled and unlabelled halves, and it is the one place the streaming
+/// pipeline cannot follow the spike: the spike paints each window's label back
+/// over the audio the window was built from, and a live session has no past to
+/// paint. Three things end it: a chunk with no voiced frame in it, which
+/// answers `None` rather than attributing a pause to whoever spoke before it;
+/// a window the clusterer cannot place, which makes the previous answer stale;
+/// and a detected turn change, because asserting the outgoing speaker's name
+/// over the incoming speaker's opening sentence is worse than saying nothing.
+///
+/// **Corrections.** A live session has no past to paint, but it does have a
+/// past it can *name*. Two things become knowable after the fact and are
+/// reported as [`Relabel`]s for the session to turn into
+/// `transcript.relabel`: a speaker being minted, whose first seconds were
+/// committed with no name because four windows had not yet agreed, and a full
+/// window contradicting the provisional label a hop had been offering. Neither
+/// crosses a detected turn change, so a correction can never put one person's
+/// name on another's sentence.
 ///
 /// **On failure:** `session.rs` warns per failed chunk and retires the
 /// diarizer after five *consecutive* ones, so every error path here has to be
@@ -435,14 +466,36 @@ pub struct RealDiarizer {
     framer: Framer,
     assembler: WindowAssembler,
     clusterer: OnlineClusterer,
-    /// The label the most recently completed window settled on, and the
-    /// answer for every chunk with voice in it until another window completes.
-    /// `None` while the clusterer is still undecided -- before the first
-    /// speaker is minted, and after any window it could not place.
+    /// The cosine below which two consecutive hops are two different people:
+    /// the server's `diarize_change_threshold`.
+    change_threshold: f32,
+    /// The label most recently settled on, and the answer for every chunk with
+    /// voice in it until something changes it. `None` while the clusterer is
+    /// undecided -- before the first speaker is minted, after any window it
+    /// could not place, and after a detected turn change.
     last_label: Option<u32>,
+    /// The previous hop's embedding, for the change-point comparison. `None`
+    /// before the first hop and after a gap long enough to have cleared the
+    /// accumulator, where there is nothing to compare against.
+    previous_hop: Option<Vec<f32>>,
+    /// The chunk at which the run of chunks answered with no speaker began,
+    /// and `None` while a speaker is being named. What a mint relabels: those
+    /// chunks were committed unattributed and now have somebody to attribute
+    /// them to.
+    ///
+    /// Reset at a detected turn change, which is what keeps a correction
+    /// inside one turn.
+    unlabelled_since: Option<u64>,
+    /// The provisional label a hop is currently asserting and the chunk it
+    /// started at. What a contradicting window relabels.
+    provisional: Option<(u32, u64)>,
+    /// Chunks pushed so far. `Relabel` names chunks by this count, which is
+    /// the same one `Session` keeps: the session pushes exactly one chunk per
+    /// chunk, in order, so the two agree without exchanging anything.
+    chunks_seen: u64,
     /// Whether the embedder is still worth asking. See the failure notes
-    /// above: this is what makes a per-window fault visible to a session that
-    /// counts chunks.
+    /// above: this is what makes a per-embedding fault visible to a session
+    /// that counts chunks.
     fuse: Fuse,
 }
 
@@ -462,20 +515,25 @@ impl State {
 }
 
 impl RealDiarizer {
-    fn new(models: Models, min_pool: usize) -> Self {
+    fn new(models: Models, tuning: DiarizeTuning) -> Self {
         Self {
             models,
             state: None,
             framer: Framer::default(),
             assembler: WindowAssembler::default(),
-            clusterer: OnlineClusterer::with_config(min_pool, crate::diarize::cluster::T_MARGIN),
+            clusterer: OnlineClusterer::with_config(tuning.min_pool, tuning.margin),
+            change_threshold: tuning.change_threshold,
             last_label: None,
+            previous_hop: None,
+            unlabelled_since: None,
+            provisional: None,
+            chunks_seen: 0,
             fuse: Fuse::default(),
         }
     }
 
-    /// What a window the embedder could not place costs: one mark against the
-    /// fuse, and the error back to the caller with the count in it, in the
+    /// What an embedding the model could not produce costs: one mark against
+    /// the fuse, and the error back to the caller with the count in it, in the
     /// shape `session.rs` already logs failures in.
     ///
     /// Split out of `push` so the failure path can be driven without a model.
@@ -483,23 +541,115 @@ impl RealDiarizer {
     fn window_failed(&mut self, e: anyhow::Error) -> anyhow::Error {
         let n = self.fuse.failed(&e);
         e.context(format!(
-            "embedding a voiced window ({n} of {MAX_WINDOW_FAILURES} in a row)"
+            "embedding voiced audio ({n} of {MAX_EMBED_FAILURES} in a row)"
         ))
+    }
+
+    /// A hop: the turn-change test, then a provisional label if there is
+    /// nothing better on offer.
+    ///
+    /// Returns whether this hop was a change point, which the caller needs in
+    /// order to throw away the windows behind it.
+    fn hop(&mut self, embedding: Vec<f32>, chunk: u64, out: &mut Attribution) -> bool {
+        let changed = self
+            .previous_hop
+            .as_ref()
+            .is_some_and(|previous| cosine(previous, &embedding) < self.change_threshold);
+        self.previous_hop = Some(embedding.clone());
+
+        if changed {
+            out.boundary = true;
+            // Everything accumulated before this hop is the outgoing speaker,
+            // so a window built from it would be a mixture of two voices.
+            self.assembler.cut_at_boundary();
+            // And nothing known about the outgoing speaker is true of the
+            // incoming one. Saying nothing beats saying the wrong name.
+            self.last_label = None;
+            self.provisional = None;
+            self.unlabelled_since = Some(chunk);
+        }
+
+        // Only where there is nothing better. A hop's guess never overwrites
+        // an answer a full window settled: it is the faster of the two, not
+        // the more trustworthy one.
+        if self.last_label.is_none()
+            && let Some(label) = self.clusterer.observe_short(&embedding)
+        {
+            self.last_label = Some(label);
+            self.provisional = Some((label, chunk));
+        }
+        changed
+    }
+
+    /// A full 1.5 s window: the only thing that moves a centroid, mints a
+    /// speaker, or corrects one.
+    fn window(&mut self, embedding: &[f32], chunk: u64, out: &mut Attribution) {
+        let before = self.clusterer.minted();
+        let settled = self.clusterer.observe(embedding);
+        let minted = self.clusterer.minted() > before;
+
+        match (settled, minted) {
+            // A speaker exists who did not before. The chunks since this turn
+            // began were committed with nobody's name on them, and now there
+            // is one -- which is the whole of complaint 1, fixed without
+            // touching the four-window reluctance that made it.
+            (Some(speaker), true) => {
+                let from = self.unlabelled_since.unwrap_or(chunk);
+                out.relabels.push(Relabel {
+                    from_chunk: from,
+                    to_chunk: chunk,
+                    speaker,
+                });
+            }
+            // A window disagreeing with the guess a hop had been offering.
+            // Correcting it is better than leaving it wrong, and the hop is
+            // allowed to be wrong precisely because this exists.
+            (Some(speaker), false) => {
+                if let Some((provisional, since)) = self.provisional
+                    && provisional != speaker
+                {
+                    out.relabels.push(Relabel {
+                        from_chunk: since,
+                        to_chunk: chunk,
+                        speaker,
+                    });
+                }
+            }
+            (None, _) => {}
+        }
+
+        // An undecided clusterer overwrites a known label with None on
+        // purpose: it has just seen 1.5 s of speech it cannot place, so the
+        // previous answer is stale rather than still true.
+        self.last_label = settled;
+        self.provisional = None;
+        match settled {
+            Some(_) => self.unlabelled_since = None,
+            None => {
+                self.unlabelled_since.get_or_insert(chunk);
+            }
+        }
     }
 }
 
 impl Diarizer for RealDiarizer {
-    fn push(&mut self, audio: &[f32]) -> Result<Option<u32>> {
+    fn push(&mut self, audio: &[f32]) -> Result<Attribution> {
+        // Counted before anything can fail, so the count keeps step with the
+        // session's however this call ends: `Relabel` names chunks by number
+        // and the two sides never exchange one.
+        let chunk = self.chunks_seen;
+        self.chunks_seen += 1;
+
         // A blown fuse answers before anything else, the lazy load and the
         // framer included. Failing every chunk is the whole point: it is what
-        // turns a fault the embedder raises per window into one the session
+        // turns a fault the embedder raises per embedding into one the session
         // sees per chunk, so its consecutive count can reach the end. Nothing
         // below is worth doing on the way -- the stream position the framer
         // keeps is only of use to a diarizer that might answer again.
         if let Some(why) = self.fuse.blown() {
             bail!(
-                "the embedder failed {MAX_WINDOW_FAILURES} windows in a row and is out \
-                 of service; the last of them: {why}"
+                "the embedder failed {MAX_EMBED_FAILURES} embeddings in a row and is \
+                 out of service; the last of them: {why}"
             );
         }
 
@@ -514,8 +664,6 @@ impl Diarizer for RealDiarizer {
         if self.state.is_none() {
             self.state = Some(State::load(&self.models).context("loading the diarization models")?);
         }
-        let state = self.state.as_mut().expect("loaded above");
-
         // Framed before the VAD runs, and unconditionally: `Vad::run` takes
         // the whole chunk into its own remainder before its first inference,
         // so a failure part-way through still consumed the audio. Advancing
@@ -523,7 +671,7 @@ impl Diarizer for RealDiarizer {
         // is, and leaves the lost frames looking like the gap they are.
         let framed = self.framer.take(audio);
         let frames = framed.samples.len() / FRAME;
-        let voiced = state.vad.run(audio)?;
+        let voiced = self.state.as_mut().expect("loaded above").vad.run(audio)?;
         ensure!(
             voiced.len() == frames,
             "the VAD reported {} frames for a chunk framed into {frames}; its flags \
@@ -531,26 +679,47 @@ impl Diarizer for RealDiarizer {
             voiced.len()
         );
 
-        for window in self.assembler.push(&framed, &voiced) {
-            let embedding = match state.embedder.embed(&window) {
+        let mut out = Attribution::default();
+        // A change point invalidates every window still to come out of this
+        // batch: they were assembled before the cut, from audio either side of
+        // the boundary, which is exactly the mixture the cut says they are.
+        // (A hop and a window never complete on the same frame -- 23 and 47
+        // frames are coprime in the relevant sense -- but they can complete on
+        // the same chunk, which is what this is for.)
+        let mut cut = false;
+        for piece in self.assembler.push(&framed, &voiced) {
+            let (Cut::Hop(audio) | Cut::Window(audio)) = &piece;
+            if matches!(piece, Cut::Window(_)) && cut {
+                continue;
+            }
+            let embedding = match self
+                .state
+                .as_mut()
+                .expect("loaded above")
+                .embedder
+                .embed(audio)
+            {
                 Ok(embedding) => embedding,
                 Err(e) => return Err(self.window_failed(e)),
             };
             self.fuse.passed();
-            // An undecided clusterer overwrites a known label with None on
-            // purpose: it has just seen 1.5 s of speech it cannot place, so
-            // the previous answer is stale rather than still true.
-            self.last_label = self.clusterer.observe(&embedding);
+            match piece {
+                Cut::Hop(_) => cut |= self.hop(embedding, chunk, &mut out),
+                Cut::Window(_) => self.window(&embedding, chunk, &mut out),
+            }
         }
 
         // Silence answers None rather than repeating itself. Carrying a label
         // across a chunk with no voice in it would attribute the pause to
         // whoever spoke before it, and `speaker: None` exists for exactly this.
         if voiced.iter().any(|&v| v) {
-            Ok(self.last_label)
-        } else {
-            Ok(None)
+            out.speaker = self.last_label;
+            out.provisional = self.provisional.is_some();
         }
+        if out.speaker.is_none() {
+            self.unlabelled_since.get_or_insert(chunk);
+        }
+        Ok(out)
     }
 }
 
@@ -650,7 +819,7 @@ mod tests {
         // allocation under memory pressure -- and a session that still gets
         // an embedding out of every other window is still labelling.
         let mut fuse = Fuse::default();
-        for _ in 0..MAX_WINDOW_FAILURES * 3 {
+        for _ in 0..MAX_EMBED_FAILURES * 3 {
             fuse.failed(&anyhow::anyhow!("a blip"));
             fuse.passed();
         }
@@ -660,7 +829,7 @@ mod tests {
     #[test]
     fn windows_that_keep_failing_blow_the_fuse_for_good() {
         let mut fuse = Fuse::default();
-        for i in 1..MAX_WINDOW_FAILURES {
+        for i in 1..MAX_EMBED_FAILURES {
             assert_eq!(fuse.failed(&anyhow::anyhow!("window {i}")), i);
             assert!(fuse.blown().is_none(), "blown after only {i}");
         }
@@ -694,9 +863,9 @@ mod tests {
                 embed: PathBuf::from("/nonexistent/embed.onnx"),
                 norm: Norm::Mean,
             },
-            2,
+            DiarizeTuning::default(),
         );
-        for _ in 0..MAX_WINDOW_FAILURES {
+        for _ in 0..MAX_EMBED_FAILURES {
             let _ = d.window_failed(anyhow::anyhow!("embedding 0 is not finite at dimension 3"));
         }
 

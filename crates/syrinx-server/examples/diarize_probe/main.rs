@@ -59,7 +59,7 @@ use syrinx_server::diarize::cluster::{
 };
 use syrinx_server::diarize::fbank::SAMPLE_RATE;
 use syrinx_server::diarize::real::{Embedder, Vad, norm_for};
-use syrinx_server::diarize::window::{FRAME, Framed, WINDOW_SAMPLES, WindowAssembler};
+use syrinx_server::diarize::window::{Cut, FRAME, Framed, WINDOW_SAMPLES, WindowAssembler};
 
 mod reference;
 use reference::Reference;
@@ -210,7 +210,11 @@ fn agrees_with_the_shipped_assembler(
             first_frame,
             samples: samples[first_frame * FRAME..(first_frame + n) * FRAME].to_vec(),
         };
-        for window in assembler.push(&framed, &voiced[first_frame..first_frame + n]) {
+        for cut in assembler.push(&framed, &voiced[first_frame..first_frame + n]) {
+            // Hops are the harness's blind spot on purpose: it scores whole
+            // files and has no use for a 0.75 s embedding, so this check is
+            // about the windows the numbers were measured on.
+            let Cut::Window(window) = cut else { continue };
             let expected = mine.get(matched).with_context(|| {
                 format!(
                     "the shipped assembler produced window {matched}, the harness \

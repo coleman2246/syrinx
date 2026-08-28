@@ -73,7 +73,12 @@ fn build_loader(config: &Config) -> Arc<dyn Fn() -> Result<Arc<dyn AsrBackend>> 
 #[cfg(feature = "diarize")]
 fn build_diarizer(config: &Config) -> Option<Arc<dyn DiarizerFactory>> {
     let dir = config.diarize_model_dir.as_ref()?;
-    match RealDiarizerFactory::load(std::path::Path::new(dir), config.diarize_min_pool) {
+    let tuning = syrinx_server::diarize::DiarizeTuning {
+        min_pool: config.diarize_min_pool,
+        margin: config.diarize_margin,
+        change_threshold: config.diarize_change_threshold,
+    };
+    match RealDiarizerFactory::load(std::path::Path::new(dir), tuning) {
         Ok(factory) => Some(Arc::new(factory) as Arc<dyn DiarizerFactory>),
         Err(e) => {
             tracing::error!("speaker labelling disabled: {e:#}");

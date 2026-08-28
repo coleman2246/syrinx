@@ -162,11 +162,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Inference on the blocking pool: it is synchronous and GPU-bound.
     let sid = session_id.clone();
-    // Read before the closure takes ownership of everything it needs; the depth
-    // is the server's `diarize_lag_chunks`, defaulting to the calibrated 2.
-    let lag_chunks = state.config.diarize_lag_chunks;
+    // Read before the closure takes ownership of everything it needs: the
+    // server's `diarize_lag_chunks` and `diarize_relabel_window`, defaulting to
+    // the values `session.rs` names.
+    let tuning = crate::session::SessionTuning {
+        lag_chunks: state.config.diarize_lag_chunks,
+        relabel_window: state.config.diarize_relabel_window,
+    };
     let infer = tokio::task::spawn_blocking(move || {
-        let mut session = Session::with_lag(mode, backend.as_ref(), sid, d, lag_chunks);
+        let mut session = Session::with_tuning(mode, backend.as_ref(), sid, d, tuning);
         while let Some(ev) = audio_rx.blocking_recv() {
             let is_finish = matches!(ev, AudioEvent::Finish);
             let produced = match ev {
