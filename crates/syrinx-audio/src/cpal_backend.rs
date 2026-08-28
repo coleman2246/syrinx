@@ -31,7 +31,9 @@ pub fn list_sources() -> Result<Vec<Source>> {
     let mut out = Vec::new();
 
     for d in host.input_devices().context("enumerating input devices")? {
-        let Some(name) = device_name(&d) else { continue };
+        let Some(name) = device_name(&d) else {
+            continue;
+        };
         out.push(Source {
             target: SourceTarget::CpalDevice {
                 name: name.clone(),
@@ -46,8 +48,13 @@ pub fn list_sources() -> Result<Vec<Source>> {
         });
     }
 
-    for d in host.output_devices().context("enumerating output devices")? {
-        let Some(name) = device_name(&d) else { continue };
+    for d in host
+        .output_devices()
+        .context("enumerating output devices")?
+    {
+        let Some(name) = device_name(&d) else {
+            continue;
+        };
         let name_for_sink = name.clone();
         out.push(Source {
             target: SourceTarget::CpalDevice {
@@ -81,7 +88,10 @@ pub fn list_sources() -> Result<Vec<Source>> {
 pub fn find_device(name: &str, loopback: bool) -> Result<cpal::Device> {
     let host = cpal::default_host();
     let mut devices: Box<dyn Iterator<Item = cpal::Device>> = if loopback {
-        Box::new(host.output_devices().context("enumerating output devices")?)
+        Box::new(
+            host.output_devices()
+                .context("enumerating output devices")?,
+        )
     } else {
         Box::new(host.input_devices().context("enumerating input devices")?)
     };

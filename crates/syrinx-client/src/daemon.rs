@@ -269,11 +269,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                 }
                 Request::SetStreamFile { path } => {
                     state.opts.config.stream_to = path;
-                    if let Err(e) = state
-                        .opts
-                        .config
-                        .save(&crate::Config::default_path())
-                    {
+                    if let Err(e) = state.opts.config.save(&crate::Config::default_path()) {
                         warn!("saving the config: {e:#}");
                     }
                     Response::Ok
@@ -575,8 +571,7 @@ impl DaemonRuntime {
             let s = if self.sessions.is_empty() {
                 &self.last
             } else {
-                merged =
-                    merge_states(&self.sessions.iter().map(|s| s.state()).collect::<Vec<_>>());
+                merged = merge_states(&self.sessions.iter().map(|s| s.state()).collect::<Vec<_>>());
                 &merged
             };
             // Turns only once something carries a speaker. Without labels
@@ -619,11 +614,8 @@ impl DaemonRuntime {
         } else {
             merge_states(&lives)
         };
-        let mut out = DaemonState::from_session(
-            &s,
-            self.opts.mode,
-            self.opts.source_keys.first().cloned(),
-        );
+        let mut out =
+            DaemonState::from_session(&s, self.opts.mode, self.opts.source_keys.first().cloned());
         out.revision = self.text.revision;
         out.source_keys = self.opts.source_keys.clone();
         out.source_mode = self.opts.source_mode;
@@ -835,9 +827,11 @@ impl DaemonRuntime {
         if self.running() {
             anyhow::bail!("stop the current session before transcribing a file");
         }
-        if self.file_job.as_ref().is_some_and(|j| {
-            !j.lock().expect("file job poisoned").done
-        }) {
+        if self
+            .file_job
+            .as_ref()
+            .is_some_and(|j| !j.lock().expect("file job poisoned").done)
+        {
             anyhow::bail!("already transcribing a file");
         }
 
@@ -1064,8 +1058,7 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir()
-            .join(format!("syrinx-daemon-{tag}-{}.txt", std::process::id()))
+        std::env::temp_dir().join(format!("syrinx-daemon-{tag}-{}.txt", std::process::id()))
     }
 
     #[test]
@@ -1143,7 +1136,11 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            [("mic one", Some(1)), ("system", Some(1)), ("mic two", Some(2))],
+            [
+                ("mic one", Some(1)),
+                ("system", Some(1)),
+                ("mic two", Some(2))
+            ],
             "the merge must interleave by time and carry every speaker"
         );
     }

@@ -88,6 +88,60 @@ pub struct Config {
     /// `docs/specs/2026-08-24-speaker-diarization-design.md`.
     #[serde(default = "default_diarize_min_pool")]
     pub diarize_min_pool: usize,
+
+    /// How far the nearest centroid must beat the second nearest before a
+    /// window is attributed to it.
+    ///
+    /// The crowding tunable. An argmax against a fixed threshold decays as
+    /// centroids are added -- with five speakers the spike already measured
+    /// two live centroids at 0.519, above `T_assign` -- so a genuinely new
+    /// voice increasingly finds an incumbent over the bar to be handed to.
+    /// Requiring a lead as well is the question that does not rot.
+    ///
+    /// Raising it labels less and guesses less; 0 is the rule the server used
+    /// before 2026-08-27, and the retreat if corrections and gaps turn out to
+    /// read worse than the occasional wrong name. Accepted range 0 to 0.5.
+    ///
+    /// **The default is an engineering estimate, not a measurement.** See
+    /// `docs/specs/2026-08-27-diarization-latency-and-crowding-design.md`; the
+    /// probe's live-emulation mode exists to replace it.
+    #[serde(default = "default_diarize_margin")]
+    pub diarize_margin: f32,
+
+    /// How far the cosine between two consecutive 0.75 s hop embeddings must
+    /// fall before the diarizer calls it a turn change.
+    ///
+    /// A detected change flushes the 1.5 s accumulator at the boundary, so the
+    /// next full window is one voice rather than two; stops the previous
+    /// speaker's label being carried forward over the new speaker's opening
+    /// sentence; and stops the commit vote reaching across the boundary. It is
+    /// the only turn-change detector in the pipeline -- `MAX_GAP_FRAMES` is
+    /// deliberately not one, and `window.rs` records the measurement saying so.
+    ///
+    /// A cosine, so 0 to 1. At 0 nothing is ever a turn change and the
+    /// behaviour is what the server did before 2026-08-27; at 1 every hop is,
+    /// and no window ever completes.
+    ///
+    /// **The default is an engineering estimate, not a measurement.**
+    #[serde(default = "default_diarize_change_threshold")]
+    pub diarize_change_threshold: f32,
+
+    /// How many seconds of already-committed transcript stay eligible to have
+    /// their speaker corrected.
+    ///
+    /// A voice needs four agreeing windows before it is minted, so the opening
+    /// of a meeting is committed before anybody can be named for it. Within
+    /// this window the server sends `transcript.relabel` when the name
+    /// arrives, and the GUI and Save-as pick it up; the streamed file never
+    /// does, because it is append-only on purpose.
+    ///
+    /// 0 turns corrections off entirely, which is the retreat if text
+    /// acquiring a speaker name a few seconds late reads worse than a gap.
+    /// Accepted range 0 to 600 seconds.
+    ///
+    /// **The default is an engineering estimate, not a measurement.**
+    #[serde(default = "default_diarize_relabel_window")]
+    pub diarize_relabel_window: u64,
 }
 
 /// What [`Config::diarize_lag_chunks`] will accept. The top is ~9 s, five
@@ -101,6 +155,23 @@ const DIARIZE_LAG_CHUNKS: RangeInclusive<usize> = 0..=16;
 /// is ~12 s of one uninterrupted voice before a speaker is minted, by which
 /// point a meeting labels nobody at all.
 const DIARIZE_MIN_POOL: RangeInclusive<usize> = 2..=16;
+
+/// What [`Config::diarize_margin`] will accept. The top is half a cosine,
+/// which is already past useful: same-speaker windows sit at a median of 0.52
+/// and different-speaker at 0.046, so a lead of more than about half is a
+/// server that assigns nothing while looking perfectly healthy -- the quiet
+/// failure the spike documented when `T_assign` was raised instead.
+const DIARIZE_MARGIN: RangeInclusive<f32> = 0.0..=0.5;
+
+/// What [`Config::diarize_change_threshold`] will accept: a cosine's range,
+/// both ends meaningful. 0 detects no turn change ever, 1 detects one at every
+/// hop.
+const DIARIZE_CHANGE_THRESHOLD: RangeInclusive<f32> = 0.0..=1.0;
+
+/// What [`Config::diarize_relabel_window`] will accept, in seconds. The top is
+/// ten minutes, past which the session is holding a ring of commits nobody is
+/// still looking at and the client is repainting scrollback.
+const DIARIZE_RELABEL_WINDOW: RangeInclusive<u64> = 0..=600;
 
 /// Execution provider. Defaults to CPU: it needs no GPU, cannot disturb other
 /// tenants, and at ~149ms per 560ms chunk it still keeps up in real time.
@@ -139,6 +210,15 @@ fn default_diarize_lag_chunks() -> usize {
 fn default_diarize_min_pool() -> usize {
     crate::diarize::cluster::MIN_POOL
 }
+fn default_diarize_margin() -> f32 {
+    crate::diarize::cluster::T_MARGIN
+}
+fn default_diarize_change_threshold() -> f32 {
+    crate::diarize::cluster::T_CHANGE
+}
+fn default_diarize_relabel_window() -> u64 {
+    crate::session::RELABEL_WINDOW
+}
 
 impl Config {
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
@@ -150,14 +230,15 @@ impl Config {
     /// Refuse settings that parse but cannot work, naming the key and what it
     /// accepts.
     ///
-    /// Only the two diarization tunables need this. The other numbers here are
+    /// Only the diarization tunables need this. The other numbers here are
     /// either checked where they are used or have no wrong value -- a small
-    /// `max_sessions` is a cautious server, not a broken one. These two are
+    /// `max_sessions` is a cautious server, not a broken one. These are
     /// different: a pool of 1 mints a speaker from a single window, which is
-    /// the one outcome the clustering design exists to prevent, and a lag of
-    /// 200 holds two minutes of transcript hostage to a label. Both look
-    /// exactly like a working server until a meeting is under way, so the load
-    /// is where they have to fail.
+    /// the one outcome the clustering design exists to prevent; a lag of 200
+    /// holds two minutes of transcript hostage to a label; a margin of 0.9
+    /// labels nobody at all. Every one of them looks exactly like a working
+    /// server until a meeting is under way, so the load is where they have to
+    /// fail.
     fn validate(&self) -> anyhow::Result<()> {
         ensure!(
             DIARIZE_LAG_CHUNKS.contains(&self.diarize_lag_chunks),
@@ -178,6 +259,37 @@ impl Config {
             DIARIZE_MIN_POOL.end(),
             DIARIZE_MIN_POOL.start(),
             default_diarize_min_pool(),
+        );
+        ensure!(
+            DIARIZE_MARGIN.contains(&self.diarize_margin),
+            "diarize_margin = {} is out of range: it must be {} to {}, in cosine. \
+             0 assigns to the nearest centroid over the threshold and never mind \
+             the runner-up, which is what the server did before speaker crowding \
+             was addressed; the shipped value is {}.",
+            self.diarize_margin,
+            DIARIZE_MARGIN.start(),
+            DIARIZE_MARGIN.end(),
+            default_diarize_margin(),
+        );
+        ensure!(
+            DIARIZE_CHANGE_THRESHOLD.contains(&self.diarize_change_threshold),
+            "diarize_change_threshold = {} is out of range: it must be {} to {}, \
+             in cosine between consecutive 0.75 s hops. 0 detects no turn change \
+             ever; the shipped value is {}.",
+            self.diarize_change_threshold,
+            DIARIZE_CHANGE_THRESHOLD.start(),
+            DIARIZE_CHANGE_THRESHOLD.end(),
+            default_diarize_change_threshold(),
+        );
+        ensure!(
+            DIARIZE_RELABEL_WINDOW.contains(&self.diarize_relabel_window),
+            "diarize_relabel_window = {} is out of range: it must be {} to {} \
+             seconds. 0 turns speaker corrections off entirely; the shipped \
+             value is {}.",
+            self.diarize_relabel_window,
+            DIARIZE_RELABEL_WINDOW.start(),
+            DIARIZE_RELABEL_WINDOW.end(),
+            default_diarize_relabel_window(),
         );
         Ok(())
     }
@@ -302,7 +414,8 @@ mod tests {
 
     #[test]
     fn provider_parses_from_config() {
-        let c = Config::from_toml("token = \"a\"\nmodel_dir = \"/m\"\nprovider = \"cuda\"").unwrap();
+        let c =
+            Config::from_toml("token = \"a\"\nmodel_dir = \"/m\"\nprovider = \"cuda\"").unwrap();
         assert_eq!(c.provider, Provider::Cuda);
     }
 
@@ -350,10 +463,8 @@ mod tests {
 
     #[test]
     fn diarize_model_dir_parses() {
-        let c = Config::from_toml(
-            "token = \"a\"\nmodel_dir = \"/m\"\ndiarize_model_dir = \"/d\"",
-        )
-        .unwrap();
+        let c = Config::from_toml("token = \"a\"\nmodel_dir = \"/m\"\ndiarize_model_dir = \"/d\"")
+            .unwrap();
         assert_eq!(c.diarize_model_dir.as_deref(), Some("/d"));
     }
 
@@ -427,5 +538,110 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("diarize_min_pool"), "{message}");
         assert!(message.contains("2 to 16"), "{message}");
+    }
+
+    #[test]
+    fn the_latency_tunables_default_to_what_the_code_names() {
+        // Same rule as the two before them: a config that says nothing about
+        // these must behave exactly as the server did before they existed.
+        let c = base();
+        assert_eq!(c.diarize_margin, crate::diarize::cluster::T_MARGIN);
+        assert_eq!(
+            c.diarize_change_threshold,
+            crate::diarize::cluster::T_CHANGE
+        );
+        assert_eq!(c.diarize_relabel_window, crate::session::RELABEL_WINDOW);
+    }
+
+    #[test]
+    fn the_latency_tunables_parse() {
+        let c = with(
+            "diarize_margin = 0.2\ndiarize_change_threshold = 0.5\n\
+             diarize_relabel_window = 10",
+        )
+        .unwrap();
+        assert_eq!(c.diarize_margin, 0.2);
+        assert_eq!(c.diarize_change_threshold, 0.5);
+        assert_eq!(c.diarize_relabel_window, 10);
+    }
+
+    #[test]
+    fn a_margin_of_zero_is_the_documented_way_back_to_the_old_rule() {
+        // The bottom of the range is meaningful: assign to the nearest
+        // centroid over the threshold and never mind the runner-up, which is
+        // exactly what the server did before 2026-08-27. It is the retreat if
+        // withholding turns out to cost more than it saves, so it has to be
+        // accepted rather than read as "unset".
+        assert_eq!(with("diarize_margin = 0.0").unwrap().diarize_margin, 0.0);
+    }
+
+    #[test]
+    fn a_relabel_window_of_zero_turns_corrections_off() {
+        // The escape hatch the design names: if text acquiring a speaker name
+        // a few seconds late reads worse than a gap, this is how a deployment
+        // says so.
+        assert_eq!(
+            with("diarize_relabel_window = 0")
+                .unwrap()
+                .diarize_relabel_window,
+            0
+        );
+    }
+
+    #[test]
+    fn a_margin_nothing_could_clear_is_refused_at_load_by_name() {
+        // Cosines to two different centroids cannot differ by more than about
+        // half in any configuration that assigns anything at all, so a margin
+        // above that is a server that labels nobody while looking healthy --
+        // the same quiet failure the spike measured when T_assign was raised.
+        let err = with("diarize_margin = 0.6").expect_err("above the range");
+        let message = format!("{err:#}");
+        assert!(message.contains("diarize_margin"), "{message}");
+        assert!(message.contains("0 to 0.5"), "{message}");
+        assert!(with("diarize_margin = -0.1").is_err(), "a negative margin");
+    }
+
+    #[test]
+    fn an_out_of_range_change_threshold_is_refused_at_load_by_name() {
+        // A cosine, so the range is a cosine's. At 1 every hop is a turn
+        // change and the accumulator never fills; at 0 nothing is.
+        let err = with("diarize_change_threshold = 1.5").expect_err("above the range");
+        let message = format!("{err:#}");
+        assert!(message.contains("diarize_change_threshold"), "{message}");
+        assert!(message.contains("0 to 1"), "{message}");
+        assert!(with("diarize_change_threshold = 0.0").is_ok());
+        assert!(with("diarize_change_threshold = 1.0").is_ok());
+    }
+
+    #[test]
+    fn an_absurd_relabel_window_is_refused_at_load_by_name() {
+        // Ten minutes of transcript still open to correction is a client
+        // repainting text nobody is looking at any more, and a ring of
+        // commits the session holds for as long.
+        let err = with("diarize_relabel_window = 601").expect_err("above the range");
+        let message = format!("{err:#}");
+        assert!(message.contains("diarize_relabel_window"), "{message}");
+        assert!(message.contains("0 to 600"), "{message}");
+    }
+
+    #[test]
+    fn the_latency_tunables_are_not_overridable_either() {
+        // They describe how the service behaves, like everything else that is
+        // not a token, a bind address or a model path.
+        let mut c = base();
+        let before = (
+            c.diarize_margin,
+            c.diarize_change_threshold,
+            c.diarize_relabel_window,
+        );
+        c.apply_env(|_| Some("999".into()));
+        assert_eq!(
+            (
+                c.diarize_margin,
+                c.diarize_change_threshold,
+                c.diarize_relabel_window,
+            ),
+            before
+        );
     }
 }

@@ -25,7 +25,8 @@ fn live_mode_never_emits_provisional_or_revise() {
     // a client to retract.
     for m in drive(Mode::Live, 3) {
         match m {
-            ServerMessage::TranscriptProvisional { .. } | ServerMessage::TranscriptRevise { .. } => {
+            ServerMessage::TranscriptProvisional { .. }
+            | ServerMessage::TranscriptRevise { .. } => {
                 panic!("live mode emitted a revision message: {m:?}")
             }
             _ => {}

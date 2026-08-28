@@ -8,8 +8,8 @@
 //! its own, which lives in `windows_ui`; both feed the same [`TrayCommand`]
 //! channel, so nothing downstream knows which one is running.
 
-use std::sync::Mutex;
 use crate::{OutputMode, Status};
+use std::sync::Mutex;
 use tokio::sync::mpsc;
 
 /// A request from the tray menu to the application.
@@ -70,7 +70,8 @@ impl TrayHandle {
         *last = Some(state.clone());
         #[cfg(target_os = "linux")]
         {
-            self.handle.update(move |t: &mut SyrinxTray| t.state = state);
+            self.handle
+                .update(move |t: &mut SyrinxTray| t.state = state);
         }
         #[cfg(windows)]
         {

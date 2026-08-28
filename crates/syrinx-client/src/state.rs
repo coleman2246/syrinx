@@ -109,8 +109,7 @@ pub fn signal_stop(pid: i32, pid_path: &Path) -> Result<()> {
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
         let _ = pid_path;
-        kill(Pid::from_raw(pid), Signal::SIGTERM)
-            .context("sending SIGTERM to the running instance")
+        kill(Pid::from_raw(pid), Signal::SIGTERM).context("sending SIGTERM to the running instance")
     }
     #[cfg(windows)]
     {

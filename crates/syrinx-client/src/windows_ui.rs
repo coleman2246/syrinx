@@ -333,7 +333,11 @@ mod tests {
         let px = icon_rgba(Status::Listening);
         let at = |x: u32, y: u32| px[((y * ICON + x) * 4 + 3) as usize];
         assert_eq!(at(0, 0), 0, "the corner should be transparent");
-        assert_eq!(at(ICON - 1, ICON - 1), 0, "the corner should be transparent");
+        assert_eq!(
+            at(ICON - 1, ICON - 1),
+            0,
+            "the corner should be transparent"
+        );
         assert_eq!(at(ICON / 2, ICON / 2), 255, "the centre should be opaque");
     }
 }

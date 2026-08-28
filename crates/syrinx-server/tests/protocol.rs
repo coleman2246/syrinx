@@ -4,6 +4,8 @@
 //! no CUDA. That is the point of the `AsrBackend` boundary.
 
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
+use std::time::Duration;
 use syrinx_proto::{ClientMessage, Encoding, ErrorCode, Mode, ServerMessage};
 use syrinx_server::app::build_router;
 use syrinx_server::asr::AsrBackend;
@@ -11,8 +13,6 @@ use syrinx_server::asr::lifecycle::{FixedVramProbe, ModelHandle, VramGuard};
 use syrinx_server::asr::mock::MockBackend;
 use syrinx_server::config::Config;
 use syrinx_server::diarize::{Diarizer, DiarizerFactory, MockDiarizer};
-use std::sync::Arc;
-use std::time::Duration;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as TMessage;
 
@@ -45,8 +45,10 @@ async fn spawn_server(max_sessions: usize, diarize: Option<Arc<dyn DiarizerFacto
     // tests exercise the protocol, not the tenancy policy.
     let model = Arc::new(ModelHandle::new(
         Arc::new(|| {
-            Ok(Arc::new(MockBackend::new(&["alpha", "beta", "gamma"]).with_chunk_samples(4))
-                as Arc<dyn AsrBackend>)
+            Ok(
+                Arc::new(MockBackend::new(&["alpha", "beta", "gamma"]).with_chunk_samples(4))
+                    as Arc<dyn AsrBackend>,
+            )
         }),
         VramGuard::new(1536),
         Arc::new(FixedVramProbe(None)),
@@ -199,7 +201,8 @@ async fn live_mode_never_emits_revision_messages_over_the_wire() {
 
     while let Some(m) = next_msg(&mut ws).await {
         match m {
-            ServerMessage::TranscriptProvisional { .. } | ServerMessage::TranscriptRevise { .. } => {
+            ServerMessage::TranscriptProvisional { .. }
+            | ServerMessage::TranscriptRevise { .. } => {
                 panic!("live mode emitted a revision message over the wire: {m:?}")
             }
             ServerMessage::SessionClosed { .. } => break,
@@ -315,7 +318,8 @@ async fn session_flush_ends_the_session_exactly_like_stop() {
 
 #[tokio::test]
 async fn transcribe_session_requesting_labels_gets_them_when_a_factory_is_configured() {
-    let factory: Arc<dyn DiarizerFactory> = Arc::new(ScriptedFactory(vec![Some(1), Some(1), Some(1)]));
+    let factory: Arc<dyn DiarizerFactory> =
+        Arc::new(ScriptedFactory(vec![Some(1), Some(1), Some(1)]));
     let url = spawn_server(4, Some(factory)).await;
     let mut ws = connect(&url, Some(TOKEN)).await.unwrap();
 
@@ -332,7 +336,10 @@ async fn transcribe_session_requesting_labels_gets_them_when_a_factory_is_config
 
     match next_msg(&mut ws).await.unwrap() {
         ServerMessage::SessionReady { diarize, .. } => {
-            assert!(diarize, "a configured server must honestly grant what it asked for")
+            assert!(
+                diarize,
+                "a configured server must honestly grant what it asked for"
+            )
         }
         other => panic!("expected session.ready, got {other:?}"),
     }
@@ -381,7 +388,10 @@ async fn transcribe_session_requesting_labels_gets_none_without_a_configured_fac
 
     match next_msg(&mut ws).await.unwrap() {
         ServerMessage::SessionReady { diarize, .. } => {
-            assert!(!diarize, "no diarizer is configured, so the handshake must say no")
+            assert!(
+                !diarize,
+                "no diarizer is configured, so the handshake must say no"
+            )
         }
         other => panic!("expected session.ready, got {other:?}"),
     }
@@ -417,7 +427,8 @@ async fn live_mode_never_gets_labels_even_when_requested_and_available() {
     // Mode gating happens regardless of what the server has configured: live
     // mode types into someone else's application, where a speaker label has
     // nowhere to go.
-    let factory: Arc<dyn DiarizerFactory> = Arc::new(ScriptedFactory(vec![Some(1), Some(1), Some(1)]));
+    let factory: Arc<dyn DiarizerFactory> =
+        Arc::new(ScriptedFactory(vec![Some(1), Some(1), Some(1)]));
     let url = spawn_server(4, Some(factory)).await;
     let mut ws = connect(&url, Some(TOKEN)).await.unwrap();
 

@@ -468,7 +468,7 @@ impl RealDiarizer {
             state: None,
             framer: Framer::default(),
             assembler: WindowAssembler::default(),
-            clusterer: OnlineClusterer::with_min_pool(min_pool),
+            clusterer: OnlineClusterer::with_config(min_pool, crate::diarize::cluster::T_MARGIN),
             last_label: None,
             fuse: Fuse::default(),
         }

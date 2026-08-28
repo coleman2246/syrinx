@@ -55,7 +55,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 
 use syrinx_server::diarize::cluster::{
-    EMA_ALPHA, MIN_POOL, OnlineClusterer, T_ASSIGN, T_RETIRE, cosine,
+    EMA_ALPHA, MIN_POOL, OnlineClusterer, T_ASSIGN, T_MARGIN, T_RETIRE, cosine,
 };
 use syrinx_server::diarize::fbank::SAMPLE_RATE;
 use syrinx_server::diarize::real::{Embedder, Vad, norm_for};
@@ -583,10 +583,10 @@ fn label_frames(
     (labels, clusterer)
 }
 
-/// The clusterer's four thresholds, as the sweep varies them.
+/// The clusterer's five thresholds, as the sweep varies them.
 ///
 /// Deliberately not a type in `diarize::cluster`: the server has no
-/// configuration surface here, and the one place these four travel together is
+/// configuration surface here, and the one place these five travel together is
 /// this harness. [`Default`] reads the shipped constants, so a no-flags `run`
 /// is the shipped configuration and there is no second copy of the numbers.
 #[derive(Clone, Copy, Debug)]
@@ -595,6 +595,10 @@ struct Params {
     t_retire: f32,
     alpha: f32,
     min_pool: usize,
+    /// How far the best centroid must beat the second best. 0 is the rule the
+    /// server used before 2026-08-27, which is what makes `--margin 0` the
+    /// before-and-after comparison for every number this harness reports.
+    margin: f32,
 }
 
 impl Default for Params {
@@ -604,13 +608,20 @@ impl Default for Params {
             t_retire: T_RETIRE,
             alpha: EMA_ALPHA,
             min_pool: MIN_POOL,
+            margin: T_MARGIN,
         }
     }
 }
 
 impl Params {
     fn clusterer(&self) -> OnlineClusterer {
-        OnlineClusterer::with_params(self.t_assign, self.t_retire, self.alpha, self.min_pool)
+        OnlineClusterer::with_params(
+            self.t_assign,
+            self.t_retire,
+            self.alpha,
+            self.min_pool,
+            self.margin,
+        )
     }
 }
 
@@ -703,6 +714,11 @@ const MIN_POOL_FLAG: Flag = (
     true,
     "agreeing orphans before a new speaker is minted",
 );
+const MARGIN_FLAG: Flag = (
+    "--margin",
+    true,
+    "how far the best centroid must beat the second; 0 is the pre-2026-08-27 rule",
+);
 const WINDOW_FLAG: Flag = ("--window", true, "window length in seconds");
 const HOP_FLAG: Flag = ("--hop", true, "hop in seconds; 0 means half the window");
 const MODEL_FLAG: Flag = ("--model", true, "embedding model filename, or a path");
@@ -721,6 +737,7 @@ const RUN: Spec = Spec {
         T_RETIRE_FLAG,
         ALPHA_FLAG,
         MIN_POOL_FLAG,
+        MARGIN_FLAG,
         ("--quiet", false, "suppress the per-segment listing"),
     ],
 };
@@ -753,6 +770,7 @@ const SWEEP: Spec = Spec {
         ("--assigns", true, "comma-separated T_assign values"),
         ("--retires", true, "comma-separated T_retire values"),
         ("--alphas", true, "comma-separated EMA alphas"),
+        ("--margins", true, "comma-separated assignment margins"),
     ],
 };
 const BENCH: Spec = Spec {
@@ -876,6 +894,7 @@ impl Args {
             t_retire: self.num("--t-retire", shipped.t_retire)?,
             alpha: self.num("--alpha", shipped.alpha)?,
             min_pool: self.num("--min-pool", shipped.min_pool as f32)? as usize,
+            margin: self.num("--margin", shipped.margin)?,
         })
     }
     /// Window and hop in seconds; a hop of zero means half the window.
@@ -1220,9 +1239,12 @@ fn sweep(args: &Args) -> Result<()> {
     )?;
     let retires: Vec<f32> = args.nums("--retires", "0.60,0.70,0.80,0.85")?;
     let alphas: Vec<f32> = args.nums("--alphas", "0.05")?;
+    // 0 is the pre-2026-08-27 rule and the shipped value is 0.10, so the
+    // default grid answers "what did the margin change?" without a flag.
+    let margins: Vec<f32> = args.nums("--margins", "0.00,0.10")?;
 
     println!(
-        "model\tmeeting\twindow\tt_assign\tt_retire\tmin_pool\talpha\tref\thyp\tsplits\tmerges\tmiss%\tconf%\tminted\tactive\tcrowd"
+        "model\tmeeting\twindow\tt_assign\tt_retire\tmin_pool\talpha\tmargin\tref\thyp\tsplits\tmerges\tmiss%\tconf%\tminted\tactive\tcrowd"
     );
 
     for model in &models {
@@ -1241,33 +1263,36 @@ fn sweep(args: &Args) -> Result<()> {
                     for &t_assign in &assigns {
                         for &t_retire in &retires {
                             for &alpha in &alphas {
-                                let params = Params {
-                                    t_assign,
-                                    t_retire,
-                                    alpha,
-                                    min_pool,
-                                };
-                                let (hyp, clusterer) =
-                                    label_frames(&emb, params, reference.frames.len());
-                                let m = reference::score(&hyp, &reference);
-                                // The closest surviving pair: how much room a
-                                // meeting with more people would have had.
-                                let crowd = clusterer
-                                    .crowding()
-                                    .first()
-                                    .map_or(f32::NAN, |&(_, _, sim)| sim);
-                                println!(
-                                    "{}\t{meeting}\t{window_s}\t{t_assign}\t{t_retire}\t{min_pool}\t{alpha}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{crowd:.3}",
-                                    stem(&model),
-                                    m.ref_speakers,
-                                    m.hyp_speakers,
-                                    m.splits,
-                                    m.merges,
-                                    100.0 * m.miss,
-                                    100.0 * m.confusion,
-                                    clusterer.minted(),
-                                    clusterer.active(),
-                                );
+                                for &margin in &margins {
+                                    let params = Params {
+                                        t_assign,
+                                        t_retire,
+                                        alpha,
+                                        min_pool,
+                                        margin,
+                                    };
+                                    let (hyp, clusterer) =
+                                        label_frames(&emb, params, reference.frames.len());
+                                    let m = reference::score(&hyp, &reference);
+                                    // The closest surviving pair: how much room a
+                                    // meeting with more people would have had.
+                                    let crowd = clusterer
+                                        .crowding()
+                                        .first()
+                                        .map_or(f32::NAN, |&(_, _, sim)| sim);
+                                    println!(
+                                        "{}\t{meeting}\t{window_s}\t{t_assign}\t{t_retire}\t{min_pool}\t{alpha}\t{margin}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{crowd:.3}",
+                                        stem(&model),
+                                        m.ref_speakers,
+                                        m.hyp_speakers,
+                                        m.splits,
+                                        m.merges,
+                                        100.0 * m.miss,
+                                        100.0 * m.confusion,
+                                        clusterer.minted(),
+                                        clusterer.active(),
+                                    );
+                                }
                             }
                         }
                     }

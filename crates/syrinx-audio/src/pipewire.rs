@@ -180,7 +180,6 @@ pub fn list_all_sources() -> Result<Vec<Source>> {
     parse_sources(&String::from_utf8_lossy(&out.stdout))
 }
 
-
 // ---------------------------------------------------------------------------
 // Capture
 // ---------------------------------------------------------------------------
@@ -237,7 +236,10 @@ impl PwCapture {
         if link_from.is_some() {
             // pw-record publishes no process id, so give the node a name we can
             // find it by. Without this the link target cannot be identified.
-            cmd.env("PIPEWIRE_PROPS", format!("{{ node.name = {capture_name} }}"));
+            cmd.env(
+                "PIPEWIRE_PROPS",
+                format!("{{ node.name = {capture_name} }}"),
+            );
         }
         let mut child = cmd
             .args([
@@ -385,7 +387,10 @@ mod tests {
     fn non_node_objects_are_ignored() {
         // Ports are not nodes and cannot be capture targets.
         let s = parse_sources(SAMPLE).unwrap();
-        assert!(!s.iter().any(|x| x.target == SourceTarget::PipeWireNode(111)));
+        assert!(
+            !s.iter()
+                .any(|x| x.target == SourceTarget::PipeWireNode(111))
+        );
     }
 
     #[test]
@@ -458,4 +463,3 @@ mod tests {
         assert!(parse_sources(json).unwrap().is_empty());
     }
 }
-

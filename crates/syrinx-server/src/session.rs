@@ -26,6 +26,24 @@ pub const LAG_CHUNKS: usize = 2;
 /// session that must keep transcribing.
 const MAX_DIARIZER_STRIKES: u32 = 5;
 
+/// Seconds of already-emitted transcript that stay eligible for a speaker
+/// correction.
+///
+/// A voice needs four agreeing 1.5 s windows before it is minted, which is
+/// roughly 3.7 s of speech, and the text of those seconds has already been
+/// committed by then -- unlabelled, and until now unlabellable forever. The
+/// session keeps a ring of what it emitted over this many seconds so that
+/// `transcript.relabel` can fill those gaps when the name finally arrives.
+///
+/// 30 s covers the mint delay many times over, which is deliberate: the case
+/// it is really sized for is a quiet participant whose first few sentences are
+/// spread across half a minute before four windows of them agree.
+///
+/// `pub` because it is the default of the `diarize_relabel_window` config key,
+/// which reads it here rather than repeating the number next to a copy of this
+/// paragraph. **An engineering estimate, not a measurement.**
+pub const RELABEL_WINDOW: u64 = 30;
+
 /// Text waiting for its speaker label to settle.
 struct HeldCommit {
     text: String,

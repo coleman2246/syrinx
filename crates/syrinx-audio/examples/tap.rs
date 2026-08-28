@@ -10,7 +10,9 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("syrinx_audio=info").init();
+    tracing_subscriber::fmt()
+        .with_env_filter("syrinx_audio=info")
+        .init();
     let want = std::env::args().nth(1).unwrap_or_default().to_lowercase();
     let sources = syrinx_audio::list_sources()?;
     let src = sources
@@ -40,7 +42,11 @@ async fn main() -> Result<()> {
         "samples={} rms={:.4} -> {}",
         all.len(),
         rms,
-        if rms > 0.01 { "AUDIO CAPTURED" } else { "silent" }
+        if rms > 0.01 {
+            "AUDIO CAPTURED"
+        } else {
+            "silent"
+        }
     );
     Ok(())
 }

@@ -23,9 +23,9 @@ pub fn install_crypto_provider() {
 }
 pub mod config;
 pub mod daemon;
-pub mod ipc;
 pub mod hotkey;
 pub mod inject;
+pub mod ipc;
 pub mod mode;
 pub mod preview;
 pub mod save;
@@ -110,7 +110,11 @@ mod tests {
     #[test]
     fn a_denoised_microphone_is_preferred_over_the_raw_device() {
         let list = vec![
-            src("Blue Microphones", SourceKind::Microphone, "alsa_input.blue"),
+            src(
+                "Blue Microphones",
+                SourceKind::Microphone,
+                "alsa_input.blue",
+            ),
             src("Yeti (RNNoise)", SourceKind::Microphone, "rnnoise_source"),
         ];
         assert_eq!(
@@ -127,7 +131,10 @@ mod tests {
             src("Monitor of Speakers", SourceKind::Monitor, "mon"),
             src("Webcam", SourceKind::Microphone, "cam"),
         ];
-        assert_eq!(choose_source(&list, None).unwrap().kind, SourceKind::Microphone);
+        assert_eq!(
+            choose_source(&list, None).unwrap().kind,
+            SourceKind::Microphone
+        );
     }
 
     #[test]
@@ -135,7 +142,10 @@ mod tests {
         // A machine with no microphone should still be able to transcribe
         // system audio rather than refusing outright.
         let list = vec![src("Monitor of Speakers", SourceKind::Monitor, "mon")];
-        assert_eq!(choose_source(&list, None).unwrap().kind, SourceKind::Monitor);
+        assert_eq!(
+            choose_source(&list, None).unwrap().kind,
+            SourceKind::Monitor
+        );
     }
 
     #[test]

@@ -22,8 +22,9 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use syrinx_client::{
-    Config, OutputMode, Source, SourceKind, ipc, mode::SourceMode,
+    Config, OutputMode, Source, SourceKind, ipc,
     ipc::{DaemonState, Request, Response},
+    mode::SourceMode,
     save,
     session::Status,
 };
@@ -167,7 +168,9 @@ fn no_window_here() -> Option<String> {
     let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
     no_window_advice(
         set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET") || set("DISPLAY"),
-        ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"].iter().any(|k| set(k)),
+        ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+            .iter()
+            .any(|k| set(k)),
     )
 }
 
@@ -376,10 +379,7 @@ mod ensure_daemon_tests {
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "syrinx-gui-test-{}-{tag}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("syrinx-gui-test-{}-{tag}", std::process::id()))
     }
 
     #[test]
@@ -421,7 +421,11 @@ mod ensure_daemon_tests {
         // and send every launch to PATH instead.
         let dir = scratch("beside");
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(daemon_beside(&dir), None, "an empty directory has no daemon");
+        assert_eq!(
+            daemon_beside(&dir),
+            None,
+            "an empty directory has no daemon"
+        );
 
         let exe = dir.join(format!("syrinx{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&exe, b"").unwrap();
@@ -656,8 +660,7 @@ impl App {
                     .desired_width(280.0)
                     .hint_text("ws://192.168.1.10:8770/v1/stream"),
             );
-            let submitted =
-                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let submitted = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             // Changing servers mid-session would leave the daemon connected to
             // the old one, so it waits for idle.
             let apply = ui
@@ -769,7 +772,11 @@ impl App {
                         // An application exists in the graph only while it is
                         // playing, so an empty section means "nothing is
                         // playing", not "unsupported".
-                        if !self.sources.iter().any(|s| s.kind == SourceKind::Application) {
+                        if !self
+                            .sources
+                            .iter()
+                            .any(|s| s.kind == SourceKind::Application)
+                        {
                             ui.separator();
                             ui.weak(SourceKind::Application.label());
                             ui.weak("  nothing is playing audio right now");
@@ -778,7 +785,11 @@ impl App {
                 // Latin text, not a glyph: the geometric and icon ranges are
                 // not reliably covered by the bundled fonts on Windows, where
                 // they render as missing-glyph boxes.
-                if ui.button("Rescan").on_hover_text("Rescan sources").clicked() {
+                if ui
+                    .button("Rescan")
+                    .on_hover_text("Rescan sources")
+                    .clicked()
+                {
                     self.refresh_sources();
                 }
             });
@@ -870,10 +881,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Level:");
 
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(220.0, 26.0),
-                egui::Sense::hover(),
-            );
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(220.0, 26.0), egui::Sense::hover());
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
 
@@ -939,11 +947,8 @@ impl App {
                         ui.weak("Typing at the cursor; no transcript is kept in this mode.");
                         if !self.state.last_fragment.is_empty() {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "last: {}",
-                                    self.state.last_fragment
-                                ))
-                                .italics(),
+                                egui::RichText::new(format!("last: {}", self.state.last_fragment))
+                                    .italics(),
                             );
                         }
                     } else {
@@ -1141,8 +1146,8 @@ impl App {
             // Separate mode writes one file per source beside the chosen
             // path, so a tooltip naming only that path would name a file
             // nothing is being written to.
-            let split = self.state.source_mode == SourceMode::Separate
-                && self.state.source_keys.len() > 1;
+            let split =
+                self.state.source_mode == SourceMode::Separate && self.state.source_keys.len() > 1;
             let hover = match &self.state.stream_to {
                 Some(p) if split => {
                     format!("Appending to one file per source beside {p}\nClick to stop")
@@ -1206,7 +1211,10 @@ impl App {
                 .on_hover_text("Transcribe an audio file: wav, mp3, m4a, opus, flac")
                 .clicked()
                 && let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Audio", &["wav", "mp3", "m4a", "opus", "flac", "ogg", "aac"])
+                    .add_filter(
+                        "Audio",
+                        &["wav", "mp3", "m4a", "opus", "flac", "ogg", "aac"],
+                    )
                     .pick_file()
             {
                 action = Some(Request::TranscribeFile {
@@ -1314,7 +1322,14 @@ mod tests {
     fn an_incomplete_address_is_refused() {
         // These used to be repaired into a URL. Refusing is the point: a
         // guess that lands somewhere unintended is worse than a complaint.
-        for bad in ["", "   ", "10.0.0.5", "dictate.example.com", "ws://", "ws:///v1/stream"] {
+        for bad in [
+            "",
+            "   ",
+            "10.0.0.5",
+            "dictate.example.com",
+            "ws://",
+            "ws:///v1/stream",
+        ] {
             assert!(normalise_server(bad).is_err(), "{bad:?} should be refused");
         }
     }
@@ -1346,5 +1361,4 @@ mod tests {
         assert_eq!((icon.width, icon.height), (256, 256));
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
     }
-
 }

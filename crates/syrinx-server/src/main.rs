@@ -1,6 +1,8 @@
 #[cfg(not(feature = "cuda"))]
 use anyhow::bail;
 use anyhow::{Context, Result};
+use std::sync::Arc;
+use std::time::Duration;
 use syrinx_server::app::build_router;
 use syrinx_server::asr::AsrBackend;
 use syrinx_server::asr::lifecycle::{ModelHandle, NvidiaSmiProbe, VramGuard, VramProbe};
@@ -9,16 +11,12 @@ use syrinx_server::config::{Config, Provider};
 use syrinx_server::diarize::DiarizerFactory;
 #[cfg(feature = "diarize")]
 use syrinx_server::diarize::real::RealDiarizerFactory;
-use std::sync::Arc;
-use std::time::Duration;
 use tracing::info;
 
 /// How often the reaper checks whether the model has gone idle.
 const REAPER_TICK: Duration = Duration::from_secs(30);
 
-fn build_loader(
-    config: &Config,
-) -> Arc<dyn Fn() -> Result<Arc<dyn AsrBackend>> + Send + Sync> {
+fn build_loader(config: &Config) -> Arc<dyn Fn() -> Result<Arc<dyn AsrBackend>> + Send + Sync> {
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let dir = config.model_dir.clone();
     let provider = config.provider;
@@ -30,7 +28,9 @@ fn build_loader(
             #[cfg(feature = "cuda")]
             Provider::Cpu => {
                 use syrinx_server::asr::parakeet::ParakeetBackend;
-                Ok(Arc::new(ParakeetBackend::load_cpu(std::path::Path::new(&dir))?))
+                Ok(Arc::new(ParakeetBackend::load_cpu(std::path::Path::new(
+                    &dir,
+                ))?))
             }
 
             #[cfg(feature = "cuda")]

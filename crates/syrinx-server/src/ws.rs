@@ -17,13 +17,13 @@ use crate::asr::lifecycle::ModelHandle;
 use crate::auth::check_bearer;
 use crate::config::Config;
 use crate::session::Session;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
-use syrinx_proto::{ClientMessage, ErrorCode, Mode, ServerMessage};
 use std::sync::Arc;
+use syrinx_proto::{ClientMessage, ErrorCode, Mode, ServerMessage};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
@@ -82,12 +82,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Admission control before any work is done.
     let Ok(_slot) = state.slots.clone().try_acquire_owned() else {
-        let _ = tx.send(json_msg(&ServerMessage::Error {
-            code: ErrorCode::Capacity,
-            message: "server at session capacity".into(),
-            retryable: true,
-        }))
-        .await;
+        let _ = tx
+            .send(json_msg(&ServerMessage::Error {
+                code: ErrorCode::Capacity,
+                message: "server at session capacity".into(),
+                retryable: true,
+            }))
+            .await;
         return;
     };
 
