@@ -162,6 +162,7 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         overlay: None,
         file_job: None,
         previews: Vec::new(),
+        preview_keys: Vec::new(),
         last_viewer: None,
         last: Default::default(),
         // One rather than zero, so the first tick's token cannot match the
@@ -466,6 +467,9 @@ struct DaemonRuntime {
     /// anywhere at any time, idle or running, which is precisely the question
     /// somebody with two sources selected is asking.
     previews: Vec<crate::preview::Preview>,
+    /// The selection `previews` was built for, so re-pointing can compare
+    /// against what was asked for rather than what it resolved to.
+    preview_keys: Vec<String>,
     /// When a viewer last asked for state. Metering stops shortly after the
     /// last one closes.
     last_viewer: Option<std::time::Instant>,
@@ -554,31 +558,31 @@ impl DaemonRuntime {
 
         if !want {
             self.previews.clear();
+            self.preview_keys.clear();
             return;
         }
 
-        let keys = self.opts.source_keys.clone();
-        let current: Vec<String> = self.previews.iter().map(|p| p.source_key.clone()).collect();
         // Re-point when the selection changes, so the meters always show what
-        // pressing Start would actually record. With nothing selected the
-        // meter falls back to whatever `choose_source` would pick, and the
-        // comparison cannot be made against an empty list -- doing so tore the
-        // preview down and rebuilt it on every tick.
-        let stale = if keys.is_empty() {
-            self.previews.is_empty()
-        } else {
-            current != keys
-        };
-        if !stale {
+        // pressing Start would actually record.
+        //
+        // Compared against what was *asked for*, not against what the previews
+        // resolved to. A key that no longer names a device falls back to
+        // `choose_source`, whose answer has a different key -- so comparing
+        // resolved keys would find them stale for ever and tear down and
+        // reopen every capture on every tick, forty times a second.
+        if self.preview_keys == self.opts.source_keys && !self.previews.is_empty() {
             return;
         }
 
         self.previews.clear();
+        self.preview_keys = self.opts.source_keys.clone();
         let Ok(sources) = list_sources() else { return };
-        let wanted: Vec<Option<&str>> = if keys.is_empty() {
+        // Nothing selected means "whatever Start would choose", which is one
+        // source, not none.
+        let wanted: Vec<Option<&str>> = if self.preview_keys.is_empty() {
             vec![None]
         } else {
-            keys.iter().map(|k| Some(k.as_str())).collect()
+            self.preview_keys.iter().map(|k| Some(k.as_str())).collect()
         };
         for key in wanted {
             let Ok(source) = choose_source(&sources, key) else {
@@ -1096,6 +1100,7 @@ mod tests {
             sessions: Vec::new(),
             overlay: None,
             previews: Vec::new(),
+            preview_keys: Vec::new(),
             last_viewer: None,
             file_job: None,
             last,
