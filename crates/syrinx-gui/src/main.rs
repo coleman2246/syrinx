@@ -1194,14 +1194,14 @@ impl App {
                     .set_file_name(name)
                     .set_directory(dir)
                     .save_file();
-                if let Some(p) = &chosen {
-                    self.status_line = Some((
-                        Severity::Ok,
-                        format!("The next session appends to {}", p.display()),
-                    ));
-                }
                 // Cancelling leaves the setting alone: closing a dialog is not
                 // a way of asking for anything.
+                //
+                // Nothing is put on the status line here. The daemon answers
+                // with a bare acknowledgement and `send` clears the line on
+                // one, so a message written now would be gone before the frame
+                // ended; the label under this row is what reports the target,
+                // and it stays.
                 if let Some(req) = stream_choice(chosen) {
                     action = Some(req);
                 }
@@ -1218,8 +1218,6 @@ impl App {
                     .clicked()
             {
                 action = Some(Request::SetStreamFile { path: None });
-                self.status_line =
-                    Some((Severity::Ok, "Stopped streaming to file".into()));
             }
 
             if ui
