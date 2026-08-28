@@ -74,13 +74,14 @@ const REFRACTORY_SAMPLES: usize = REFRACTORY_FRAMES * FRAME;
 /// its label across a break rather than blanking it: blanking doubled the
 /// unlabelled share of voiced chunks (30% to 59%) to catch three changes.
 ///
-/// There is now a real turn-change detector, and it is somewhere else: the
+/// There is a real turn-change detector, and it is somewhere else: the
 /// diarizer compares the voice in one [`Cut::Hop`] against the voice in the
 /// one before it against `cluster::T_CHANGE`, and calls
-/// [`WindowAssembler::cut_at_boundary`] when they differ. Two rules that look
-/// alike and are not -- this one asks how long the silence was, that one asks
-/// who is talking -- so the measurement above still stands and this constant
-/// is unchanged.
+/// [`WindowAssembler::cut_at_boundary`] when they differ -- which may refuse,
+/// since boundaries have a refractory floor and this rule does not. Two rules
+/// that look alike and are not: this one asks how long the silence was, that
+/// one asks who is talking. So the measurement above still stands and this
+/// constant is unchanged.
 const MAX_GAP_FRAMES: usize = 15;
 
 /// A piece of voiced audio the assembler has finished with.

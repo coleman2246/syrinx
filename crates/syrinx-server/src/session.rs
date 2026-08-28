@@ -90,9 +90,10 @@ struct HeldCommit {
 struct ChunkLabel {
     chunk: u64,
     speaker: Option<u32>,
-    /// Whether `speaker` came from a 0.75 s hop's guess rather than a full
-    /// window. A commit voted entirely out of guesses is one a later window
-    /// may correct; one a window settled is not.
+    /// Whether `speaker` is a guess rather than an answer the diarizer will
+    /// stand behind -- a hop naming a turn early, or a window no centroid stood
+    /// out clearly enough for. A commit voted entirely out of guesses is one a
+    /// later window may correct; one a window settled is not.
     provisional: bool,
     /// Whether the voice changed at this chunk. The vote stops here.
     boundary: bool,
@@ -332,10 +333,14 @@ impl Session {
     ///
     /// - only commits still inside the relabel window are eligible, so text
     ///   the reader has scrolled past does not move under them;
-    /// - only a commit with no speaker, or one carrying a provisional guess
-    ///   this contradicts, is touched. A label a full window settled stands,
-    ///   which is what stops a correction reaching out of its own turn and
-    ///   putting one person's name on another's sentence;
+    /// - only a commit with no speaker, or one carrying a guess this
+    ///   contradicts, is touched. A label a full window settled stands. That
+    ///   is a real guard but not a sufficient one, and it is worth being
+    ///   precise about which half of the job it does: it stops a correction
+    ///   overwriting somebody else's *settled* sentence, and it says nothing
+    ///   about an unattributed one. What keeps a correction off text that was
+    ///   never labelled at all is the diarizer bounding the range it asks
+    ///   for -- see `real::RealDiarizer`'s notes on provenance;
     /// - a speaker is never renumbered. This names an existing speaker for
     ///   text that had none, and nothing else.
     ///

@@ -577,9 +577,12 @@ impl OnlineClusterer {
     /// folds the duplicate back -- leaves a transcript naming somebody the
     /// session no longer has.
     ///
-    /// `T_RETIRE` has no say here: a mean within 0.80 of a live centroid is
-    /// far past `T_ASSIGN + margin` and refused by the ceiling long before a
-    /// duplicate could be minted for retirement to fold back.
+    /// `T_RETIRE` caps the ceiling: a mean that close to a live centroid mints
+    /// a duplicate the next assignment folds straight back, so there was never
+    /// a speaker there to find. At the shipped constants the cap is redundant,
+    /// because a cosine cannot exceed 1 and `T_MINT_MARGIN >= 1 - T_RETIRE`
+    /// already makes such a pool unmintable -- it matters for the sweep, which
+    /// varies `t_retire` across a range where that relation does not hold.
     fn mint(&mut self, members: &[Vec<f32>]) -> Option<u32> {
         let mean = mean_of(members);
         let rival = self.nearest(&mean).map(|(_, similarity)| similarity);
@@ -608,7 +611,8 @@ impl OnlineClusterer {
             // it needs `rival < t_assign + 0` against a `rival >= t_assign`.
             Some(rival) if rival < self.t_assign => true,
             Some(rival) => {
-                rival < self.t_assign + self.margin && coherence - rival >= T_MINT_MARGIN
+                rival < (self.t_assign + self.margin).min(self.t_retire)
+                    && coherence - rival >= T_MINT_MARGIN
             }
         }
     }
@@ -2228,6 +2232,38 @@ mod tests {
                 Heard::Settled(3)
             ]
         );
+    }
+
+    #[test]
+    fn the_mint_ceiling_never_reaches_past_the_retire_threshold() {
+        // A pool whose mean is within `t_retire` of a live centroid mints a
+        // duplicate the next assignment folds straight back -- the same wrong
+        // speaker, minted and retired, with commits carrying its number left
+        // behind. At the shipped constants that is unreachable, since a cosine
+        // cannot exceed 1 and `T_MINT_MARGIN >= 1 - T_RETIRE`; the sweep is
+        // where it becomes reachable, and where the cap has to hold.
+        const { assert!(T_MINT_MARGIN >= 1.0 - T_RETIRE, "redundant as shipped") };
+
+        // Two speakers far enough apart not to retire at 0.35, and a voice
+        // exactly between them -- ambiguous, so it reaches the gate at all.
+        let (first, second, between) = (at(0.0), at(80.0), at(40.0));
+        let apart = similarity(&first, &second);
+        assert!(apart < 0.35, "the two speakers sit at {apart}");
+        let rival = similarity(&between, &first);
+        assert!((0.35..T_ASSIGN + 0.5).contains(&rival), "{rival}");
+
+        let mut c = OnlineClusterer::with_params(T_ASSIGN, 0.35, EMA_ALPHA, MIN_POOL, 0.5);
+        for _ in 0..MIN_POOL {
+            c.observe(&first);
+        }
+        for _ in 0..MIN_POOL {
+            c.observe(&second);
+        }
+        assert_eq!(c.live_labels(), vec![1, 2]);
+        for _ in 0..MIN_POOL * 2 {
+            c.observe(&between);
+        }
+        assert_eq!(c.minted(), 2, "a duplicate was minted for retiring");
     }
 
     #[test]

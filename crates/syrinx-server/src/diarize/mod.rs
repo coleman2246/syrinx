@@ -57,7 +57,14 @@ impl Default for DiarizeTuning {
 /// count `Session` keeps, because the session pushes exactly one chunk per
 /// chunk and in order. Two things produce one: a speaker being minted, whose
 /// first few seconds were committed before they had a number, and a full
-/// window contradicting the provisional label a hop had been offering.
+/// window contradicting a guess that was being offered.
+///
+/// How far back the range may reach is the diarizer's to bound, and it bounds
+/// it by what it can vouch for rather than by what it happened to detect --
+/// `real::RealDiarizer` records exactly what that means and what it does not
+/// cover. The session's own rule, that a settled label is never overwritten,
+/// is the second guard and not the first: it says nothing about text nobody
+/// was named for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Relabel {
     /// First chunk covered, inclusive.
@@ -79,12 +86,17 @@ pub struct Relabel {
 pub struct Attribution {
     /// Who is speaking in this chunk.
     pub speaker: Option<u32>,
-    /// Whether `speaker` is a 0.75 s hop's guess rather than a full window's
-    /// answer.
+    /// Whether `speaker` is a guess rather than an answer the diarizer will
+    /// stand behind.
     ///
-    /// The session keeps this per chunk so that a later correction knows what
-    /// it may overwrite: a gap and a provisional guess are both correctable, a
-    /// label a full window settled is not.
+    /// Two things produce one, and they are the same promise: a 0.75 s hop
+    /// naming a turn before any window has confirmed it, and a full window
+    /// that no centroid stood out clearly enough for. Either may be
+    /// contradicted by a later window.
+    ///
+    /// The session keeps it per chunk so that a later correction knows what it
+    /// may overwrite: a gap and a guess are both correctable, a label a full
+    /// window settled is not.
     pub provisional: bool,
     /// Whether the voice changed inside this chunk.
     ///
