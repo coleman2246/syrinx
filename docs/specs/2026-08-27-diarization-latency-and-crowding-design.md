@@ -322,6 +322,10 @@ prediction in a document rather than a red test.
 - **An ambiguous pool mints nobody.** Four mutually agreeing windows sitting
   equidistant from two incumbents are not a third speaker, at 0.60, 0.65, 0.705
   or 0.79 — while the same four just inside the ceiling still are.
+- **A pool resembles its own mean far more than its members resemble each
+  other**, with the arithmetic stated: it is what decides whether the mint
+  gate's second clause can bind at all, and a form that cannot bind is
+  indistinguishable from no clause under every other test in the file.
 - **A non-finite embedding is refused**, never assigned, and moves no centroid:
   one such assignment is an absorbing state, since the EMA makes that centroid
   non-finite and `total_cmp` then ranks it above every real one.
@@ -417,10 +421,29 @@ so the transcript is left permanently naming a speaker the session no longer
 has. The flaw is conceptual: **ambiguity between two incumbents is evidence of
 a bad or mixed embedding, not evidence of a new person**, and the rule treats
 it as novelty. The gate now asks whether the pooled group is more like itself
-than like anybody known — minimum pairwise agreement against the cosine to the
-nearest live centroid, by `T_MINT_MARGIN` — inside a ceiling of
-`T_ASSIGN + margin`, which at margin 0 collapses onto the pre-2026-08-27 rule
-exactly.
+than like anybody known, inside a ceiling of `T_ASSIGN + margin` which at
+margin 0 collapses onto the pre-2026-08-27 rule exactly. The mintable band
+narrows from `[0.45, 0.80)` to `[0.45, 0.55)`.
+
+**"More like itself" has to be measured against the pool's own mean, on both
+sides.** The obvious reading — worst *pairwise* agreement among the members,
+against the mean's cosine to the nearest centroid — compares two different
+scales. A pool is mutually agreeing at `T_ASSIGN` by construction, so its worst
+pairwise figure is floored at exactly 0.45 and can be nothing else, while
+averaging four windows removes most of their noise, so the same pool's mean
+sits at 0.766 or better from its own members and correspondingly closer to any
+centroid. Written that way the clause admits only
+`rival <= T_ASSIGN - T_MINT_MARGIN` = 0.25, which is stricter than the rule it
+is layered on: it reads as a gate and acts as a veto, leaving the ceiling
+unreachable and the whole mint path exactly what it was before. Measured over
+synthetic rooms with the spike's same-speaker statistic, the shipped
+configuration and `diarize_margin = 0` then mint the *same* speakers at every
+crowding level — the crowding fix does nothing at all. Comparing
+`min cos(mean, member)` against `cos(mean, nearest centroid)` instead puts both
+sides on the mean's scale; over the same rooms it lifts eight-speaker mint
+counts from 6–7 to 7–8 and *lowers* the unlabelled share (16% to 9%), because
+a newcomer with their own centroid is unambiguous where a newcomer merged into
+an incumbent is not.
 
 **2. `POOL_RING = 8` tolerates one interrupting speaker.** Holding `MIN_POOL`
 newcomer windows with `k` foreign orphans between each needs `4 + 3k <= 8`, so

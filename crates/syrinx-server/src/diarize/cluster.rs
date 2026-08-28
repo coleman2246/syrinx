@@ -187,25 +187,37 @@ pub const T_ZNORM: f32 = 2.0;
 #[doc(hidden)]
 pub const T_CHANGE: f32 = 0.30;
 
-/// How much more like each other than like any incumbent a pool of orphans
-/// must be before it becomes a speaker of its own.
+/// How much more like itself than like any incumbent a pool of orphans must be
+/// before it becomes a speaker of its own.
 ///
 /// The mint gate asks the question the room is actually posing. Ambiguity
 /// between two incumbents is evidence of a bad or mixed embedding, not
 /// evidence of a new person, so "the mean was not assignable" is no reason to
 /// mint from it. What is a reason is the group being tighter with itself than
-/// any of it is with somebody already known: `min pairwise agreement - cosine
-/// to the nearest live centroid >= T_MINT_MARGIN`.
+/// it is with somebody already known: `min cos(mean, member) - cos(mean,
+/// nearest live centroid) >= T_MINT_MARGIN`.
 ///
-/// **Unmeasured.** 0.20 is sized against the spike's separability figures and
-/// against what it must refuse: four windows that each sit just under
-/// `T_ASSIGN` of an incumbent, whose private noise cancels in the mean, agree
-/// with each other by about 0.18 more than their mean resembles that
-/// incumbent -- and they are that incumbent, not a new person. It is
-/// deliberately above that. On real audio, where a same-speaker window pair
-/// sits at a median cosine of 0.517 and the agreeing-pool rule already floors
-/// the group at `T_ASSIGN`, this gate rarely decides anything on its own; the
-/// ceiling below is what usually binds. Both are guesses.
+/// **Both sides are measured against the pool's mean, and that is the whole
+/// of why the rule works at all.** The obvious form -- worst *pairwise*
+/// agreement against the mean's nearest centroid -- compares a noisy vector
+/// against a noisy vector on one side and a smoothed one against a smoothed
+/// one on the other, and the two live on different scales: averaging four
+/// windows removes most of their noise, so a pool's mean resembles a centroid
+/// far more closely than any of its windows resemble each other. Worse, the
+/// pairwise figure is floored at exactly `T_ASSIGN` by the way a pool is
+/// built, so that form admits only `rival <= T_ASSIGN - T_MINT_MARGIN` and is
+/// unconditionally stricter than the first clause of the gate -- it looks like
+/// a rule and is a veto.
+///
+/// **Unmeasured.** 0.20 is sized against what the gate must refuse: a pool
+/// that is really an incumbent, whose mean lands at 0.705 from that
+/// incumbent's centroid, agrees with itself by about 0.19 more than that --
+/// and it is that person, not a new one. Where the clause binds depends on the
+/// configured pool: the same construction floors `min cos(mean, member)` at
+/// `sqrt((1 + (min_pool - 1) * T_ASSIGN) / min_pool)`, which is 0.766 at the
+/// shipped pool of four, so up to a rival of 0.566 the ceiling below is what
+/// decides and this is a backstop. At a configured pool of eight or more the
+/// floor drops far enough that this becomes the binding rule.
 #[doc(hidden)]
 pub const T_MINT_MARGIN: f32 = 0.20;
 
@@ -570,6 +582,13 @@ impl OnlineClusterer {
     /// is more like itself than it is like that incumbent, by
     /// [`T_MINT_MARGIN`].
     ///
+    /// Narrowing the band rather than opening it is the point. A rule that
+    /// mints wherever the mean is *unassignable* opens everything from
+    /// `T_ASSIGN` to `T_RETIRE`, and at 0.705 against a same-speaker median of
+    /// 0.517 that is a person who already has a number -- minted, carried text
+    /// away under, and retired back tens of windows later, leaving the
+    /// transcript naming somebody the session no longer has.
+    ///
     /// What it deliberately does not do is treat ambiguity as novelty. A mean
     /// the assignment rule merely declined to place is evidence of a bad or
     /// mixed embedding; minting from it manufactures a speaker who does not
@@ -586,7 +605,7 @@ impl OnlineClusterer {
     fn mint(&mut self, members: &[Vec<f32>]) -> Option<u32> {
         let mean = mean_of(members);
         let rival = self.nearest(&mean).map(|(_, similarity)| similarity);
-        if !self.may_mint(coherence(members), rival) {
+        if !self.may_mint(cohesion(&mean, members), rival) {
             return None;
         }
         let label = self.next_label;
@@ -873,13 +892,11 @@ fn mean_of(members: &[Vec<f32>]) -> Vec<f32> {
     l2_normalize(&mean)
 }
 
-/// The worst agreement between any two members: how much the set is like
-/// itself. `INFINITY` for a set with no pair in it, which no caller has.
-fn coherence(members: &[Vec<f32>]) -> f32 {
+/// How well a set's own mean represents its worst member.
+fn cohesion(mean: &[f32], members: &[Vec<f32>]) -> f32 {
     members
         .iter()
-        .enumerate()
-        .flat_map(|(i, a)| members[i + 1..].iter().map(move |b| cosine(a, b)))
+        .map(|m| cosine(mean, m))
         .fold(f32::INFINITY, f32::min)
 }
 
@@ -2157,6 +2174,44 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_resembles_its_mean_far_more_than_its_members_resemble_each_other() {
+        // The asymmetry the mint gate has to be written around, and the reason
+        // both of its sides are measured against the pool's mean.
+        //
+        // A pool is mutually agreeing at `T_ASSIGN` by construction, so its
+        // worst *pairwise* figure is floored at exactly that and can be
+        // nothing else -- while averaging removes most of the noise, so the
+        // same pool's mean sits far closer both to its own members and to any
+        // centroid. Comparing the pairwise floor against a mean-to-centroid
+        // cosine measures two different scales against each other: it admits
+        // only `rival <= T_ASSIGN - T_MINT_MARGIN`, which is stricter than the
+        // rule it is layered on, so it reads like a gate and acts as a veto
+        // that leaves the ceiling unreachable.
+        let k = MIN_POOL;
+        let pool: Vec<Vec<f32>> = (0..k)
+            .map(|i| embedding(&[(0, T_ASSIGN.sqrt()), (1 + i, (1.0 - T_ASSIGN).sqrt())]))
+            .collect();
+        let mean = mean_of(&pool);
+        let pairwise = cosine(&pool[0], &pool[1]);
+        assert!((pairwise - T_ASSIGN).abs() < 1e-5, "{pairwise}");
+
+        let floor = ((1.0 + (k as f32 - 1.0) * T_ASSIGN) / k as f32).sqrt();
+        let to_mean = cohesion(&mean, &pool);
+        assert!((to_mean - floor).abs() < 1e-5, "{to_mean} against {floor}");
+
+        assert!(
+            to_mean - T_MINT_MARGIN > T_ASSIGN + T_MARGIN,
+            "at the shipped pool the ceiling is what decides a mint, and this \
+             is the arithmetic that leaves it room to"
+        );
+        assert!(
+            pairwise - T_MINT_MARGIN < T_ASSIGN,
+            "while the pairwise figure would refuse everything the first \
+             clause already refuses, and nothing else"
+        );
+    }
+
+    #[test]
     fn a_pool_that_stands_out_from_a_crowd_still_mints() {
         // The other side of the gate, and the reason it is a ceiling rather
         // than a return to "any incumbent over T_ASSIGN blocks a mint": in a
@@ -2175,16 +2230,18 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_whose_mean_is_a_known_speaker_mints_nothing() {
+    fn a_pool_whose_mean_lands_on_a_known_speaker_mints_nothing() {
         // Four windows that agree with each other, each individually just
         // under `T_ASSIGN` of speaker 1 -- a shared pull off-axis plus private
         // noise on an axis of its own. Averaging cancels the private part, so
-        // their mean lands back inside speaker 1's territory, and the pool
-        // agrees with itself by less than `T_MINT_MARGIN` more than that.
+        // their mean lands well inside speaker 1's territory, past the ceiling
+        // the mint gate allows. Splitting a speaker who already has a label is
+        // the one failure this design exists to avoid.
         //
-        // Two live centroids, not one: with a single centroid the gate's
-        // first clause is trivially satisfied and the case that is the whole
-        // content of the rule never runs.
+        // Two live centroids, not one: with a single centroid a mint gate that
+        // asked whether the mean was *assignable* would be trivially
+        // satisfied, and the case that is the whole content of the rule would
+        // never run.
         let mut c = OnlineClusterer::new();
         for _ in 0..MIN_POOL {
             c.observe(&voice(0));
@@ -2194,8 +2251,9 @@ mod tests {
         }
         assert_eq!(c.live_labels(), vec![1, 2]);
 
+        // Shared energy 0.46 on axes 0 and 1, the rest on a private axis each.
         let pooled: Vec<Vec<f32>> = (0..MIN_POOL)
-            .map(|i| embedding(&[(0, 0.42), (1, 0.35_f32.sqrt()), (2 + i, 0.4736_f32.sqrt())]))
+            .map(|i| embedding(&[(0, 0.44), (1, 0.2664_f32.sqrt()), (2 + i, 0.54_f32.sqrt())]))
             .collect();
         let mean = mean_of(&pooled.iter().map(|v| l2_normalize(v)).collect::<Vec<_>>());
         for v in &pooled {
@@ -2204,17 +2262,12 @@ mod tests {
             assert!(similarity(v, &pooled[0]) >= T_ASSIGN, "but agreeing");
         }
         let rival = cosine(&mean, &voice(0));
-        assert!((T_ASSIGN..T_ASSIGN + T_MARGIN).contains(&rival), "{rival}");
-        let coherence = similarity(&pooled[0], &pooled[1]);
         assert!(
-            coherence - rival < T_MINT_MARGIN,
-            "the pool agrees with itself by {} more than its mean resembles \
-             speaker 1, which has to be under the gate for this to bite",
-            coherence - rival
+            rival >= T_ASSIGN + T_MARGIN,
+            "the mean sits at {rival} from speaker 1, which has to be past the \
+             mint gate's ceiling for the ceiling to be what refuses this"
         );
 
-        // So none of them mints: splitting a speaker who already has a label
-        // is the one failure this design exists to avoid.
         for v in &pooled {
             assert_eq!(c.observe(v), Heard::Unknown);
         }
