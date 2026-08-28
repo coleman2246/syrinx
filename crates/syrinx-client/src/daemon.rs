@@ -192,6 +192,12 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     {
         state.opts.source_keys = vec![s.stable_key()];
     }
+
+    // And again here, not only at the session that uses it, so a window
+    // opened the morning after names the file that would really be written
+    // rather than yesterday's. Costs a config write once a day at most: a
+    // name already carrying today's date is left alone.
+    state.refresh_stream_name(&crate::Config::default_path());
     let mut quit = false;
 
     while !quit {
@@ -702,6 +708,12 @@ impl DaemonRuntime {
 
         let (url, token) = (self.opts.config.url.clone(), self.opts.config.token.clone());
         let inject = self.opts.config.inject;
+        // Every way of starting comes through here -- the tray, the global
+        // hotkey, Ctrl+D, `syrinx toggle` -- and only one of them has ever
+        // seen a file dialog. Re-seeding the dialog's default name therefore
+        // fixes almost none of them, so the generated name is refreshed at
+        // the session that uses it.
+        self.refresh_stream_name(&crate::Config::default_path());
         let stream = self
             .opts
             .config
@@ -957,8 +969,35 @@ impl DaemonRuntime {
     /// edit the settings of whoever ran it.
     fn set_stream_file(&mut self, path: Option<String>, config: &std::path::Path) {
         self.opts.config.stream_to = path;
-        if let Err(e) = self.opts.config.save(&config.to_path_buf()) {
+        if let Err(e) = self.opts.config.save(config) {
             warn!("saving the config: {e:#}");
+        }
+    }
+
+    /// Give a generated stream name today's date, before a session opens it.
+    ///
+    /// `stream_to` is persisted, so the name accepted from the Save dialog on
+    /// the 20th is still the name on the 27th, and every session in between
+    /// appended to `2026-08-20_09-14-03.txt`. Only a name of that shape is
+    /// touched: `notes.txt` was chosen deliberately, and continuing it is the
+    /// whole reason the setting is remembered.
+    ///
+    /// Written back rather than only used, so that two sessions on one day
+    /// still meet in one file -- a fresh stamp per session would give each
+    /// its own -- and so that every viewer's label names the file that is
+    /// really being written.
+    ///
+    /// Restamping the string as it was written keeps a `~` a `~`; expanding
+    /// it here would quietly rewrite the config to an absolute path.
+    fn refresh_stream_name(&mut self, config: &std::path::Path) {
+        let Some(current) = self.opts.config.stream_to.clone() else {
+            return;
+        };
+        let current = std::path::PathBuf::from(current);
+        let fresh = save::restamped(&current, &save::timestamp());
+        if fresh != current {
+            info!("streaming to {} for today", fresh.display());
+            self.set_stream_file(Some(fresh.display().to_string()), config);
         }
     }
 
@@ -1407,6 +1446,69 @@ mod tests {
         assert!(!written.contains("/tmp/notes.txt"), "still there:\n{written}");
 
         let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn a_generated_stream_name_from_another_day_is_refreshed_before_a_session() {
+        // The complaint. Only the GUI's Stream button ever opens a file
+        // dialog, so re-seeding the dialog left the tray, the global hotkey,
+        // Ctrl+D and `syrinx start` still appending today's meeting to a file
+        // named for a fortnight ago. This runs at every session, whichever
+        // asked for it.
+        let config_path = scratch("streamrestamp").with_extension("toml");
+        let _ = std::fs::remove_file(&config_path);
+        let mut d = daemon_holding(SessionState::default());
+        d.opts.config.stream_to = Some("/tmp/2026-08-20_09-14-03.txt".into());
+
+        d.refresh_stream_name(&config_path);
+
+        let now = d.opts.config.stream_to.clone().expect("still streaming");
+        assert!(now.starts_with("/tmp/"), "the folder was chosen: {now}");
+        assert!(
+            now.contains(&save::timestamp()[..10]),
+            "not today's date: {now}"
+        );
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains(&now), "not persisted:\n{written}");
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn two_sessions_on_one_day_still_meet_in_one_file() {
+        // The refreshed name is written back rather than only used, so the
+        // second session of the day finds a name that is already today's and
+        // continues it. A stamp minted per session would give each its own
+        // file and lose "stopping and starting continues where you left off".
+        let config_path = scratch("streamsameday").with_extension("toml");
+        let _ = std::fs::remove_file(&config_path);
+        let mut d = daemon_holding(SessionState::default());
+        d.opts.config.stream_to = Some("/tmp/2026-08-20_09-14-03.txt".into());
+
+        d.refresh_stream_name(&config_path);
+        let first = d.opts.config.stream_to.clone().unwrap();
+        d.refresh_stream_name(&config_path);
+
+        assert_eq!(d.opts.config.stream_to.as_deref(), Some(first.as_str()));
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn a_stream_file_the_user_named_is_never_renamed() {
+        // `notes.txt` was chosen on purpose, and continuing it is why the
+        // setting is remembered at all. Nothing is written either: an
+        // untouched setting is not a reason to rewrite the config file.
+        let config_path = scratch("streamkept").with_extension("toml");
+        let _ = std::fs::remove_file(&config_path);
+        let mut d = daemon_holding(SessionState::default());
+        d.opts.config.stream_to = Some("~/transcripts/notes.txt".into());
+
+        d.refresh_stream_name(&config_path);
+
+        assert_eq!(
+            d.opts.config.stream_to.as_deref(),
+            Some("~/transcripts/notes.txt")
+        );
+        assert!(!config_path.exists(), "the config was rewritten for nothing");
     }
 
     #[test]

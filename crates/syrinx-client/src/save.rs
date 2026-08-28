@@ -386,6 +386,61 @@ pub fn default_dir() -> PathBuf {
     }
 }
 
+/// The stream target a session starting now should open.
+///
+/// The chosen path is persisted, so the same one comes back on every run --
+/// which is right for the folder and wrong for the name. A file accepted from
+/// the Save dialog on the 20th is called `2026-08-20_09-14-03.txt`, and every
+/// session since has appended to it: a fortnight of meetings under one day's
+/// date. Re-seeding the dialog fixes only the presses that go through the
+/// dialog, and the tray, the global hotkey, `Ctrl+D` and `syrinx start` never
+/// open one.
+///
+/// So a name this program generated is re-stamped once the date on it is no
+/// longer today's, and a name the user typed is left exactly alone. `notes.txt`
+/// was chosen on purpose, and "stopping and starting continues where you left
+/// off" has to keep meaning that for whoever chose it.
+///
+/// The extension is kept, so a deliberate `.md` on an auto-generated stem
+/// survives; only the stem is restamped.
+pub fn restamped(path: &Path, stamp: &str) -> PathBuf {
+    let Some(stem) = path.file_stem().map(|s| s.to_string_lossy()) else {
+        return path.to_path_buf();
+    };
+    if !is_stamp(&stem) {
+        return path.to_path_buf();
+    }
+    // The date only. A second session on the same day has to land on the same
+    // file, or "continues where you left off" stops being true within the day.
+    if stem.get(..10) == stamp.get(..10) {
+        return path.to_path_buf();
+    }
+    let name = match path.extension() {
+        Some(e) => format!("{stamp}.{}", e.to_string_lossy()),
+        None => stamp.to_string(),
+    };
+    // A bare filename has `""` for a parent, which joins back to itself.
+    match path.parent() {
+        Some(p) => p.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Whether a filename stem is one [`timestamp`] produced.
+///
+/// Shape only: `2026-08-20_09-14-03`. Anything else is a name someone chose,
+/// and choosing `2026-08-20_09-14-03` deliberately is not a case worth
+/// distinguishing -- the answer is the same file, one day later.
+fn is_stamp(stem: &str) -> bool {
+    stem.len() == 19
+        && stem.char_indices().all(|(i, c)| match i {
+            4 | 7 => c == '-',
+            10 => c == '_',
+            13 | 16 => c == '-',
+            _ => c.is_ascii_digit(),
+        })
+}
+
 /// Build a filename from a timestamp.
 ///
 /// Sortable by name, and safe on every filesystem: no colons, which Windows
@@ -512,6 +567,78 @@ mod tests {
         for bad in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
             assert!(!name.contains(bad), "{name:?} contains {bad:?}");
         }
+    }
+
+    #[test]
+    fn a_generated_name_from_an_earlier_day_gets_todays_date() {
+        // The complaint this exists for: a file accepted from the dialog on
+        // the 20th came back on every start afterwards, so a fortnight of
+        // meetings piled into one file still called 2026-08-20_09-14-03.txt.
+        assert_eq!(
+            restamped(
+                Path::new("/home/a/notes/2026-08-20_09-14-03.txt"),
+                "2026-08-27_18-02-11"
+            ),
+            PathBuf::from("/home/a/notes/2026-08-27_18-02-11.txt")
+        );
+    }
+
+    #[test]
+    fn a_generated_name_from_today_is_left_where_it_is() {
+        // Stopping and starting within a day has to continue the same file.
+        // The date is what is compared, not the whole stamp, or every session
+        // would open a file of its own.
+        let today = Path::new("/home/a/2026-08-27_09-14-03.txt");
+        assert_eq!(restamped(today, "2026-08-27_18-02-11"), today);
+    }
+
+    #[test]
+    fn a_name_the_user_chose_is_never_touched() {
+        // `notes.txt` was picked on purpose. Restamping it would rename the
+        // file out from under whoever is reading it every morning.
+        for chosen in ["/home/a/notes.txt", "/home/a/standup.md", "/home/a/2026.txt"] {
+            assert_eq!(restamped(Path::new(chosen), "2026-08-27_18-02-11"), PathBuf::from(chosen));
+        }
+    }
+
+    #[test]
+    fn a_generated_name_keeps_the_extension_it_was_given() {
+        // The dialog offers `.txt` and the user can type anything over it.
+        // The date is what went stale, not the format.
+        assert_eq!(
+            restamped(Path::new("/a/2026-08-20_09-14-03.md"), "2026-08-27_18-02-11"),
+            PathBuf::from("/a/2026-08-27_18-02-11.md")
+        );
+        assert_eq!(
+            restamped(Path::new("/a/2026-08-20_09-14-03"), "2026-08-27_18-02-11"),
+            PathBuf::from("/a/2026-08-27_18-02-11")
+        );
+    }
+
+    #[test]
+    fn a_name_with_no_folder_in_front_of_it_restamps_in_place() {
+        // A relative `stream_to` is legal in the config file, and joining a
+        // parent of "" back on must not produce "/2026-...".
+        assert_eq!(
+            restamped(Path::new("2026-08-20_09-14-03.txt"), "2026-08-27_18-02-11"),
+            PathBuf::from("2026-08-27_18-02-11.txt")
+        );
+    }
+
+    #[test]
+    fn a_path_that_names_no_file_at_all_is_returned_unchanged() {
+        // `/` has no file name to restamp, and neither does an empty setting.
+        assert_eq!(restamped(Path::new("/"), "2026-08-27_18-02-11"), PathBuf::from("/"));
+        assert_eq!(restamped(Path::new(""), "2026-08-27_18-02-11"), PathBuf::from(""));
+    }
+
+    #[test]
+    fn a_stamp_is_recognised_by_shape_and_nothing_else() {
+        assert!(is_stamp("2026-08-20_09-14-03"));
+        assert!(!is_stamp("2026-08-20"), "a date alone is not one");
+        assert!(!is_stamp("2026-08-20_09-14-0x"), "letters are not digits");
+        assert!(!is_stamp("2026:08:20_09-14-03"), "separators are part of it");
+        assert!(!is_stamp("notes"));
     }
 
     #[test]

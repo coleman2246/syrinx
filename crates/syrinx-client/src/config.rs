@@ -6,7 +6,7 @@
 use crate::mode::OutputMode;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Config {
@@ -162,7 +162,7 @@ impl Config {
     /// save -- the comments would survive exactly until the config was used.
     /// So values are edited into the existing document, and only a file that
     /// does not exist yet is written from the template.
-    pub fn save(&self, path: &PathBuf) -> Result<()> {
+    pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
