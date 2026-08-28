@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use syrinx_client::{Config, OutputMode, SessionOptions, save, state};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(name = "syrinx", about = "Live speech to text")]
@@ -374,7 +374,8 @@ fn run(
     split: bool,
     pid_path: PathBuf,
 ) -> Result<()> {
-    let cfg = Config::load(config)?;
+    let config_path = config.clone().unwrap_or_else(Config::default_path);
+    let mut cfg = Config::load(config)?;
     let mode = mode.map(OutputMode::from).unwrap_or(cfg.mode);
 
     let available = syrinx_client::list_sources()?;
@@ -391,6 +392,26 @@ fn run(
         }
         v
     };
+
+    // A generated name in the config gets today's date before it is opened,
+    // exactly as it does in the daemon: `stream_to` is remembered, and a file
+    // named 2026-08-20_09-14-03.txt would otherwise collect every session
+    // since under that day's date. Written back for the same reason the
+    // daemon writes it back -- so the next run today continues this file
+    // rather than minting one of its own.
+    //
+    // `--stream` is left exactly as typed. It was typed for this run, which
+    // is nothing like a name remembered from a fortnight ago.
+    if let Some(current) = cfg.stream_to.clone() {
+        let current = PathBuf::from(current);
+        let fresh = save::restamped(&current, &save::timestamp());
+        if fresh != current {
+            cfg.stream_to = Some(fresh.display().to_string());
+            if let Err(e) = cfg.save(&config_path) {
+                warn!("saving the config: {e:#}");
+            }
+        }
+    }
 
     // The flag wins over the config, so a one-off run can stream somewhere
     // else without editing anything.
@@ -410,6 +431,11 @@ fn run(
     state::refresh_waybar(cfg.waybar_signal);
 
     let source_count = chosen.len();
+    // Named as a set: `short_label` calls every monitor "System audio", and
+    // two sources under one name build one stream filename and put two
+    // writers on it, which tears the records. Unused in combined mode, where
+    // there is one session and no per-source file.
+    let source_names = syrinx_audio::source::short_labels(&chosen);
     // Separate mode is one session per source; combined is one session fed by
     // a mix. Only the first source may type, since several streams typing into
     // one cursor interleave into nonsense.
@@ -433,7 +459,7 @@ fn run(
             .into_iter()
             .enumerate()
             .map(|(i, s)| {
-                let name = s.short_label();
+                let name = source_names[i].clone();
                 let stream = stream_target.as_ref().map(|(base, format)| {
                     let p = stream_path_for(base, &name, source_count);
                     info!("appending {name}'s transcript to {}", p.display());
@@ -514,6 +540,13 @@ fn run(
             "--save has nothing to write in {} mode; use --mode transcribe or both",
             mode.label()
         );
+    }
+    // Said, but not fatal. The run recorded and saved everything it had; one
+    // fragment did not reach the file being streamed to, which is worth
+    // knowing and is not a reason to exit non-zero on an otherwise complete
+    // transcript.
+    if let Some(w) = final_state.stream_error {
+        eprintln!("warning: {w}");
     }
     if let Some(e) = final_state.error {
         anyhow::bail!("{e}");

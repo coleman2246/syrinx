@@ -408,9 +408,24 @@ button picks a file, offering the current local time as the name —
 `2026-08-21_14-59-41.txt`, the same default **Save as…** uses. Ordered
 largest unit first, so sorting a folder by name sorts it by time.
 
-Every session appends to the same file, so stopping and starting continues
-where you left off, and a crash costs the last sentence rather than the whole
-session — verified against `kill -9` mid-session.
+It asks every time, and it asks in the folder you chose last. Cancelling
+changes nothing, and **Clear stream file** beside it is what stops it. Either
+choice applies to the next session, because the file is opened when a session
+starts: a session already running keeps writing to the file it opened.
+
+The folder is remembered; a name syrinx generated is not. A file called
+`2026-08-20_09-14-03.txt` is given the current date the next day you
+dictate — however you started it, from the button, the tray, the hotkey or
+`syrinx start` — or a file picked a fortnight ago quietly collects every
+session since under that day's date. **A name you chose yourself is left
+alone**: `notes.txt` is still `notes.txt` in a year.
+
+Every session on a given day appends to that day's file, so stopping and
+starting continues where you left off, and a crash costs the last sentence
+rather than the whole session — verified against `kill -9` mid-session. If a
+write fails partway through, the window says so in amber: the recording has
+not stopped and the transcript is still being kept, but a fragment did not
+reach the file.
 
 Several sources transcribed separately get a file each, beside the one you
 asked for: `syrinx start --separate --stream notes.txt` on a microphone and

@@ -202,6 +202,12 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
     {
         state.opts.source_keys = vec![s.stable_key()];
     }
+
+    // And again here, not only at the session that uses it, so a window
+    // opened the morning after names the file that would really be written
+    // rather than yesterday's. Costs a config write once a day at most: a
+    // name already carrying today's date is left alone.
+    state.refresh_stream_name(&state.config_path());
     let mut quit = false;
 
     while !quit {
@@ -273,8 +279,8 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
                     Response::Ok
                 }
                 Request::SetStreamFile { path } => {
-                    state.opts.config.stream_to = path;
-                    state.save_config();
+                    let config = state.config_path();
+                    state.set_stream_file(path, &config);
                     Response::Ok
                 }
                 Request::SetServer { server } => {
@@ -325,8 +331,6 @@ pub fn run(opts: DaemonOptions) -> Result<()> {
         // Settled at startup and constant thereafter, so it is stamped on
         // rather than carried through the session machinery.
         snap.hotkey = hotkey_report.clone();
-        snap.stream_to = state.opts.config.stream_to.clone();
-        snap.format = state.opts.format;
 
         // Built from `snap` before it moves into `published`, so a whole
         // extra `DaemonState` clone is not paid every 25 ms just to hand the
@@ -591,14 +595,23 @@ impl DaemonRuntime {
     /// daemon run with `--config <other>` that saved to the canonical path
     /// would drop the change the moment it restarted and read `<other>` again.
     fn save_config(&self) {
-        let path = self
-            .opts
-            .config_path
-            .clone()
-            .unwrap_or_else(crate::Config::default_path);
+        let path = self.config_path();
         if let Err(e) = self.opts.config.save(&path) {
             warn!("saving the config to {}: {e:#}", path.display());
         }
+    }
+
+    /// The file this daemon reads its settings from, and must write them to.
+    ///
+    /// Separate from [`save_config`] because the handlers that take an explicit
+    /// path -- so a test can point them at a scratch file rather than the
+    /// settings of whoever ran it -- still have to be given *this* daemon's
+    /// path in production, not the canonical one.
+    fn config_path(&self) -> std::path::PathBuf {
+        self.opts
+            .config_path
+            .clone()
+            .unwrap_or_else(crate::Config::default_path)
     }
 
     /// Take a new source selection, and write it down.
@@ -776,9 +789,13 @@ impl DaemonRuntime {
         out.revision = self.text.revision;
         out.source_keys = self.opts.source_keys.clone();
         out.source_mode = self.opts.source_mode;
-        // The setting, not the session's answer about it: a viewer's checkbox
-        // has to read what the next session would ask for.
+        // The settings, not the session's answers about them: a viewer's
+        // controls have to read what the next session would do. Stamped here
+        // rather than by the caller so every reader of a snapshot -- the loop,
+        // and the tests -- sees the same one.
         out.diarize_configured = self.opts.config.diarize;
+        out.stream_to = self.opts.config.stream_to.clone();
+        out.format = self.opts.format;
 
         // A file job owns the status while it runs, so a viewer shows progress
         // rather than an idle window with nothing happening.
@@ -877,6 +894,12 @@ impl DaemonRuntime {
 
         let (url, token) = (self.opts.config.url.clone(), self.opts.config.token.clone());
         let inject = self.opts.config.inject;
+        // Every way of starting comes through here -- the tray, the global
+        // hotkey, Ctrl+D, `syrinx toggle` -- and only one of them has ever
+        // seen a file dialog. Re-seeding the dialog's default name therefore
+        // fixes almost none of them, so the generated name is refreshed at
+        // the session that uses it.
+        self.refresh_stream_name(&self.config_path());
         let stream = self
             .opts
             .config
@@ -918,6 +941,11 @@ impl DaemonRuntime {
                 ));
             }
             crate::mode::SourceMode::Separate => {
+                // Named as a set rather than one at a time: `short_label`
+                // calls every monitor "System audio", and two of those would
+                // build one filename and put two writers on it -- the tearing
+                // the paragraph above exists to prevent.
+                let names = syrinx_audio::source::short_labels(&resolved);
                 for (i, source) in resolved.into_iter().enumerate() {
                     // Only the first source may type: several streams typing
                     // into one cursor interleave into nonsense. The rest are
@@ -927,7 +955,7 @@ impl DaemonRuntime {
                     } else {
                         OutputMode::Transcribe
                     };
-                    let name = source.short_label();
+                    let name = names[i].clone();
                     let stream = stream.as_ref().map(|(base, format)| {
                         let p = if split_stream {
                             save::path_for_source(base, &name)
@@ -1110,6 +1138,51 @@ impl DaemonRuntime {
         }
         self.opts.config.diarize = on;
         self.save_config();
+    }
+
+    /// Where the next session appends its transcript, or nothing at all.
+    ///
+    /// Applied and written down, like `set_diarize`: the setting reaches a
+    /// session through `opts.config`, and one that died with the daemon would
+    /// have to be chosen again every time. Unlike `set_diarize` it is accepted
+    /// while running -- the writer is opened at session start, so this can
+    /// only ever describe the next session anyway.
+    ///
+    /// The config path is a parameter rather than `Config::default_path()`
+    /// because this writes a real file: a test that called it would otherwise
+    /// edit the settings of whoever ran it.
+    fn set_stream_file(&mut self, path: Option<String>, config: &std::path::Path) {
+        self.opts.config.stream_to = path;
+        if let Err(e) = self.opts.config.save(config) {
+            warn!("saving the config: {e:#}");
+        }
+    }
+
+    /// Give a generated stream name today's date, before a session opens it.
+    ///
+    /// `stream_to` is persisted, so the name accepted from the Save dialog on
+    /// the 20th is still the name on the 27th, and every session in between
+    /// appended to `2026-08-20_09-14-03.txt`. Only a name of that shape is
+    /// touched: `notes.txt` was chosen deliberately, and continuing it is the
+    /// whole reason the setting is remembered.
+    ///
+    /// Written back rather than only used, so that two sessions on one day
+    /// still meet in one file -- a fresh stamp per session would give each
+    /// its own -- and so that every viewer's label names the file that is
+    /// really being written.
+    ///
+    /// Restamping the string as it was written keeps a `~` a `~`; expanding
+    /// it here would quietly rewrite the config to an absolute path.
+    fn refresh_stream_name(&mut self, config: &std::path::Path) {
+        let Some(current) = self.opts.config.stream_to.clone() else {
+            return;
+        };
+        let current = std::path::PathBuf::from(current);
+        let fresh = save::restamped(&current, &save::timestamp());
+        if fresh != current {
+            info!("streaming to {} for today", fresh.display());
+            self.set_stream_file(Some(fresh.display().to_string()), config);
+        }
     }
 
     fn save(&self, format: save::Format, path: Option<&str>) -> Result<String> {
@@ -1498,6 +1571,7 @@ mod tests {
             diarize: true,
             diarize_requested: true,
             error: Some("boom".into()),
+            stream_error: Some("a fragment was not written".into()),
             levels: vec![0.5; 10],
             rms: 0.25,
             sources: vec![syrinx_audio::mixer::SourceHealth {
@@ -1524,6 +1598,7 @@ mod tests {
             (full.diarize, full.diarize_requested, full.rms)
         );
         assert_eq!((live.error, live.levels), (full.error, full.levels));
+        assert_eq!(live.stream_error, full.stream_error);
         assert_eq!(live.last_fragment, full.last_fragment);
     }
 
@@ -1635,6 +1710,117 @@ mod tests {
             Some(std::time::Duration::from_secs(600)),
             std::time::Duration::from_secs(5),
         ));
+    }
+
+    #[test]
+    fn a_chosen_stream_file_is_applied_and_written_down() {
+        // Nothing covered this handler end to end, and it has two halves that
+        // can fail separately: the next session reads `opts.config`, and every
+        // viewer reads the published state.
+        let config_path = scratch("streamfile").with_extension("toml");
+        let _ = std::fs::remove_file(&config_path);
+        let mut d = daemon_holding(SessionState::default());
+        let mut p = Published::default();
+
+        d.set_stream_file(Some("/tmp/notes.txt".into()), &config_path);
+        tick(&mut d, &mut p);
+
+        assert_eq!(d.opts.config.stream_to.as_deref(), Some("/tmp/notes.txt"));
+        assert_eq!(
+            p.live.stream_to.as_deref(),
+            Some("/tmp/notes.txt"),
+            "a window has to see what it just asked for"
+        );
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("/tmp/notes.txt"), "not persisted:\n{written}");
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn stopping_the_stream_takes_the_setting_away_for_good() {
+        // A cleared setting that survived in the file would come back on the
+        // next start, and a transcript would be appended to a file nobody
+        // asked for. `clearing_an_optional_setting_removes_it` covers the
+        // config half; this is the daemon reaching it.
+        let config_path = scratch("streamstop").with_extension("toml");
+        let _ = std::fs::remove_file(&config_path);
+        let mut d = daemon_holding(SessionState::default());
+        let mut p = Published::default();
+
+        d.set_stream_file(Some("/tmp/notes.txt".into()), &config_path);
+        d.set_stream_file(None, &config_path);
+        tick(&mut d, &mut p);
+
+        assert_eq!(d.opts.config.stream_to, None);
+        assert_eq!(p.live.stream_to, None);
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!written.contains("/tmp/notes.txt"), "still there:\n{written}");
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn a_generated_stream_name_from_another_day_is_refreshed_before_a_session() {
+        // The complaint. Only the GUI's Stream button ever opens a file
+        // dialog, so re-seeding the dialog left the tray, the global hotkey,
+        // Ctrl+D and `syrinx start` still appending today's meeting to a file
+        // named for a fortnight ago. This runs at every session, whichever
+        // asked for it.
+        let config_path = scratch("streamrestamp").with_extension("toml");
+        let _ = std::fs::remove_file(&config_path);
+        let mut d = daemon_holding(SessionState::default());
+        d.opts.config.stream_to = Some("/tmp/2026-08-20_09-14-03.txt".into());
+
+        d.refresh_stream_name(&config_path);
+
+        let now = d.opts.config.stream_to.clone().expect("still streaming");
+        assert!(now.starts_with("/tmp/"), "the folder was chosen: {now}");
+        assert!(
+            now.contains(&save::timestamp()[..10]),
+            "not today's date: {now}"
+        );
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains(&now), "not persisted:\n{written}");
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn two_sessions_on_one_day_still_meet_in_one_file() {
+        // The refreshed name is written back rather than only used, so the
+        // second session of the day finds a name that is already today's and
+        // continues it. A stamp minted per session would give each its own
+        // file and lose "stopping and starting continues where you left off".
+        let config_path = scratch("streamsameday").with_extension("toml");
+        let _ = std::fs::remove_file(&config_path);
+        let mut d = daemon_holding(SessionState::default());
+        d.opts.config.stream_to = Some("/tmp/2026-08-20_09-14-03.txt".into());
+
+        d.refresh_stream_name(&config_path);
+        let first = d.opts.config.stream_to.clone().unwrap();
+        d.refresh_stream_name(&config_path);
+
+        assert_eq!(d.opts.config.stream_to.as_deref(), Some(first.as_str()));
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn a_stream_file_the_user_named_is_never_renamed() {
+        // `notes.txt` was chosen on purpose, and continuing it is why the
+        // setting is remembered at all. Nothing is written either: an
+        // untouched setting is not a reason to rewrite the config file.
+        let config_path = scratch("streamkept").with_extension("toml");
+        let _ = std::fs::remove_file(&config_path);
+        let mut d = daemon_holding(SessionState::default());
+        d.opts.config.stream_to = Some("~/transcripts/notes.txt".into());
+
+        d.refresh_stream_name(&config_path);
+
+        assert_eq!(
+            d.opts.config.stream_to.as_deref(),
+            Some("~/transcripts/notes.txt")
+        );
+        assert!(!config_path.exists(), "the config was rewritten for nothing");
     }
 
     #[test]

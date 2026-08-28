@@ -100,6 +100,36 @@ impl Source {
     }
 }
 
+/// Compact names for a whole set of sources, with collisions broken apart.
+///
+/// [`Source::short_label`] answers for one source and cannot see the others,
+/// so every monitor comes back as "System audio" and two microphones sharing
+/// their first 24 characters come back identical. In a transcript line that is
+/// merely vague; in a filename it is a bug. Separate mode gives each source
+/// its own stream file through `save::path_for_source`, built from this name,
+/// and two sources under one name point two `StreamWriter`s at one file --
+/// neither of which is ever shown the other's fragments, so the records tear
+/// rather than interleave.
+///
+/// The first source to claim a name keeps it, so the ordinary case of one
+/// microphone and one monitor reads exactly as it did before.
+pub fn short_labels(sources: &[Source]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(sources.len());
+    for s in sources {
+        let base = s.short_label();
+        let mut name = base.clone();
+        // Counting from two, because whatever already holds the name is the
+        // first of them: "System audio" and "System audio 2".
+        let mut n = 2;
+        while out.contains(&name) {
+            name = format!("{base} {n}");
+            n += 1;
+        }
+        out.push(name);
+    }
+    out
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -203,6 +233,66 @@ mod tests {
         };
         assert!(!s.short_label().contains("(input)"));
         assert!(s.short_label().chars().count() <= 24);
+    }
+
+    fn monitor(name: &str, stable: &str) -> Source {
+        Source {
+            target: SourceTarget::PipeWireNode(1),
+            name: name.into(),
+            kind: SourceKind::Monitor,
+            detail: None,
+            stable_name: Some(stable.into()),
+            sink_description: None,
+        }
+    }
+
+    #[test]
+    fn two_monitors_are_never_given_one_name() {
+        // Every monitor is "System audio" on its own, and separate mode builds
+        // a stream filename from that name. Two of them under one name is two
+        // writers on one file, which tears the records.
+        let names = short_labels(&[
+            monitor("Speakers", "alsa_output.pci-0000_00.analog"),
+            monitor("Headset", "alsa_output.usb-headset.analog"),
+        ]);
+        assert_eq!(names, ["System audio", "System audio 2"]);
+    }
+
+    #[test]
+    fn a_lone_monitor_keeps_the_name_it_always_had() {
+        // The common case must read exactly as before; a "System audio 1"
+        // beside nothing else would be noise.
+        let names = short_labels(&[monitor("Speakers", "alsa_output.pci")]);
+        assert_eq!(names, ["System audio"]);
+    }
+
+    #[test]
+    fn microphones_truncated_to_the_same_name_are_still_told_apart() {
+        // The label is cut to 24 characters, so two devices from one maker
+        // collide long before their full names do.
+        let mic = |n: &str| Source {
+            target: SourceTarget::PipeWireNode(1),
+            name: n.into(),
+            kind: SourceKind::Microphone,
+            detail: None,
+            stable_name: None,
+            sink_description: None,
+        };
+        let names = short_labels(&[
+            mic("Blue Microphones Yeti Stereo A"),
+            mic("Blue Microphones Yeti Stereo B"),
+        ]);
+        assert_ne!(names[0], names[1]);
+    }
+
+    #[test]
+    fn three_of_a_kind_get_three_names() {
+        let names = short_labels(&[
+            monitor("A", "a"),
+            monitor("B", "b"),
+            monitor("C", "c"),
+        ]);
+        assert_eq!(names, ["System audio", "System audio 2", "System audio 3"]);
     }
 
     #[test]
