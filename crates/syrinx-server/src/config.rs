@@ -127,6 +127,12 @@ pub struct Config {
     /// splitting; lowering it mints less, and a genuinely new voice that is
     /// refused gets an incumbent's number as a guess instead of a gap.
     ///
+    /// **`diarize_margin = 0` switches this key off entirely**, whatever it is
+    /// set to, and that is the only value of any other key that touches it.
+    /// The hatch is documented as the whole retreat to the pre-2026-08-27
+    /// rules, and one that left the split guard running would not be a
+    /// retreat; a file setting both is therefore setting only the margin.
+    ///
     /// **Not the same quantity as `diarize_margin`,** although it used to be
     /// derived from it. That one is a lead between one 1.5 s window's cosines,
     /// measured against the spike's same-speaker median of 0.517; this one is

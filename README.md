@@ -261,8 +261,11 @@ crowded room and risks that split; lowering it finds fewer, and a new voice
 that is refused is offered an existing name as a guess rather than left blank.
 It is a cosine between an *average* of four windows and an existing voice,
 which is a different measurement on a different scale from `diarize_margin`,
-so the two do not move together and setting one says nothing about the other.
-Of all the numbers here it is the one most in need of being measured.
+so the two do not move together and the value of one says nothing about the
+value of the other. The one place they meet is the escape hatch above:
+`diarize_margin = 0` switches this key off outright, so a file setting both
+is really only setting the first. Of all the numbers here it is the one most
+in need of being measured.
 
 `diarize_change_threshold` is how much the voice has to change between one
 three-quarter-second stretch and the next before the diarizer calls it a new
