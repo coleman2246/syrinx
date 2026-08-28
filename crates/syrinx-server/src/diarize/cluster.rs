@@ -618,9 +618,9 @@ impl OnlineClusterer {
         Some(label)
     }
 
-    /// Whether a pool with this internal agreement, whose mean sits at `rival`
-    /// from the nearest live centroid, may become a speaker.
-    fn may_mint(&self, coherence: f32, rival: Option<f32>) -> bool {
+    /// Whether a pool whose mean sits `cohesion` from its own worst member and
+    /// `rival` from the nearest live centroid may become a speaker.
+    fn may_mint(&self, cohesion: f32, rival: Option<f32>) -> bool {
         match rival {
             // Nobody to split.
             None => true,
@@ -631,7 +631,7 @@ impl OnlineClusterer {
             Some(rival) if rival < self.t_assign => true,
             Some(rival) => {
                 rival < (self.t_assign + self.margin).min(self.t_retire)
-                    && coherence - rival >= T_MINT_MARGIN
+                    && cohesion - rival >= T_MINT_MARGIN
             }
         }
     }
