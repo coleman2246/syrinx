@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Build an unsigned .ipa for sideloading.
+# Build an unsigned .ipa.
 #
-# Unsigned on purpose: AltStore and SideStore re-sign with your own Apple ID
-# on the device, so no certificate is needed here and no credentials are ever
+# Unsigned on purpose: whatever installs it re-signs it -- xtool with a
+# developer team, or AltStore and SideStore with your own Apple ID (see
+# docs/ios.md) -- so no certificate is needed here and no credentials are ever
 # stored by the build.
 set -euo pipefail
 cd "$(dirname "$0")"

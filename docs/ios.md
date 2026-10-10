@@ -53,10 +53,27 @@ and there is no neater way.
 
 ## Installing
 
-The build is unsigned (`CODE_SIGNING_ALLOWED=NO`), so a sideloader signs it with
-your own Apple ID. Any of AltStore, SideStore or iLoader will do. Whatever signs
-it must stay installed: a free certificate expires every seven days and
-something has to refresh it.
+The build is unsigned (`CODE_SIGNING_ALLOWED=NO`), so something has to sign it
+on the way to the phone. With a paid developer account, that is
+[xtool](https://xtool.sh) on Linux, with the phone on USB:
+
+```sh
+make ios-install        # make ios, then: xtool install --usb ~/Downloads/SyrinxDemo.ipa
+```
+
+xtool creates a provisioning profile for the app and another for the keyboard
+extension, signs both, and installs. The profiles last a year; install again
+before they run out. xtool prefixes every bundle ID with `XTL-<TEAM>.`, so the
+app and the keyboard install as `XTL-<TEAM>.<bundle ID>`. That is harmless here,
+because the app and the keyboard only find each other over loopback and share no
+App Group. It does make the result a different app from any copy a sideloader
+installed, so delete that copy first: both would stay installed and compete for
+the loopback port. `xtool auth` must have logged in once, with an App Store
+Connect API key that has the **Admin** role.
+
+Without a paid account, a sideloader signs it with your own Apple ID. Any of
+AltStore, SideStore or iLoader will do. Whatever signs it must stay installed: a
+free certificate expires every seven days and something has to refresh it.
 
 After installing, two things are required and neither is optional:
 
@@ -75,8 +92,8 @@ the same spectrum the desktop overlay draws, and the caption shows the last few
 words typed — a meter can bounce happily while the transcript stays empty, so
 both are needed to tell "hearing you" from "recognising you".
 
-The **ⓘ** button types a diagnostic report into whatever field has focus. A
-sideloaded extension has no console and no debugger, so this is the only way to
+The **ⓘ** button types a diagnostic report into whatever field has focus. From
+Linux the extension has no console and no debugger, so this is the only way to
 see what it thinks is happening. The app's half is in Settings › Keyboard.
 
 ## Constraints worth knowing before changing anything

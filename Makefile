@@ -16,7 +16,7 @@ CONFIG ?= config.toml
 MACVM ?= ssh -i $(HOME)/.ssh/macvm -o StrictHostKeyChecking=no -p 2222 cole@127.0.0.1
 IPA ?= $(HOME)/Downloads/SyrinxDemo.ipa
 
-.PHONY: test lint build-cuda serve dictate probe check ios ios-framework
+.PHONY: test lint build-cuda serve dictate probe check ios ios-framework ios-install
 
 ## Run the full suite. No GPU needed -- the mock backend covers the protocol.
 ##
@@ -80,6 +80,14 @@ ios:
 	scp -i $(HOME)/.ssh/macvm -o StrictHostKeyChecking=no -P 2222 \
 		cole@127.0.0.1:syrinx/ios/build/SyrinxDemo.ipa $(IPA)
 	@echo "wrote $(IPA)"
+
+## Build, then sign with your developer team and install over USB.
+##
+## The .ipa is unsigned; xtool provisions and signs the app and the keyboard
+## extension with the account `xtool auth` is logged into, and the profiles
+## last a year rather than a free certificate's seven days.
+ios-install: ios
+	xtool install --usb $(IPA)
 
 ## Rebuild the Rust core for iOS. Needed whenever anything under crates/
 ## changed: `make ios` links the existing static library and will otherwise
